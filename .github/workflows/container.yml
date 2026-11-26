@@ -76,7 +76,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         id: meta
         with:
           images: ghcr.io/${{ github.repository_owner }}/owlbot-server
@@ -105,7 +105,7 @@ jobs:
       # tagged the same so OWLBOT_VERSION pins both. Its recipe is pinned by
       # digest and checksum (docker/desktop), so the release's tag is
       # what it is built from.
-      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         id: desktop
         with:
           images: ghcr.io/${{ github.repository_owner }}/owlbot-desktop
