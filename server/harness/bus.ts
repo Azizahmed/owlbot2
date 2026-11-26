@@ -1,0 +1,105 @@
+// Where every provider's output becomes one stream.
+//
+// Each running instance emits its own normalised events. They all arrive
+// here, get stamped with which instance produced them, and go two places
+// at once: an append-only log on disk, and whoever is subscribed (the SSE
+// endpoint, and the folder in server/index.ts that turns events into
+// transcript messages).
+//
+// The log is the reason this is a bus rather than a callback. A turn that
+// went wrong is reconstructable afterwards from `~/.owlbot/events/<thread>
+// .ndjson` without having had a debugger attached at the time, which is
+// most of how anything here gets diagnosed.
+import { appendFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { EVENTS_DIR } from "../config.ts";
+import type { ProviderInstance, RuntimeEvent, RuntimeEventListener } from "../contracts.ts";
+import { toolCommand } from "../tool-command.ts";
+
+export class EventBus {
+  private subscribers = new Set<RuntimeEventListener>();
+  private detachers = new Map<string, () => void>();
+
+  private readonly redact: (text: string) => string;
+  /** What an event may say before anybody hears it or it is written down:
+   * an OwlBot AI turn's events lose their model and price here, once, so no
+   * log or subscriber can see them (server/owlbot-ai.ts). */
+  private readonly scrub: (event: RuntimeEvent) => RuntimeEvent;
+
+  constructor(redact: (text: string) => string, scrub: (event: RuntimeEvent) => RuntimeEvent = (event) => event) {
+    this.redact = redact;
+    this.scrub = scrub;
+  }
+
+  /** Start relaying from these instances. Safe to call again after a
+   * `detach`, which is what a config reload does for the engines it
+   * rebuilds. An instance already attached is attached once. */
+  attach(instances: ProviderInstance[]) {
+    for (const instance of instances) {
+      this.detachers.get(instance.instanceId)?.();
+      const detach = instance.adapter.onEvent((event) => {
+        // An adapter speaking for a driver other than its own means two
+        // instances have got tangled, and the resulting transcript would
+        // be attributed to the wrong agent. Drop it loudly instead.
+        if (event.provider !== instance.driverKind) {
+          console.error(`bus: dropped cross-driver event from ${instance.instanceId}`);
+          return;
+        }
+        this.publish({ ...event, providerInstanceId: instance.instanceId });
+      });
+      this.detachers.set(instance.instanceId, detach);
+    }
+  }
+
+  publish(event: RuntimeEvent) {
+    event = this.scrub(event);
+    if (event.type === "item.started" && event.itemType === "tool" && event.command !== undefined) {
+      const { command, ...rest } = event;
+      const safe = toolCommand(command, this.redact);
+      event = { ...rest, ...(safe ? { command: safe } : {}) };
+    }
+    this.record(event);
+    // Iterate a copy: a subscriber is allowed to unsubscribe from inside
+    // its own callback, and mutating the set mid-loop would skip someone.
+    for (const subscriber of [...this.subscribers]) {
+      try {
+        subscriber(event);
+      } catch (error) {
+        // One bad subscriber must not cost the others their event.
+        console.error("bus: listener threw", error);
+      }
+    }
+  }
+
+  subscribe(listener: RuntimeEventListener): () => void {
+    this.subscribers.add(listener);
+    return () => this.subscribers.delete(listener);
+  }
+
+  /** Stop relaying, without disturbing subscribers: they stay attached and
+   * pick up again when new instances are attached. */
+  detachAll() {
+    this.detach([...this.detachers.keys()]);
+  }
+
+  /** The same for some instances only: what the others say still comes
+   * through. */
+  detach(instanceIds: readonly string[]) {
+    for (const id of instanceIds) {
+      this.detachers.get(id)?.();
+      this.detachers.delete(id);
+    }
+  }
+
+  /** One line per event, per thread. Failures are swallowed on purpose.
+   * A full disk or a missing directory is a reason to lose the log, never
+   * a reason to lose the turn it belongs to. */
+  private record(event: RuntimeEvent) {
+    try {
+      appendFileSync(join(EVENTS_DIR, `${event.threadId}.ndjson`), JSON.stringify(event) + "\n");
+    } catch {
+      /* logging is best effort by design */
+    }
+  }
+}

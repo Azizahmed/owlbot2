@@ -1,0 +1,740 @@
+// A command line an agent can drive as itself.
+//
+// Everything an agent can do today it does by talking: it says something
+// and a person acts on it. That is fine for answers and wrong for work.
+// An agent that has decided it needs a colleague, or that this should run
+// every Monday, should be able to do that rather than describe it.
+//
+// So a turn gets a credential of its own, and a command line that carries
+// it. Two things about that credential matter more than anything else
+// here:
+//
+//   It is the agent, not the person. It says who is calling, and what an
+//   agent may do is a smaller set than what the person at the keyboard
+//   may do. Not because agents are untrusted, but because a prompt is an
+//   input: whatever ends up in an agent's context can try to steer it,
+//   and the blast radius of that should not include the workspace's keys.
+//
+//   It lasts one turn. Minted when the turn starts, gone when it ends, so
+//   a token that leaks into a file, a log or a transcript is spent by the
+//   time anybody reads it.
+//
+// The scope rules are here, as data and a pure function over it, because
+// "what may an agent do" is the question worth being able to read in one
+// place and test exhaustively.
+import { randomBytes } from "node:crypto";
+
+/** A turn's credential. */
+export interface AgentToken {
+  token: string;
+  botId: string;
+  /** The lane it was minted for, so the record can say which. */
+  taskId: string;
+  expiresAt: number;
+  /** Changes made so far on this credential. */
+  spent: number;
+  /** Which of its lane's turns it was minted for (laneTurns), so a write
+   * made with it belongs to that turn and no later one. */
+  seq?: number;
+  /** This credential can only reply to its turn's Telegram sender. */
+  reply?: { sender: import("./telegram-people.ts").TelegramReplySender; turn: number; attempted?: Set<string> };
+  /** Only the final direct submission, retained through normal renewal. */
+  report?: ReservedReport;
+  /** This credential can only message one person on somebody's behalf
+   * (POST /api/agent/message-person): a turn an admin started in a team
+   * conversation or a room, which gets none of the owner's standing. */
+  messenger?: true;
+}
+
+export interface ReportResponse { status: number; body: Record<string, unknown> }
+export interface ReservedReport {
+  identity: string;
+  /** A write may have taken effect. It cannot be safely refunded. */
+  dispatched: boolean;
+  accepted: boolean;
+  response: ReportResponse;
+}
+
+export const REPORT_PENDING: ReportResponse = {
+  status: 202,
+  body: { ok: false, pending: true, note: "This direct message is still pending. Retry the same words and destination to check it; do not send a replacement." },
+};
+export const REPORT_UNCERTAIN: ReportResponse = {
+  status: 202,
+  body: { ok: false, uncertain: true, note: "This direct message may have been accepted. Retry only the same submission to check its receipt; do not send it again elsewhere." },
+};
+
+/** Why a different direct message is refused once the kept-back one is
+ * taken. "Occupied by another submission" read as a send still in flight,
+ * worth waiting on or retrying, when the first had long been delivered
+ * and the turn had nothing left to spend (GitHub 369). So it says which:
+ * delivered, maybe delivered, or still on its way, and that nothing from
+ * this request went anywhere. */
+export function keptBackRefusal(report: ReservedReport): string {
+  if (report.accepted) {
+    return "this turn has made its twelve changes and its one kept-back message was already delivered, so this message was not sent. Put what it says in your reply; a message to another agent can go in a later turn.";
+  }
+  if (report.dispatched) {
+    return "this turn's one kept-back message may already have been delivered, so this message was not sent. Retry that first message with the same words and destination to check its receipt; do not send a replacement.";
+  }
+  return "this turn's one kept-back message is still being sent, so this message was not sent. Retry that first message with the same words and destination to check on it; do not send a replacement.";
+}
+
+/** How long a credential lasts without its turn vouching for it. A turn
+ * that is still running renews it (see `alive` below): long turns are
+ * ordinary work now, an hour of comparing quotes in a browser, and an
+ * agent that lost its credential partway could not deliver what it
+ * found. The hour is the backstop for a turn that never ended cleanly. */
+export const TOKEN_TTL_MS = 60 * 60 * 1000;
+
+/** Whether the turn a credential belongs to is still running. */
+export type TurnAlive = (taskId: string) => boolean;
+
+/**
+ * How many things one turn may do.
+ *
+ * Reading is free; anything that changes the workspace is counted. The
+ * number is not about abuse, it is about loops: an agent that messages
+ * another agent starts a turn, and that agent can message back. Without a
+ * ceiling the two of them can spend an afternoon and a lot of somebody's
+ * money agreeing with each other. Twelve is more than any real piece of
+ * work needs and far less than a loop.
+ *
+ * Past the twelve one more is kept back, for one direct message to
+ * another agent and nothing else (claimReport below). A turn handed work
+ * by another agent owes it an answer, and an agent that spent its twelve
+ * on the work itself would otherwise finish having done it and been
+ * unable to say so. The thirteenth cannot feed a loop the twelve could
+ * not: it is one message, and the message still counts along the chain.
+ *
+ * It starts again with every turn, so it bounds one turn and not the
+ * back and forth. That is counted across turns as well: a turn another
+ * agent's message started is one further along a chain than the
+ * sender's, and past MAX_AGENT_CHAIN (server/index.ts) the next message
+ * waits for the person.
+ */
+export const TURN_BUDGET = 12;
+
+/**
+ * What an agent may ask for.
+ *
+ * Read as: method, a path pattern, and whether `:id` in the path has to
+ * be the agent itself. Anything not listed is refused, which is the only
+ * way a list like this stays honest as routes are added.
+ */
+export interface Rule {
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  /**
+   * `:me` matches only the calling agent's own id. `:room` matches a room
+   * this agent is actually in. `:id` matches any.
+   */
+  path: string;
+  why: string;
+}
+
+export const RULES: Rule[] = [
+  // The one route that exists for the command line itself. It is on the
+  // list like everything else, because the guard runs before any route
+  // does and a route nobody listed is a route nobody reaches.
+  { method: "GET", path: "/api/agent/whoami", why: "find out who this credential says you are" },
+  // A message into one person's private conversation with this agent, on
+  // the owner's or an admin's word (server/access.ts decides whether it
+  // may, and the answer says so either way).
+  { method: "POST", path: "/api/agent/message-person", why: "message one person in this workspace privately, when the owner or an admin asked you to in a team conversation or a room" },
+  // Settings as their owners hold them, for `owlbot settings`: reading only,
+  // credentials as configured or not, and a device's settings as it last
+  // said them (docs/ARCHITECTURE.md, Settings inspection).
+  { method: "GET", path: "/api/agent/settings", why: "inspect safe settings observations and their owner controls without changing them" },
+  // Where something lives in the app, so an agent can tell the person the
+  // way rather than guess at it, and a button that takes them there. The
+  // answer is the app's own settings index (server/where.ts); the button
+  // only opens a page, and the person changes whatever is on it.
+  { method: "GET", path: "/api/agent/where", why: "find where something lives in the app: the Settings page or panel, the path in words and the rows that match" },
+  { method: "POST", path: "/api/agent/open", why: "put a card in the conversation with one button that opens a page of the app for the person; it changes nothing" },
+  // A change to one of a short list of everyday preferences, proposed on
+  // a card the person answers (server/settings-proposals.ts). Proposing
+  // is all it is: the change is made by the person's tap, through the
+  // request the Settings page sends, and the route that takes the tap
+  // (/api/settings-proposals) is on NEVER. Approvals, keys, people,
+  // devices, money and anything that could be lost are refused by name.
+  { method: "GET", path: "/api/agent/settings/proposals", why: "list the everyday settings it may propose changing, with their current values" },
+  { method: "POST", path: "/api/agent/settings/proposals", why: "propose changing one everyday setting, on a card the person answers with Change or Keep; nothing changes until they tap Change" },
+  { method: "GET", path: "/api/agent/settings/proposals/:id", why: "wait for the person's answer to a setting it proposed" },
+  // Other agents' models, changed only on the owner's Apply, every one on
+  // one card or none of them (server/model-proposals.ts). PATCH
+  // /api/bots/:id stays sidebar only for another agent, and the route
+  // that takes the Apply (/api/model-proposals) is on NEVER.
+  { method: "GET", path: "/api/agent/models", why: "see the engines and the models each offers, and which engine and model every agent is on" },
+  { method: "POST", path: "/api/agent/models/proposals", why: "propose changing the engine and model of named agents, on one card the owner answers with Apply or Keep; nothing changes until they apply it, and then all of it or none" },
+  { method: "GET", path: "/api/agent/models/proposals/:id", why: "wait for the owner's answer to model changes it proposed" },
+  { method: "DELETE", path: "/api/agent/models/proposals/:id", why: "withdraw model changes of its own the owner has not answered, closing the card with nothing changed" },
+  // The owner's own instruction to change models, carried out with no
+  // card (server/model-instructions.ts). The credential names a message
+  // and nothing more: the server reads the owner's words as stored and
+  // decides what changes, so an agent cannot widen, reuse or invent one.
+  { method: "POST", path: "/api/agent/models/instruction", why: "carry out the owner's own instruction in this conversation to change agents' primary models on the engines they are on, read and checked by the server from the owner's message" },
+  // The goal the person set for the conversation this turn runs in, if
+  // any. Reading only: a goal starts turns unattended and can run a
+  // command on the person's computer, so setting one is theirs alone,
+  // and no rule here reaches the routes that do.
+  { method: "GET", path: "/api/agent/goal", why: "read the goal the person set for this conversation, if there is one" },
+  // Where the person is, as their own iPhone last said, with how long ago
+  // and how exactly (server/location.ts). Reading only, and only in the
+  // owner's own conversations: the route refuses the rest. The report
+  // itself, and forgetting it, are the person's (NEVER below).
+  { method: "GET", path: "/api/agent/location", why: "read where the person's iPhone last placed them, how long ago and how exactly, or ask it for a fresh reading" },
+  // The browser inside the OwlBot window, signed in as the owner, which
+  // the person watches and can take over (server/app-browser.ts). The
+  // route refuses any turn the owner did not start, a site the workspace
+  // denies, and a password, payment or upload field until the person
+  // says yes on a card. Not counted against the turn's changes: a page
+  // takes dozens of steps, and none of them changes the workspace.
+  { method: "GET", path: "/api/agent/browser", why: "see the OwlBot browser's tabs, who has it, its site rules and its downloads" },
+  // A panel of the side dock brought in front of the person, in the
+  // conversation this turn answers (`owlbot dock show`, GitHub 522).
+  { method: "POST", path: "/api/agent/dock", why: "bring a panel of the side dock in front of the person in this conversation: a file of yours at a line, a page, one of your terminal tabs, the changes, the timeline" },
+  // The agent's own terminal tabs: a long-running command in a tab of
+  // its own beside the chat, read back and stopped. Never the person's
+  // tabs: the routes list and reach only tabs this agent started.
+  { method: "GET", path: "/api/agent/terminals", why: "list the terminal tabs you started yourself" },
+  { method: "POST", path: "/api/agent/terminals", why: "start a long-running command in a terminal tab of your own beside the chat, approved like any command you run" },
+  { method: "GET", path: "/api/agent/terminals/:id", why: "read the recent output of a terminal tab you started" },
+  { method: "DELETE", path: "/api/agent/terminals/:id", why: "stop and close a terminal tab you started" },
+  { method: "POST", path: "/api/agent/browser", why: "browse in the OwlBot browser while the person watches: open, read, snapshot, click, type, select, scroll, wait, screenshot, switch tabs and answer a page's dialogs" },
+
+  // Who is here, so an agent can address someone by name rather than
+  // guessing. Names, roles and skills only: the roster route already
+  // returns nothing secret.
+  { method: "GET", path: "/api/bots", why: "see who else is in the workspace" },
+  { method: "GET", path: "/api/owlbot", why: "see which rooms exist" },
+  // How the sidebar is arranged, so an agent filing or pinning a teammate
+  // can see where things stand first. The order of the headings is read
+  // here and only the person moves it.
+  { method: "GET", path: "/api/sidebar", why: "see how the sidebar is arranged: its sections in order, and what is pinned where" },
+  // Who reports to whom, as the owner set it, and who to contact for
+  // something, with whether this agent may write to them directly
+  // (server/registry.ts). Reading only: the chart is the owner's, and
+  // /api/registry, where it is set, is on NEVER.
+  { method: "GET", path: "/api/agent/registry", why: "see who reports to whom, the teams, and where you sit" },
+  { method: "GET", path: "/api/agent/registry/contacts", why: "find who to contact for something, and whether to go through your lead" },
+
+  // Saying something to somebody. This is the one that turns a chat
+  // between one agent and one person into a workspace.
+  { method: "POST", path: "/api/bots/:id/messages", why: "say something to another agent" },
+  { method: "POST", path: "/api/bots/:id/take-back", why: "take back its own messages still waiting for another agent" },
+  // Its own questions asked without waiting, and withdrawing one the
+  // person settled some other way. Never an approval, never another's.
+  { method: "GET", path: "/api/bots/:me/questions", why: "list the questions it asked without waiting that nobody has answered yet" },
+  { method: "DELETE", path: "/api/bots/:me/questions/:id", why: "withdraw a question of its own that the person settled some other way, with no answer given for them" },
+  // A new conversation is only ever opened by saying something in it, to
+  // itself or to an agent it may message, and the words go through every
+  // check `say`'s do (GitHub 408). The person's own route for an empty
+  // one, POST /api/bots/:id/tasks, stays off this list.
+  { method: "POST", path: "/api/agent/conversations", why: "open a new conversation, a tab of its own, for itself or another agent it may message, with the first message in it" },
+  { method: "POST", path: "/api/owlbot/:room/messages", why: "say something in a room it is in" },
+  { method: "GET", path: "/api/owlbot/:room/messages", why: "read what was said in a room it is in" },
+  // A room's topics, each a thread of its own (server/room-topics.ts):
+  // only the room's lead may open or close one, which the route checks;
+  // which agents work in it, its folder and its branch are the person's.
+  { method: "POST", path: "/api/owlbot/:room/topics", why: "open a topic in a room it leads, by its title and category" },
+  { method: "PATCH", path: "/api/owlbot/:room/topics/:id", why: "close or reopen a topic in a room it leads" },
+  // and moving a person's message from the main stream into a topic, or
+  // into one it opens for it: the lead only, while the owner lets it,
+  // which the route checks and says in the room
+  { method: "POST", path: "/api/owlbot/:room/topics/move", why: "move a person's message from the main stream of a room it leads into a topic, when the owner lets it" },
+
+  // Getting a colleague, and somewhere to work with them.
+  { method: "POST", path: "/api/bots", why: "hire a teammate" },
+  { method: "POST", path: "/api/owlbot", why: "open a room" },
+  { method: "PATCH", path: "/api/owlbot/:room", why: "change a room it is in" },
+
+  // Work that repeats, and work nobody has been named for.
+  { method: "GET", path: "/api/routines", why: "see what is scheduled" },
+  { method: "POST", path: "/api/routines", why: "file a routine: at a time of day, or a check-in every so often that may answer QUIET" },
+  { method: "PATCH", path: "/api/routines/:id", why: "change a routine" },
+  { method: "DELETE", path: "/api/routines/:id", why: "drop a routine" },
+  { method: "GET", path: "/api/watchers", why: "see its own watchers" },
+  { method: "GET", path: "/api/watchers/:id/looks", why: "see what one of its own watchers' last looks found, and why one did not act" },
+  // An app watcher an agent files is only ever a proposal: the route puts
+  // a card in front of the person and nothing listens until they say yes
+  // (POST /api/watchers/:id/confirm is not on this list, and the route
+  // refuses an agent's PATCH of one).
+  { method: "POST", path: "/api/watchers", why: "watch a folder, a web page or a feed, run a cheap check, wait for the person to arrive at or leave a place, or propose acting on an event in a connected app, and act when it finds something" },
+  { method: "PATCH", path: "/api/watchers/:id", why: "change one of its own watchers without replacing it" },
+  { method: "DELETE", path: "/api/watchers/:id", why: "stop one of its own watchers, or withdraw an app watcher it proposed" },
+  { method: "GET", path: "/api/app-triggers/:id", why: "see the events a connected app can start work on, and the config each asks for" },
+  // Standing intents (server/intents.ts): an agent proposes, the person
+  // approves. Nothing on this list approves, pauses or changes one; the
+  // route files an agent's as a proposal whatever the body says.
+  { method: "GET", path: "/api/intents", why: "see the standing intents it proposed, and whether the person approved each" },
+  { method: "POST", path: "/api/intents", why: "propose a standing intent: whenever some words come up in a conversation, post a note, bring an agent in or message one, once the person approves it" },
+  { method: "DELETE", path: "/api/intents/:id", why: "withdraw a standing intent it proposed that is still waiting for approval" },
+  // Pausing an engine for itself, and only for itself: the route refuses
+  // another agent, longer than a day, and stopping what is running.
+  { method: "GET", path: "/api/engine-pauses", why: "see the engine pauses that apply to it, and until when" },
+  { method: "POST", path: "/api/engine-pauses", why: "pause an engine or a model for itself, up to a day, so its own work waits until then" },
+  { method: "DELETE", path: "/api/engine-pauses/:id", why: "call off a pause it made on itself" },
+  // The incident desk (server/incidents.ts): something failed and this
+  // agent leads, so it reads the incident and takes one of three ways out.
+  // The routes refuse an incident that is not this agent's to lead, and
+  // one that is with the person now; the list itself is the person's.
+  { method: "GET", path: "/api/incidents/:id", why: "read an incident OwlBot handed you because you lead" },
+  { method: "POST", path: "/api/incidents/:id/retry", why: "try a failed thing you lead once more, once" },
+  { method: "POST", path: "/api/incidents/:id/hand", why: "hand a failed thing you lead to a teammate, with what to do" },
+  { method: "POST", path: "/api/incidents/:id/tell", why: "tell the person what a failed thing you lead needs from them, in a card they will see" },
+  { method: "GET", path: "/api/jobs", why: "read the job board" },
+  { method: "POST", path: "/api/jobs", why: "post work to the board" },
+
+  // Its own notes, and nobody else's.
+  { method: "GET", path: "/api/bots/:me/memory", why: "read its own memory" },
+  { method: "GET", path: "/api/bots/:me/recall", why: "look something up in its own past conversations" },
+  { method: "GET", path: "/api/bots/:me/recall/:id", why: "read in full a message its recall found" },
+  // Stopping is an authority: the route allows it only for an agent the
+  // caller hired, or one it outranks in a room they share.
+  { method: "POST", path: "/api/bots/:id/interrupt", why: "stop the current turn of an agent it hired or leads in a room" },
+  { method: "POST", path: "/api/bots/:id/archive", why: "archive an agent it hired, once that agent has nothing left to do" },
+  { method: "POST", path: "/api/bots/:me/notes", why: "suggest a short note about the person, for them to keep or not" },
+  // The person's list (server/todos.ts): its own lines only, by its own
+  // keys. The person closes a line through /api/todos, which stays shut.
+  { method: "GET", path: "/api/bots/:me/todos", why: "see what it put on the person's list, and whether each is still open, done or dismissed" },
+  { method: "POST", path: "/api/bots/:me/todos", why: "put something the person has to do themselves on their list, one line however often it is reported; it waits for them in the morning brief" },
+  { method: "DELETE", path: "/api/bots/:me/todos/:id", why: "clear something it put on the person's list once it no longer needs doing" },
+  // The same secure field the request_secret tool plants, for an engine
+  // that has no such tool. Asking is not a permission: the person still
+  // types the value, and the agent never sees it in the chat.
+  { method: "POST", path: "/api/bots/:me/secrets", why: "ask the person for an API key or other secret, or for its own Telegram bot's token, through a secure field in the chat" },
+  { method: "PUT", path: "/api/bots/:me/memory", why: "write its own memory" },
+  { method: "GET", path: "/api/bots/:me/memory/topics/:id", why: "read one of its own memory topic files" },
+  { method: "PUT", path: "/api/bots/:me/memory/topics/:id", why: "write one of its own memory topic files" },
+  { method: "DELETE", path: "/api/bots/:me/memory/topics/:id", why: "forget one of its own memory topic files" },
+  // What the person keeps for every agent, read only: the write is theirs
+  // alone, and is not on this list.
+  { method: "GET", path: "/api/memory/shared", why: "read the shared memory the person keeps for every agent" },
+  { method: "GET", path: "/api/bots/:me/artifacts", why: "list what it has produced" },
+  // One file into the conversation, as a card the person opens in the
+  // app on any device. The command reads the file, as the agent, and
+  // sends its bytes; the route never reads a path it is given.
+  { method: "POST", path: "/api/bots/:me/artifacts", why: "share one file into the conversation as a card the person can open, and get a link to it" },
+  // One file or one text to the person's Telegram chat with this agent's
+  // own bot, whatever started the turn. Its own bot and its own paired
+  // chat only, and a file from its own folders only: the route judges the
+  // path it is given and the pairing as it stands. Its Telegram settings
+  // stay the person's (/api/bots/:id/telegram is not on this list).
+  { method: "POST", path: "/api/bots/:me/telegram/send", why: "send one file from its working folder or its own files, or a text, to the person's Telegram chat with its own bot, while that bot is paired with them" },
+  // The home, through the owner's Home Assistant (server/home-assistant.ts):
+  // only the entities the owner listed, only for an agent the owner let
+  // in, only in the owner's own turns. Reading is free. A change runs
+  // only on the owner's yes on a card, unless the owner marked it auto;
+  // locks, alarms and garage doors ask every time. The settings, the
+  // token and the list stay the owner's (/api/home is on NEVER).
+  { method: "GET", path: "/api/bots/:me/home/entities", why: "see the Home Assistant entities the owner listed for you, with their states" },
+  { method: "GET", path: "/api/bots/:me/home/history", why: "read one listed Home Assistant entity's recent history" },
+  { method: "POST", path: "/api/bots/:me/home/call", why: "ask to run a Home Assistant service on listed entities, which waits for the owner's yes unless they marked it auto" },
+  { method: "GET", path: "/api/bots/:me/home/requests/:id", why: "wait for the owner's answer to a change to the home you asked for" },
+
+  // Skills it can consult, and its own settings.
+  { method: "GET", path: "/api/skills", why: "see the skill library" },
+  { method: "GET", path: "/api/skills/:id", why: "read one of its skills in full, as it stands or at an earlier version" },
+  // A skill's versions, and asking for a change. Asking is all it is: the
+  // route stages the change for the person whatever the body says, and
+  // refuses one written against a version that has moved on. Editing,
+  // restoring, keeping a suggestion and installing stay the person's
+  // (PUT /api/skills/:id, .../restore, .../fork, /api/skills/proposals,
+  // /api/skills/registry are not on this list, and refuse an agent too).
+  { method: "GET", path: "/api/skills/:id/history", why: "see who changed a skill, when and why, version by version, and how often each version was used" },
+  { method: "GET", path: "/api/skills/:id/history/:id", why: "read one earlier version of a skill in full" },
+  { method: "GET", path: "/api/skills/:id/diff", why: "see what changed in a skill between two versions" },
+  { method: "POST", path: "/api/skills/:id/revisions", why: "propose a revision of a skill against the version it read, for the person to keep, edit or dismiss; it never changes the skill by itself" },
+  { method: "GET", path: "/api/skills/:id/files", why: "list a skill's supporting files, or read one by its path, when the skill's instructions send it there" },
+  // A new skill, asked for whole: its instructions, its supporting files
+  // and whether it wants it for itself, on one card the person answers
+  // (server/skill-requests.ts). Asking is all it is: the route never
+  // writes over a skill already there, and nothing is added until the
+  // person presses Add, through a route on NEVER.
+  { method: "POST", path: "/api/agent/skills", why: "ask to add a new skill to the library, with its supporting files, and to use it itself, on one card the person answers; nothing is added until they press Add" },
+  { method: "GET", path: "/api/agent/skills/:id", why: "wait for the person's answer to a skill it asked to add" },
+
+  // Answering with something other than a paragraph.
+  { method: "POST", path: "/api/bots/:me/show", why: "answer with a chart, a table or another component" },
+  { method: "PATCH", path: "/api/bots/:me", why: "change its own settings" },
+  // A section, a pin and a place among the pins are where a row sits in
+  // the sidebar: they change nothing another agent can do or see, and the
+  // person can move them back. The route itself refuses anything else on
+  // an agent that is not the caller.
+  { method: "PATCH", path: "/api/bots/:id", why: "file a teammate into a sidebar section, pin it or place it among the pins (nothing else of its)" },
+  { method: "PATCH", path: "/api/bots/:me/tasks/:id", why: "rename one of its own conversations" },
+  { method: "DELETE", path: "/api/bots/:me/tasks/:id", why: "close one of its own conversations, once its turn there ends" },
+  { method: "POST", path: "/api/bots/:me/tasks/:id/fresh", why: "start a fresh engine session in the conversation it is in, keeping the transcript" },
+  { method: "POST", path: "/api/bots/:me/tasks/:id/quiet", why: "finish the turn it is in quietly, when nothing in it needs the person" },
+  { method: "GET", path: "/api/bots/:me/tasks/:id/summary", why: "read what the older messages of the conversation it is in were summarised into" },
+  { method: "DELETE", path: "/api/bots/:me/tasks/:id/summary", why: "drop a stale summary of the conversation it is in, so the next turn replays and summarises again" },
+];
+
+/**
+ * Nothing here is reachable with an agent's token, whatever the rules
+ * above say. Kept as its own list rather than trusting the allow list to
+ * be complete: a rule added carelessly should still not open one of
+ * these, and a test can assert every one of them stays shut.
+ */
+export const NEVER = [
+  "/api/config",
+  // how much every agent may do without asking is the person's alone
+  "/api/approvals",
+  "/api/providers",
+  "/api/custom-endpoints",
+  "/api/instances",
+  // which engine an Auto room spends, read for Settings and changed there
+  "/api/room-router",
+  // installing software and opening Terminal are the person's to start
+  "/api/engines",
+  "/api/pair",
+  "/api/mcp-servers",
+  // reading the person's other tools out of their home folder
+  "/api/setup-import",
+  // and their past conversations with those tools
+  "/api/session-import",
+  "/api/ledger",
+  "/api/relay",
+  "/api/calls",
+  // turning the person's recorded speech into text, on their key
+  "/api/speech/transcribe",
+  "/api/terminal",
+  "/api/usage",
+  // the person's plan and the way to their billing, which their own
+  // devices reach too: never a turn's (GitHub 357)
+  "/api/plan",
+  "/api/profile",
+  // a backup is the whole workspace, and a restore replaces it
+  "/api/backups",
+  // every conversation in the workspace in one file, to train on
+  "/api/training-export",
+  // which version of OwlBot runs the workspace is the person's to choose
+  "/api/server-update",
+  // a map of what reaches the person's keys and screen, and its fixes
+  "/api/security",
+  // the secrets saved for agents, by name, and forgetting one: the
+  // person's to keep or drop, never a turn's
+  "/api/secrets",
+  // the connections agents use without the credential, who may use them,
+  // and their audit log: what a turn gets is an address, never a say in
+  // what it reaches (server/connections.ts)
+  "/api/connections",
+  // gh and git on this computer: installing, signing in and setting git
+  // up are the person's to start (server/cli-plugins.ts)
+  "/api/cli-plugins",
+  // workspace extensions: installing one, what it is granted, switching it
+  // off, and the calls its framed documents make through the app's page
+  // (server/extensions.ts). An agent never installs, grants or speaks for one.
+  "/api/extensions",
+  // where the person is, as their phone says it: an agent reads it through
+  // /api/agent/location and never says it, changes it or forgets it
+  "/api/location",
+  // the OwlBot browser's settings, its picture for a phone and another
+  // app's way in: an agent drives it through /api/agent/browser only, and
+  // what sites it may use is the person's to say
+  "/api/browser",
+  // Home Assistant's address, token and list, and the other AI apps' way
+  // in: the owner's. An agent reaches the home through its own routes.
+  "/api/home",
+  // which Signal accounts answer for which agent, and who is let in
+  "/api/signal",
+  // the person's answer to a setting an agent proposed: proposing is an
+  // agent's, the Change is theirs
+  "/api/settings-proposals",
+  // and to other agents' models an agent proposed: the Apply is theirs
+  "/api/model-proposals",
+  // and to a skill an agent asked to add: asking is an agent's, the Add
+  // is theirs
+  "/api/skill-requests",
+  // the person's list as they see it, and closing a line on it: an agent
+  // adds to it and clears its own through /api/bots/:me/todos
+  "/api/todos",
+  // who reports to whom, and whether messages across teams go through a
+  // lead: an agent reads the chart through /api/agent/registry, and never
+  // rearranges who answers to whom
+  "/api/registry",
+];
+
+const PATH_PART = /^[\w.-]+$/;
+
+/**
+ * Which rooms this agent is in.
+ *
+ * Passed in rather than read here, so the rules stay a pure function over
+ * a request and the store stays the caller's business.
+ */
+export type InRoom = (roomId: string) => boolean;
+
+/** Nobody, which is what an unanswerable question should mean here. */
+const NO_ROOMS: InRoom = () => false;
+
+/** Does a request path match a rule's pattern, for this agent. */
+export function matches(pattern: string, path: string, botId: string, inRoom: InRoom = NO_ROOMS): boolean {
+  const want = pattern.split("/");
+  const got = path.split("/");
+  if (want.length !== got.length) return false;
+  for (let i = 0; i < want.length; i++) {
+    if (want[i] === ":me") {
+      if (got[i] !== botId) return false;
+      continue;
+    }
+    if (want[i] === ":room") {
+      if (!PATH_PART.test(got[i] ?? "") || !inRoom(got[i])) return false;
+      continue;
+    }
+    if (want[i] === ":id") {
+      if (!PATH_PART.test(got[i] ?? "")) return false;
+      continue;
+    }
+    if (want[i] !== got[i]) return false;
+  }
+  return true;
+}
+
+/** The same shape, ignoring membership: used only to tell "you are not in
+ * that room" apart from "that is not a thing an agent can do". */
+function shapeMatches(pattern: string, path: string, botId: string): boolean {
+  return matches(pattern.replace(/:room/g, ":id"), path, botId);
+}
+
+export interface Decision {
+  ok: boolean;
+  /** Why it was refused, in words an agent can act on. */
+  reason?: string;
+}
+
+/**
+ * May this agent make this request.
+ *
+ * The refusals say what would have been allowed instead, because the
+ * caller is a model and "not allowed" with no direction is how a turn
+ * turns into six more attempts at the same thing.
+ */
+export function allows(botId: string, method: string, path: string, inRoom: InRoom = NO_ROOMS): Decision {
+  const clean = path.split("?")[0].replace(/\/+$/, "") || "/";
+  for (const prefix of NEVER) {
+    if (clean === prefix || clean.startsWith(`${prefix}/`)) {
+      return { ok: false, reason: `${prefix} is not something an agent can reach` };
+    }
+  }
+  const verb = method.toUpperCase();
+  for (const rule of RULES) {
+    if (rule.method === verb && matches(rule.path, clean, botId, inRoom)) return { ok: true };
+  }
+  // The right shape, the right verb, the wrong room. Said separately
+  // because it is the one refusal here that is about who the agent is
+  // rather than about what agents may do, and an agent told "that is not
+  // allowed" would reasonably try a different route instead of asking to
+  // be added.
+  const roomRule = RULES.find(
+    (rule) => rule.path.includes(":room") && rule.method === verb && shapeMatches(rule.path, clean, botId),
+  );
+  if (roomRule) {
+    return { ok: false, reason: "an agent can only speak in and change the rooms it is in" };
+  }
+  // a path an agent may touch, but not this way
+  const otherVerb = RULES.find((rule) => shapeMatches(rule.path, clean, botId));
+  if (otherVerb) {
+    const verbs = RULES.filter((rule) => shapeMatches(rule.path, clean, botId)).map((r) => r.method);
+    return { ok: false, reason: `${clean} allows ${verbs.join(", ")} for an agent, not ${verb}` };
+  }
+  // its own things, being asked for on somebody else's behalf
+  if (/^\/api\/bots\/[\w-]+\/(memory(\/topics\/[^/]+)?|artifacts)$/.test(clean)) {
+    return { ok: false, reason: "an agent can only read and write its own memory and files" };
+  }
+  if (/^\/api\/bots\/[\w-]+\/telegram\/send$/.test(clean)) {
+    return { ok: false, reason: "an agent can only send files and texts to its own Telegram chat" };
+  }
+  return { ok: false, reason: `${verb} ${clean} is not on the list of things an agent can do` };
+}
+
+/** Everything an agent may do, as sentences, for the prompt and for the
+ * CLI's own help. */
+export function capabilities(): string[] {
+  return RULES.map((rule) => rule.why);
+}
+
+/**
+ * The engines a credential is worth minting for.
+ *
+ * A credential reaches an agent through the environment of the process
+ * its turn runs in, so an engine that is an HTTP call rather than a
+ * process has nowhere to put it and no shell to spend it from. Naming
+ * them rather than excluding the two obvious ones means a driver added
+ * later gets nothing until somebody has decided it should.
+ */
+export const CLI_DRIVERS = new Set(["claudeAgent", "codex", "antigravity", "opencode", "commandcode", "devin", "grokCli", "pi", "cursor", "cline"]);
+
+export function runsAProcess(driverKind: string): boolean {
+  return CLI_DRIVERS.has(driverKind);
+}
+
+// ── the credentials themselves ─────────────────────────────────────────
+
+export class AgentTokens {
+  private byToken = new Map<string, AgentToken>();
+
+  /** One turn, one credential. */
+  mint(botId: string, taskId: string, now: number, seq?: number): AgentToken {
+    const minted: AgentToken = {
+      token: `blk_${randomBytes(24).toString("base64url")}`,
+      botId,
+      taskId,
+      expiresAt: now + TOKEN_TTL_MS,
+      spent: 0,
+      ...(seq !== undefined ? { seq } : {}),
+    };
+    this.byToken.set(minted.token, minted);
+    return minted;
+  }
+
+  mintReply(botId: string, taskId: string, now: number, sender: import("./telegram-people.ts").TelegramReplySender, turn: number): AgentToken {
+    const minted: AgentToken = { token: `blr_${randomBytes(24).toString("base64url")}`, botId, taskId, expiresAt: now + TOKEN_TTL_MS, spent: 0, seq: turn, reply: { sender, turn } };
+    this.byToken.set(minted.token, minted);
+    return minted;
+  }
+
+  /** A credential for one thing: messaging a person on the asker's
+   * behalf. For a turn the owner did not start but an admin did, which
+   * must not carry the owner's whole workspace in its environment. */
+  mintMessenger(botId: string, taskId: string, now: number, seq?: number): AgentToken {
+    const minted: AgentToken = { token: `blm_${randomBytes(24).toString("base64url")}`, botId, taskId, expiresAt: now + TOKEN_TTL_MS, spent: 0, messenger: true, ...(seq !== undefined ? { seq } : {}) };
+    this.byToken.set(minted.token, minted);
+    return minted;
+  }
+
+  /** Who is calling, or nobody. A credential past its hour still works
+   * while its turn is running, and is renewed for another; once the turn
+   * is over it is gone. */
+  identify(token: string | null | undefined, now: number, alive?: TurnAlive): AgentToken | null {
+    if (!token) return null;
+    const found = this.byToken.get(token);
+    if (!found) return null;
+    if (found.expiresAt <= now && !this.renew(found, now, alive)) {
+      this.byToken.delete(token);
+      return null;
+    }
+    return found;
+  }
+
+  private renew(held: AgentToken, now: number, alive?: TurnAlive): boolean {
+    if (!alive?.(held.taskId)) return false;
+    held.expiresAt = now + TOKEN_TTL_MS;
+    return true;
+  }
+
+  /** Whether the turn running in a lane holds the agent's own full
+   * credential, so it can run the CLI as itself. */
+  heldFull(taskId: string): boolean {
+    for (const held of this.byToken.values()) if (held.taskId === taskId && !held.reply && !held.messenger) return true;
+    return false;
+  }
+
+  /** The turn ended. Whatever it was given stops working now rather than
+   * at the end of the hour. */
+  revokeTask(taskId: string) {
+    for (const [token, held] of this.byToken) {
+      if (held.taskId === taskId) this.byToken.delete(token);
+    }
+  }
+
+  /**
+   * Count one change against a credential's budget. Returns false once
+   * the twelve general changes are spent, which the guard turns into a
+   * refusal that says so, or into the kept-back direct message when that
+   * is what was asked for.
+   */
+  spend(token: AgentToken): boolean {
+    if (this.byToken.get(token.token) !== token || token.spent >= TURN_BUDGET) return false;
+    token.spent++;
+    return true;
+  }
+
+  /** The thirteenth change, the kept-back direct message: only once the
+   * twelve are spent, and only once. Called synchronously after delivery
+   * guards, before any recipient write. */
+  claimReport(token: AgentToken, identity: string, now: number, alive?: TurnAlive): ReservedReport {
+    if (this.identify(token.token, now, alive) !== token) {
+      throw Object.assign(new Error("this request's credential expired or was revoked"), { status: 401 });
+    }
+    if (token.spent !== TURN_BUDGET || token.report) {
+      throw Object.assign(new Error("this turn's direct reporting slot is already occupied"), { status: 429 });
+    }
+    return token.report = { identity, dispatched: false, accepted: false, response: REPORT_PENDING };
+  }
+
+  revokeBot(botId: string) {
+    for (const [token, held] of this.byToken) {
+      if (held.botId === botId) this.byToken.delete(token);
+    }
+  }
+
+  sweep(now: number, alive?: TurnAlive) {
+    for (const [token, held] of this.byToken) {
+      if (held.expiresAt <= now && !this.renew(held, now, alive)) this.byToken.delete(token);
+    }
+  }
+
+  get size(): number {
+    return this.byToken.size;
+  }
+}
+
+/**
+ * How an agent with a POSIX shell runs the CLI: through OWLBOT_CLI, which
+ * every turn sets (server/index.ts says why not a path). Spelled so that
+ * a shell without it stops with a sentence saying so. `node ""` runs
+ * nothing and exits 0, so a shell whose engine had kept the variable from
+ * it answered every command with a silence that read as success
+ * (GitHub 336).
+ */
+export const CLI_FROM_ENV = 'node "${OWLBOT_CLI:?not set in this shell}"';
+
+/** What the agent is told, once, when it has a credential. Short on
+ * purpose: a paragraph of instructions in every prompt is a paragraph
+ * competing with the actual request. */
+/** The opening of a turn whose session last ran the CLI some other way.
+ * `before` is the command it was told then, when that was recorded. */
+export function cliMovedNote(command: string, before?: string): string {
+  // the same variable, spelled to stop loudly: nothing has moved
+  if (before?.includes("OWLBOT_CLI")) {
+    return `(Run the owlbot command as \`${command}\` from now on. When this shell does not have OWLBOT_CLI it stops with an error saying so, where \`${before}\` quietly did nothing.)`;
+  }
+  return before
+    ? `(OwlBot has moved since your earlier turns. Run its command as \`${command}\` from now on. Earlier commands in this conversation that run \`${before}\` reach the copy that used to be there, so do not reuse them.)`
+    : `(Run the owlbot command as \`${command}\` from now on. Earlier commands in this conversation that run owlbot.mjs from a written-out path may reach an older copy of OwlBot that has since moved, so do not reuse them.)`;
+}
+
+/**
+ * How an agent asks for a key, said in terms of what it actually has
+ * (GitHub 172). Claude Code and the API engines with tools have the
+ * request_secret tool, the other engines with a credential have `secret`
+ * on the command line, and an engine with neither is told nothing, since
+ * pointing it at a tool it cannot call only makes it pretend to.
+ */
+export function secretHint(route: "tool" | "cli" | null, command: string): string | null {
+  if (route === "tool") {
+    return "When a task needs an API key or other secret from the user, call the request_secret tool and they get a secure field in the chat; never ask for keys in plain conversation.";
+  }
+  if (route === "cli") {
+    return `When a task needs an API key or other secret from the user, run \`${command} secret "<what it is>" --hint "<where to find it>"\` and they get a secure field in the chat; never ask for keys in plain conversation.`;
+  }
+  return null;
+}
+
+/** How a turn that may message people is told to, in terms of what its
+ * engine has: a tool, the command line, or nothing at all. */
+export function messageHint(route: "tool" | "cli" | null, command: string): string | null {
+  if (route === "tool") return "send it with the message_person tool";
+  if (route === "cli") return `send it by running \`${command} message-person "<their name>" "<the message>"\``;
+  return null;
+}
+
+export function cliBriefing(command: string): string {
+  return [
+    `You can act on this workspace yourself, not only describe what should happen. Run \`${command} help\` to see how.`,
+    "Use it when you have decided something needs doing: hiring a teammate, opening a room, filing a routine, posting a job, saying something to another agent.",
+    "Its `recall <words>` searches your past conversations when something may have come up before.",
+    "It answers JSON. Your credential is already in the environment and only lasts this turn.",
+  ].join(" ");
+}

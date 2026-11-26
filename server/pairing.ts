@@ -1,0 +1,535 @@
+// Pairing, for the case where the client is not on this machine.
+//
+// The loopback API carries no credential because loopback *is* the
+// credential (server/http-guard.ts explains why that holds, and where it
+// stops holding). The moment this server answers anything but loopback
+// that argument is gone, so remote access is a different thing with its
+// own boundary: a bearer token, handed out once, to somebody who could
+// read a six digit code off the Mac's own screen.
+//
+// Two deliberate choices worth knowing before changing anything here:
+//
+//   Off by default, and on takes a restart. Widening what a server
+//   listens on is a decision rather than a toggle, and re-binding a live
+//   process that is holding open SSE streams is a good way to invent
+//   bugs. Until the app restarts, nothing outside loopback can connect
+//   at all, whatever the config says.
+//
+//   The code never touches disk and the token never comes back off it.
+//   Only a SHA-256 of each token is stored, so a stolen config file
+//   cannot be replayed as a paired device.
+import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { hostname, networkInterfaces } from "node:os";
+import { join } from "node:path";
+
+import { DATA_DIR, loadConfig, saveConfig, type AppConfig } from "./config.ts";
+import { readSaved } from "./atomic-write.ts";
+import { directDoor, listenAddress, publicUrls } from "./self-host.ts";
+
+/** A device that completed pairing. The token itself is shown exactly
+ * once, at claim time, and only its digest is kept. */
+export interface PairedDevice {
+  id: string;
+  name: string;
+  /** sha256 of the bearer token, hex. Never the token. */
+  hash: string;
+  pairedAt: number;
+  /** Set on a device that belongs to a member of a shared room rather
+   * than to the owner. Its presence is the whole difference: an owner's
+   * device reaches the remote surface, a member's reaches only what
+   * server/member-access.ts allows for their rooms. */
+  personId?: string;
+}
+
+/** What the Mac shows on its pairing screen. Carries no secrets. */
+export interface PairingStatus {
+  enabled: boolean;
+  /** What the server actually bound to, which lags `enabled` by a restart. */
+  listening: "loopback" | "network";
+  restartRequired: boolean;
+  pending: boolean;
+  devices: Array<{ id: string; name: string; pairedAt: number; lastSeen?: number; client?: string }>;
+  /** Addresses a phone on the same network can reach, for the QR/URL. */
+  addresses: string[];
+}
+
+const CODE_TTL_MS = 5 * 60_000;
+/** A six digit code is a million guesses; five tries makes that safe and
+ * still forgives someone fat-fingering it on a phone keyboard. */
+const MAX_ATTEMPTS = 5;
+const MAX_DEVICES = 16;
+const MAX_NAME = 60;
+
+/** In memory only, and only ever one at a time. A pairing code that
+ * outlived the process it was shown by is not a code, it is a hole. */
+let pending: { code: string; token: string; expires: number; tries: number } | null = null;
+
+/** Set once at startup, so the UI can tell "on" from "on after you
+ * restart". Nothing here changes what a running server listens on. */
+let boundToNetwork = false;
+
+/** Last request time per device, kept off disk: writing a file on every
+ * request to record that a request happened is not a trade worth making. */
+const seen = new Map<string, number>();
+
+/** The app build each device said it runs on its last request, the way it
+ * said it ("iOS 2.1.6 (15)"). Off disk for the same reason as `seen`, and
+ * because it is learned again on the very next request anyway. */
+const clients = new Map<string, string>();
+const MAX_CLIENT = 40;
+
+const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+
+/** Constant time compare for equal-length secrets. Length is allowed to
+ * leak: the length of a code and of a hex digest are both public. */
+function sameSecret(a: string, b: string): boolean {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  if (x.length !== y.length) return false;
+  return timingSafeEqual(x, y);
+}
+
+/** config.json is a file a person can open and edit, so a device record
+ * is checked rather than trusted. A malformed one is dropped, not
+ * repaired: half a credential should never authenticate anything. */
+function isDevice(value: unknown): value is PairedDevice {
+  const d = value as PairedDevice | null;
+  return (
+    typeof d === "object" &&
+    d !== null &&
+    typeof d.id === "string" &&
+    typeof d.name === "string" &&
+    typeof d.hash === "string" &&
+    // a digest is 64 hex characters; anything else was not written by us
+    /^[0-9a-f]{64}$/.test(d.hash) &&
+    typeof d.pairedAt === "number"
+  );
+}
+
+/** The paired devices, digests and all, the owner's and members' both.
+ * The relay link needs the digest to derive each device's key; nothing
+ * else outside this file does. */
+export function pairedDevices(config?: AppConfig): PairedDevice[] {
+  return [...devices(config), ...memberDevices(config)];
+}
+
+/** Members' devices live in their own list: they do not count against the
+ * owner's sixteen, and never appear on the owner's device screen, where a
+ * guest's phone would read as one of the owner's own. */
+const MAX_MEMBER_DEVICES = 200;
+
+export function memberDevices(config: AppConfig = loadConfig()): PairedDevice[] {
+  const list = config.remote?.memberDevices;
+  return Array.isArray(list)
+    ? list.filter((d): d is PairedDevice => isDevice(d) && typeof d.personId === "string")
+    : [];
+}
+
+function putMemberDevices(list: PairedDevice[]): void {
+  saveConfig({ remote: { ...loadConfig().remote, memberDevices: list } });
+}
+
+/** Registers a member's device from the digest of a token the device made
+ * itself: the token never crosses to this machine, only its hash. */
+export function addMemberDevice(personId: string, name: unknown, hash: string): PairedDevice {
+  if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error("not a token digest");
+  const device: PairedDevice = {
+    id: randomBytes(8).toString("hex"),
+    name: cleanName(name),
+    hash,
+    pairedAt: Date.now(),
+    personId,
+  };
+  putMemberDevices([...memberDevices(), device].slice(-MAX_MEMBER_DEVICES));
+  return device;
+}
+
+/** Every device a person has, gone at once. Returns how many. */
+export function revokePerson(personId: string): number {
+  const list = memberDevices();
+  const left = list.filter((d) => d.personId !== personId);
+  if (left.length !== list.length) putMemberDevices(left);
+  for (const d of list) if (d.personId === personId) seen.delete(d.id);
+  return list.length - left.length;
+}
+
+function devices(config: AppConfig = loadConfig()): PairedDevice[] {
+  const list = config.remote?.devices;
+  return Array.isArray(list) ? list.filter(isDevice) : [];
+}
+
+function putDevices(list: PairedDevice[], beforeWrite?: () => void): AppConfig {
+  return saveConfig({ remote: { ...loadConfig().remote, devices: list } }, beforeWrite);
+}
+
+export function remoteEnabled(config?: AppConfig): boolean {
+  // owlbot-server: no screen to flip the switch on, and nothing but the
+  // relay can reach it (bindHost below keeps it on loopback), so the
+  // remote surface is on and the relay is its only door, or the door its
+  // owner gave it (server/self-host.ts)
+  if (process.env.OWLBOT_LOOPBACK_ONLY === "1") return true;
+  return (config ?? loadConfig()).remote?.enabled === true;
+}
+
+export function setRemoteEnabled(on: boolean): AppConfig {
+  const saved = saveConfig({ remote: { ...loadConfig().remote, enabled: on } });
+  // Turning it off should mean off right now, not at the next restart.
+  // The bind cannot narrow without one, so drop the pending code and let
+  // the guard refuse everything remote in the meantime.
+  if (!on) pending = null;
+  return saved;
+}
+
+/** Which interface to bind. Read once, at startup, by design. On the
+ * network it is IPv4 and IPv6 both ("::" takes both), so a phone can come
+ * over a Tailscale IPv6 address (GitHub 449): iOS talks plain HTTP to an
+ * IPv6 unique local address, as it does to the home network, and refuses
+ * Tailscale's IPv4 one. Which IPv6 peers may connect at all is
+ * reachablePeer's to say. */
+export function bindHost(): string {
+  // owlbot-server sets this: on a machine with a public address, OwlBot
+  // Cloud is the only way in, whatever the pairing switch says, unless
+  // whoever runs it said OWLBOT_LISTEN (in a container, behind its
+  // published port), where a paired device's token is the way in
+  // (server/self-host.ts)
+  if (process.env.OWLBOT_LOOPBACK_ONLY === "1") return listenAddress() ?? "127.0.0.1";
+  return remoteEnabled() ? "::" : "127.0.0.1";
+}
+
+/** The bind for a machine with no IPv6 at all, where "::" cannot be had. */
+export const IPV4_BIND = "0.0.0.0";
+
+/**
+ * Whether a peer may open a connection to the network bind. Every IPv4
+ * peer, as before IPv6 was listened on, and of IPv6 only what is local:
+ * loopback, unique local (fc00::/7, Tailscale's among them) and
+ * link-local. A global IPv6 address is the open internet on many
+ * networks, with no NAT in front of it, so listening on IPv6 must not
+ * widen who can reach this port beyond the networks it reached before.
+ */
+export function reachablePeer(address: string | undefined): boolean {
+  if (!address) return false;
+  const bare = address.toLowerCase().split("%")[0];
+  if (bare.startsWith("::ffff:") || !bare.includes(":")) return true;
+  if (bare === "::1") return true;
+  if (bare.startsWith("fc") || bare.startsWith("fd")) return true;
+  return /^fe[89ab]/.test(bare);
+}
+
+/** Records what the server actually bound, so status can be honest about
+ * a toggle that has not taken effect yet. */
+export function noteBound(host: string): void {
+  boundToNetwork = host !== "127.0.0.1";
+}
+
+/** Opens a pairing window. The ttl is a parameter so the expiry can be
+ * tested without a fake clock; callers should leave it alone. */
+export function startPairing(ttlMs: number = CODE_TTL_MS): {
+  code: string;
+  token: string;
+  expiresAt: number;
+} {
+  const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
+  // the QR carries this instead of the code: real entropy, no typing.
+  // Scanning replaces typing, never consent; the phone still confirms.
+  const token = `owlbot_pair_${randomBytes(24).toString("base64url")}`;
+  pending = { code, token, expires: Date.now() + ttlMs, tries: 0 };
+  return { code, token, expiresAt: pending.expires };
+}
+
+export function cancelPairing(): void {
+  pending = null;
+}
+
+export function pairingPending(): boolean {
+  return Boolean(pending && Date.now() <= pending.expires);
+}
+
+function cleanName(value: unknown): string {
+  const name = typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
+  return (name || "A device").slice(0, MAX_NAME);
+}
+
+/**
+ * Trades a correct code for a bearer token, once. Wrong guesses burn an
+ * attempt; the fifth one closes the window rather than merely failing,
+ * so a code cannot be ground down.
+ */
+export function claimPairing(
+  code: unknown,
+  name: unknown,
+  onSaved?: (config: AppConfig) => void,
+): { token: string; device: Omit<PairedDevice, "hash"> } | null {
+  if (!pending || Date.now() > pending.expires) {
+    pending = null;
+    return null;
+  }
+  if (++pending.tries > MAX_ATTEMPTS) {
+    pending = null;
+    return null;
+  }
+  const offered = typeof code === "string" ? code : "";
+  // either credential opens the door; both burn together on success
+  const matches =
+    (offered.length === pending.code.length && sameSecret(offered, pending.code)) ||
+    (offered.length === pending.token.length && sameSecret(offered, pending.token));
+  if (!matches) return null;
+
+  const token = randomBytes(32).toString("base64url");
+  const device: PairedDevice = {
+    id: randomBytes(8).toString("hex"),
+    name: cleanName(name),
+    hash: sha256(token),
+    pairedAt: Date.now(),
+  };
+  // Oldest out first. An unbounded list is a config file that grows
+  // forever and a revoke screen nobody can read.
+  const list = [...devices(), device].slice(-MAX_DEVICES);
+  const saved = putDevices(list, () => { pending = null; }); // single use, spent after the reads
+  onSaved?.(saved);
+  const { hash: _hash, ...safe } = device;
+  return { token, device: safe };
+}
+
+/**
+ * A paired phone checking that the OwlBot at a new address is the one it
+ * paired with, before its token goes there (it moved port, or the router
+ * gave it a new address). The phone names itself by a hint, the first 16
+ * hex of a SHA-256 of its token's digest, and sends a nonce; this answers
+ * with an HMAC of the nonce keyed by that digest, which only an OwlBot that
+ * holds the pairing can make. The token itself never travels, and an OwlBot
+ * that announces itself under someone else's tag cannot answer.
+ */
+export function proveDevice(hint: unknown, nonce: unknown, config?: AppConfig): string | null {
+  if (typeof hint !== "string" || !/^[0-9a-f]{16}$/.test(hint)) return null;
+  if (typeof nonce !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(nonce)) return null;
+  const device = devices(config).find((d) => sha256(d.hash).startsWith(hint));
+  if (!device) return null;
+  return createHmac("sha256", device.hash).update(`owlbot-prove:${nonce}`).digest("hex");
+}
+
+/** The device a token belongs to, or null. Compares digests, not tokens,
+ * so nothing reversible is held in memory either. */
+export function deviceForToken(token: string | null, config?: AppConfig): PairedDevice | null {
+  if (!token) return null;
+  const digest = sha256(token);
+  for (const device of pairedDevices(config)) {
+    if (typeof device?.hash === "string" && sameSecret(digest, device.hash)) {
+      markSeen(device.id);
+      return device;
+    }
+  }
+  return null;
+}
+
+/** When a paired device was last heard from, or null since this start. */
+export function seenAt(deviceId: string): number | null {
+  return seen.get(deviceId) ?? null;
+}
+
+/** Note that a paired device was just heard from. A token on the network
+ * says so in deviceForToken; a sealed request through OwlBot Cloud never
+ * shows a token, so the relay says so itself once the request opens. */
+export function markSeen(deviceId: string): void {
+  seen.set(deviceId, Date.now());
+}
+
+/** Remember which build of the app a paired device runs, from the
+ * x-owlbot-client header (or the relay's `client` field) it sends. The App
+ * Store and this Mac update on their own schedules, so when a phone
+ * misbehaves the first question is which phone, and this answers it on
+ * the device list. Anything but a short plain label is ignored. */
+export function noteClient(deviceId: string, label: unknown): void {
+  if (typeof label !== "string") return;
+  const clean = label.trim();
+  if (!clean || clean.length > MAX_CLIENT || !/^[\w .()+/-]+$/.test(clean)) return;
+  clients.set(deviceId, clean);
+}
+
+export function revokeDevice(id: string, onSaved?: (config: AppConfig) => void): boolean {
+  const list = devices();
+  const left = list.filter((d) => d.id !== id);
+  if (left.length === list.length) return false;
+  const saved = putDevices(left);
+  seen.delete(id);
+  clients.delete(id);
+  onSaved?.(saved);
+  return true;
+}
+
+export function revokeAll(): AppConfig {
+  const saved = putDevices([]);
+  seen.clear();
+  clients.clear();
+  return saved;
+}
+
+/** Addresses on this machine a phone could actually reach: not loopback,
+ * not link-local, and of IPv6 only unique local addresses (reachablePeer).
+ * The home network's first, since that is the usual way in; then an IPv6
+ * unique local one, Tailscale's first, which iOS talks plain HTTP to from
+ * anywhere on the tailnet; then a Tailscale IPv4 address, which iOS does
+ * not, but other clients do; then anything else. The QR offers each, and
+ * draws the first unless the person picks another (GitHub 449). */
+export function lanAddresses(found: ReturnType<typeof networkInterfaces> = networkInterfaces()): string[] {
+  const out: string[] = [];
+  for (const entries of Object.values(found)) {
+    for (const entry of entries ?? []) {
+      if (entry.internal) continue;
+      if (entry.family === "IPv4") {
+        if (entry.address.startsWith("169.254.")) continue;
+        out.push(entry.address);
+      } else if (entry.family === "IPv6" && /^f[cd]/i.test(entry.address)) {
+        out.push(entry.address.toLowerCase());
+      }
+    }
+  }
+  const rank = (address: string) => {
+    if (address.includes(":")) return address.startsWith("fd7a:115c:a1e0:") ? 1 : 2;
+    const [a, b] = address.split(".").map(Number);
+    if (a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)) return 0;
+    if (a === 100 && b >= 64 && b <= 127) return 3;
+    return 4;
+  };
+  // a stable sort: interfaces of one kind keep the order the system gave
+  return out.map((address, i) => ({ address, i })).sort((x, y) => rank(x.address) - rank(y.address) || x.i - y.i).map((x) => x.address);
+}
+
+/**
+ * What a phone calls this computer when it asks "Pair with ...?": the name
+ * set in System Settings on a Mac, else the host name without ".local".
+ * OWLBOT_COMPUTER_NAME stands in for it, so pictures of the app can show a
+ * made-up computer rather than the one they were taken on.
+ */
+let computer: string | null = null;
+export function computerName(env: NodeJS.ProcessEnv = process.env, platform: string = process.platform): string {
+  const given = env.OWLBOT_COMPUTER_NAME?.trim();
+  if (given) return given.slice(0, 60);
+  if (computer !== null) return computer;
+  let name = "";
+  if (platform === "darwin") {
+    try {
+      name = execFileSync("/usr/sbin/scutil", ["--get", "ComputerName"], { encoding: "utf8", timeout: 2000 }).trim();
+    } catch {
+      // no name set, or scutil missing: the host name below will do
+    }
+  }
+  computer = (name || hostname().replace(/\.local$/i, "")).slice(0, 60);
+  return computer;
+}
+
+export function pairingStatus(config: AppConfig = loadConfig()): PairingStatus {
+  const enabled = remoteEnabled(config);
+  // owlbot-server stays on loopback by design, so no restart would ever
+  // bring it onto the network, and no address on it is one a phone could
+  // dial: OwlBot Cloud is the only door, and the status says so. Unless
+  // its owner gave it a door of their own (server/self-host.ts): then the
+  // addresses a phone dials are the ones they gave, never this machine's
+  // own, which in a container or behind a proxy reach nothing.
+  const headless = process.env.OWLBOT_LOOPBACK_ONLY === "1";
+  const direct = headless && directDoor();
+  const cloudOnly = headless && !direct;
+  return {
+    enabled,
+    listening: boundToNetwork || direct ? "network" : "loopback",
+    restartRequired: !headless && enabled !== boundToNetwork,
+    pending: pairingPending(),
+    devices: devices(config).map((d) => ({
+      id: d.id,
+      name: d.name,
+      pairedAt: d.pairedAt,
+      ...(seen.has(d.id) ? { lastSeen: seen.get(d.id) } : {}),
+      ...(clients.has(d.id) ? { client: clients.get(d.id) } : {}),
+    })),
+    addresses: !enabled || cloudOnly ? [] : direct ? publicUrls() : lanAddresses(),
+  };
+}
+
+// ── pairing through the relay ──────────────────────────────────────────
+// A computer with no screen of its own (a server in a cupboard, a VPS)
+// cannot show a six digit code to a phone on the same wifi, and usually
+// is not on the same wifi at all. So it prints a link instead: the relay,
+// the owner's relay pass, and a one time secret, all after the # where no
+// server ever reads them. Whoever opens it in OwlBot becomes one of the
+// owner's devices.
+//
+// That is the same trust the six digit code carries, and it holds for the
+// same reason: the link is only ever shown to whoever is at the host's own
+// terminal or screen, or on one of the owner's own paired devices, which
+// already reaches everything the link would let in (GitHub 403). It works
+// once, for fifteen minutes.
+//
+// Unused links are kept in ~/.owlbot (the secret's digest and expiry, never
+// the secret), beside the paired devices' digests, which are the same kind
+// of thing. Kept in memory alone, a link was known only to the process that
+// made it, and two OwlBot on one ~/.owlbot (the app beside owlbot-server) are
+// common: `owlbot-server pair` asks one, the relay hands the claim to the
+// other, and every fresh link read as "already used".
+
+export const PAIR_LINK_TTL_MS = 15 * 60_000;
+
+interface PairLink {
+  id: string;
+  secretHash: string;
+  expiresAt: number;
+}
+
+const linksFile = () => join(DATA_DIR, "pair-links.json");
+
+/** The unexpired links, from disk. A missing or broken file is none. */
+function readLinks(): PairLink[] {
+  const list = readSaved<PairLink[]>(linksFile(), [], Array.isArray);
+  const now = Date.now();
+  return list.filter((l) => typeof l?.id === "string" && typeof l?.secretHash === "string" && l.expiresAt > now);
+}
+
+function writeLinks(list: PairLink[]) {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+    const temp = `${linksFile()}.${process.pid}.tmp`;
+    writeFileSync(temp, JSON.stringify(list), { mode: 0o600 });
+    renameSync(temp, linksFile());
+  } catch {
+    /* this process still knows the link; only a second one would not */
+  }
+}
+
+/** Mints a link. The secret is returned once, and only its digest kept. */
+export function createPairLink(ttlMs: number = PAIR_LINK_TTL_MS): { id: string; secret: string; expiresAt: number } {
+  const now = Date.now();
+  const id = `pair_${randomBytes(9).toString("base64url")}`;
+  const secret = randomBytes(32).toString("base64url");
+  const link = { id, secretHash: sha256(secret), expiresAt: now + ttlMs };
+  // a handful at most: a link lives fifteen minutes and is made by hand
+  writeLinks([...readLinks(), link].slice(-20));
+  return { id, secret, expiresAt: link.expiresAt };
+}
+
+/** The digest the relay link needs to open an envelope for this link, or
+ * null once it is used, expired or unknown. */
+export function pairLinkSecret(id: string): string | null {
+  return readLinks().find((l) => l.id === id)?.secretHash ?? null;
+}
+
+/** Spends a link on the device that opened it. The device made its own
+ * token and sends only that token's digest, so nothing that could be
+ * replayed crosses the relay. */
+export function claimPairLink(id: string, name: unknown, tokenHash: unknown, onSaved?: (config: AppConfig) => void): Omit<PairedDevice, "hash"> | null {
+  const links = readLinks();
+  if (!links.some((l) => l.id === id)) return null;
+  if (typeof tokenHash !== "string" || !/^[0-9a-f]{64}$/.test(tokenHash)) return null;
+  const device: PairedDevice = {
+    id: randomBytes(8).toString("hex"),
+    name: cleanName(name),
+    hash: tokenHash,
+    pairedAt: Date.now(),
+  };
+  // Read both stores before either write. Still spend the link before
+  // saving the device, as before, after the config read has succeeded.
+  const saved = putDevices([...devices(), device].slice(-MAX_DEVICES), () => writeLinks(links.filter((l) => l.id !== id)));
+  onSaved?.(saved);
+  const { hash: _hash, ...safe } = device;
+  return safe;
+}

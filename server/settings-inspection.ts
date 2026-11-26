@@ -1,0 +1,132 @@
+// Safe observations over already-loaded settings. No stores, providers or IO.
+import { resolveMode } from "./delivery.ts";
+import { resolveBackgroundWork } from "./background-work.ts";
+import { agentTaskBudget, agentTurnLimit } from "./agent-chain.ts";
+
+export type InspectionScalar = string | number | boolean | null;
+export type InspectionValue =
+  | { status: "value"; value: InspectionScalar }
+  | { status: "policy"; policy: string }
+  | { status: "unknown"; reason: string }
+  | { status: "values"; values: InspectionScalar[] }
+  | { status: "absent" }
+  | { status: "configured"; configured: boolean }
+  | { status: "omitted"; reason: "size_limit" }
+  | { status: "unsupported"; reason: "invalid_value" };
+
+export interface InspectionField {
+  id: string;
+  scope: "workspace" | "agent" | "room" | "automation" | "project" | "skill";
+  control: string;
+  saved: InspectionValue;
+  effective: InspectionValue;
+}
+
+export const INSPECTION_TEXT_CHARS = 256;
+export const WORKSPACE_INSPECTION_BYTES = 16_384;
+
+// Missing and malformed owner values are distinct. Never invoke a getter or
+// follow inherited keys when projecting an object supplied by another owner.
+export function ownAt(root: unknown, section: string, field: string): { present: boolean; value: unknown } {
+  if (!root || typeof root !== "object" || Array.isArray(root)) return { present: false, value: undefined };
+  const parent = Object.getOwnPropertyDescriptor(root, section);
+  if (!parent || !("value" in parent) || !parent.value || typeof parent.value !== "object" || Array.isArray(parent.value)) {
+    return { present: false, value: undefined };
+  }
+  const leaf = Object.getOwnPropertyDescriptor(parent.value, field);
+  return leaf ? { present: true, value: "value" in leaf ? leaf.value : undefined } : { present: false, value: undefined };
+}
+
+export function scalar(value: unknown, redact: (text: string) => string): InspectionValue {
+  if (value === null || typeof value === "boolean") return { status: "value", value };
+  if (typeof value === "number" && Number.isFinite(value)) return { status: "value", value };
+  if (typeof value !== "string") return { status: "unsupported", reason: "invalid_value" };
+  // Omit oversized values whole, never cut through a protected value.
+  if (Array.from(value).length > INSPECTION_TEXT_CHARS) return { status: "omitted", reason: "size_limit" };
+  try {
+    const safe = redact(value);
+    if (typeof safe !== "string") return { status: "unsupported", reason: "invalid_value" };
+    return Array.from(safe).length > INSPECTION_TEXT_CHARS
+      ? { status: "omitted", reason: "size_limit" }
+      : { status: "value", value: safe };
+  } catch {
+    return { status: "unsupported", reason: "invalid_value" };
+  }
+}
+
+export interface WorkspaceInspectionInput {
+  // Raw saved values are used only to distinguish what was saved. Runtime
+  // values have already passed the owner's environment/legacy precedence.
+  saved: unknown;
+  runtime: unknown;
+  resolved: { beforeTurn: number; beforeTurnAt: number; stallMinutes: number };
+  redact: (text: string) => string;
+}
+
+/** First projection slice: workspace behavior, profile and credential status.
+ * Other families, authenticated routing, continuation and devices are separate
+ * integration work. This function does not claim complete settings coverage. */
+export function inspectWorkspaceSettings(input: WorkspaceInspectionInput): InspectionField[] {
+  const fields: InspectionField[] = [];
+  const add = (section: string, key: string, control: string, effective: unknown, credential = false) => {
+    const stored = ownAt(input.saved, section, key);
+    fields.push({
+      id: `${section}.${key}`,
+      scope: "workspace",
+      control,
+      saved: !stored.present ? { status: "absent" } : credential
+        ? { status: "configured", configured: Boolean(stored.value) }
+        : scalar(stored.value, input.redact),
+      effective: credential ? { status: "configured", configured: Boolean(effective) } : scalar(effective, input.redact),
+    });
+  };
+  const value = (section: string, key: string) => ownAt(input.runtime, section, key).value;
+  const general = "Settings > Behaviour";
+  add("compaction", "micro", general, Boolean(value("compaction", "micro")));
+  add("compaction", "idle", general, Boolean(value("compaction", "idle")));
+  add("compaction", "beforeTurn", general, input.resolved.beforeTurn);
+  add("compaction", "beforeTurnAt", "config.json > compaction.beforeTurnAt", input.resolved.beforeTurnAt);
+  add("turns", "stallMinutes", general, input.resolved.stallMinutes);
+  add("turns", "backgroundWork", general, resolveBackgroundWork(undefined, value("turns", "backgroundWork")));
+  add("recall", "beforeTurn", general, value("recall", "beforeTurn") !== false);
+  add("memory", "tidy", general, value("memory", "tidy") !== false);
+  add("agents", "turnLimit", general, agentTurnLimit(value("agents", "turnLimit")));
+  // none unless the person allowed one (GitHub 326)
+  add("agents", "taskBudget", general, agentTaskBudget(value("agents", "taskBudget")));
+  // the incident desk (server/incidents.ts): on unless turned off, and
+  // who leads, which is "auto" unless the person chose
+  add("incidents", "enabled", general, value("incidents", "enabled") !== false);
+  add("incidents", "lead", general, typeof value("incidents", "lead") === "string" ? value("incidents", "lead") : "auto");
+  add("delivery", "mode", general, resolveMode(undefined, value("delivery", "mode")));
+  add("delivery", "askModel", general, value("delivery", "askModel") === true);
+  // the engine an Auto room asks (server/room-route.ts), null for the
+  // room's own engines
+  add("rooms", "router", general, typeof value("rooms", "router") === "string" ? value("rooms", "router") : null);
+  // how eager skill suggestions are: unset reads the switch it replaced,
+  // the way server/proposals.ts (eagernessOf) does
+  const learnSaid = value("skills", "learn");
+  const learn = learnSaid === "off" || learnSaid === "suggest" || learnSaid === "more" ? learnSaid : value("skills", "propose") ? "suggest" : "off";
+  add("skills", "propose", general, learn !== "off");
+  add("skills", "learn", general, learn);
+  add("changes", "showShared", general, value("changes", "showShared") !== false);
+  // OwlBot credits (server/credits.ts): background work spends them only
+  // when the person turned this on
+  add("credits", "background", "Settings > Plan > OwlBot AI", value("credits", "background") === true);
+  add("shortcuts", "quickAsk", "Settings > General > Quick ask shortcut", value("shortcuts", "quickAsk") ?? null);
+  add("profile", "about", "Settings > About you", value("profile", "about") ?? "");
+  const name = value("profile", "name");
+  add("profile", "name", "Settings > General > Your name", typeof name === "string" ? name.trim() || "The owner" : "The owner");
+  for (const [section, key, control] of [
+    ["composio", "key", "Settings > Apps and keys > Composio Connect key"],
+    ["composio", "apiKey", "Settings > Apps and keys > Composio API key"],
+    ["speech", "elevenlabsKey", "Settings > Voices > Keys"],
+    ["speech", "openaiKey", "Settings > Voices > Keys"],
+    ["speech", "fishKey", "Settings > Voices > Keys"],
+    ["speech", "xaiKey", "Settings > Voices > Keys"],
+    ["box", "token", "Settings > Computers > Boat API key"],
+    ["credits", "licence", "Settings > Plan > Your key"],
+    ["credits", "token", "Settings > Plan > OwlBot AI"],
+  ] as const) add(section, key, control, value(section, key), true);
+  // Finite fields and whole-value string bounds keep this slice bounded.
+  return fields;
+}

@@ -1,0 +1,242 @@
+// A new version, said where people look.
+//
+// The updater downloads a release on its own and installs it on the next
+// quit, but most people leave OwlBot open for days, and the only place that
+// said an update was waiting was the About card in Settings. So once one
+// has downloaded, an orange button sits on the main rail above Settings,
+// and pressing it opens a card with the one button that matters. "Not
+// now" hides that version only; the next release asks again. In a plain
+// browser tab there is no updater, so there is never a button.
+//
+// Relaunching waits for running turns to finish first (server/drain.ts),
+// which can take a while, so meanwhile the card says what it is waiting
+// for and offers to restart now or to call it off and update later.
+//
+// A relaunch that came back on the version it left says so here, once,
+// with the two ways forward, where it would have offered the same button
+// as if it had never been pressed (GitHub 267).
+import { useEffect, useState } from "react";
+import { ArrowDownToLine } from "@/components/icons";
+import { RefreshCw } from "@/components/icons";
+import { X } from "@/components/icons";
+import type { UpdateState } from "@/types/bridge";
+import { cn } from "@/lib/cn";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { t, tr } from "@/lib/i18n";
+
+const DISMISSED = "owlbot.updateCardDismissed";
+
+function dismissedVersion(): string | null {
+  try {
+    return localStorage.getItem(DISMISSED);
+  } catch {
+    return null;
+  }
+}
+
+/** What an install is waiting for, while it waits. */
+export function drainingLine(draining: NonNullable<UpdateState["draining"]>, now = Date.now()): string {
+  const n = draining.running;
+  const minutes = draining.deadline ? Math.ceil((draining.deadline - now) / 60_000) : null;
+  // a whole sentence for each case, so a language orders it its own way
+  if (n > 0) {
+    if (minutes === null) return t("updateCard.finishingReplies", { count: n });
+    return minutes > 1
+      ? t("updateCard.finishingRepliesMinutes", { count: n, minutes })
+      : t("updateCard.finishingRepliesUnderMinute", { count: n });
+  }
+  if (minutes === null) return t("updateCard.finishingRunning");
+  return minutes > 1 ? t("updateCard.finishingRunningMinutes", { minutes }) : t("updateCard.finishingRunningUnderMinute");
+}
+
+/**
+ * The update, from the main rail: an orange button above Settings while a
+ * release waits for a relaunch, and the card itself one press away. The
+ * card says what pressing will do, and while it waits for running turns
+ * it is the way to restart now or call it off.
+ */
+export function UpdateRailButton() {
+  const [update, setUpdate] = useState<UpdateState>({ state: "idle" });
+  const [hidden, setHidden] = useState<string | null>(dismissedVersion);
+  useEffect(() => {
+    void window.owlbot?.updateState?.().then(setUpdate);
+    return window.owlbot?.onUpdateState?.(setUpdate);
+  }, []);
+  // the card's own storage event is not heard here, so read the dismissal
+  // again whenever the update changes
+  useEffect(() => setHidden(dismissedVersion()), [update]);
+  const ready = update.state === "ready";
+  const missed = update.notInstalled;
+  if (!ready && !missed) return null;
+  const version = update.version ?? "";
+  if (hidden !== null && hidden === version && !update.draining && !missed) return null;
+  const label = update.draining
+    ? t("updateCard.restartingToUpdate")
+    : missed
+      ? t("updateCard.theUpdateDidNotInstall")
+      : t("updateCard.updateAvailable");
+  return (
+    <DropdownMenu onOpenChange={(open) => !open && setHidden(dismissedVersion())}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DropdownMenuTrigger
+            aria-label={version ? t("updateCard.labelWithVersion", { label, version }) : label}
+            className="flex size-8 items-center justify-center rounded-full bg-update text-update-foreground outline-none transition-[scale,opacity] duration-150 ease-out hover:opacity-90 active:scale-[0.96]"
+          >
+            {update.draining ? (
+              <RefreshCw size={15} strokeWidth={2.25} className="animate-spin motion-reduce:animate-none" />
+            ) : (
+              <ArrowDownToLine size={15} strokeWidth={2.25} />
+            )}
+          </DropdownMenuTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="right">{label}</TooltipContent>
+      </Tooltip>
+      <DropdownMenuContent side="right" align="end" sideOffset={10} className="w-[260px] p-0">
+        <UpdateCard />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/** What the update button opens: what pressing will do, and the button. */
+function UpdateCard() {
+  const [update, setUpdate] = useState<UpdateState>({ state: "idle" });
+  const [hidden, setHidden] = useState<string | null>(dismissedVersion);
+  const [restarting, setRestarting] = useState(false);
+
+  useEffect(() => {
+    void window.owlbot?.updateState?.().then(setUpdate);
+    return window.owlbot?.onUpdateState?.(setUpdate);
+  }, []);
+
+  const ready = update.state === "ready";
+  const missed = update.notInstalled;
+  if (!ready && !missed) return null;
+  const version = update.version ?? "";
+  const draining = update.draining;
+  // a wait under way shows even on a dismissed card: it is the way out,
+  // and so does an update that did not install, whatever was dismissed
+  if (hidden !== null && hidden === version && !draining && !missed) return null;
+
+  const relaunch = () => {
+    setRestarting(true);
+    // answers without restarting only when the wait is called off, and a
+    // press the app turned away must not leave the button spinning
+    const back = () => setRestarting(false);
+    void window.owlbot?.updateInstall?.().then(back, back);
+  };
+  const dismiss = () => {
+    setHidden(version);
+    try {
+      localStorage.setItem(DISMISSED, version);
+    } catch {
+      /* hidden for this visit only */
+    }
+  };
+
+  if (draining) {
+    return (
+      <div className="shrink-0">
+        <div className="relative px-3 py-2.5">
+          <div className="flex items-center gap-1.5 text-body font-medium text-foreground">
+            <RefreshCw size={12} className="animate-spin text-brand-ink motion-reduce:animate-none" />
+            {t("updateCard.restartingToUpdate")}
+          </div>
+          <p className="mt-0.5 text-small leading-snug text-muted-foreground">{drainingLine(draining)}</p>
+          <div className="mt-1.5 flex items-center gap-3">
+            <button
+              onClick={() => {
+                setRestarting(true);
+                void window.owlbot?.updateRestartNow?.();
+              }}
+              className="rounded-md text-body font-medium text-brand-ink transition-opacity duration-150 hover:opacity-80"
+            >
+              {t("updateCard.restartNow")}
+            </button>
+            <button
+              onClick={() => void window.owlbot?.updateLater?.()}
+              className="rounded-md text-body font-medium text-muted-foreground transition-colors duration-150 hover:text-foreground"
+            >
+              {t("common.cancel")}
+            </button>
+          </div>
+          <p className="mt-1 text-small leading-snug text-muted-foreground">
+            {t("updateCard.anythingStillRunningPicksUp")}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (missed) {
+    return (
+      <div className="shrink-0">
+        <div className="relative px-3 py-2.5">
+          <button
+            onClick={() => void window.owlbot?.updateNotInstalledSeen?.()}
+            aria-label={t("common.dismiss")}
+            title={t("common.dismiss")}
+            className="absolute right-1.5 top-1.5 rounded-md p-1 text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground"
+          >
+            <X size={12} />
+          </button>
+          <div className="pr-5 text-body font-medium text-foreground">{t("updateCard.theUpdateDidNotInstall")}</div>
+          <p className="mt-0.5 text-small leading-snug text-muted-foreground">
+            {tr(ready ? "updateCard.stillOnTryAgain" : "updateCard.stillOnGet", {
+              from: missed.from,
+              site: (
+                <a
+                  href="https://owlbot.dev"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="font-medium underline underline-offset-2 hover:text-foreground"
+                >
+                  owlbot.dev
+                </a>
+              ),
+            })}
+          </p>
+          {ready && (
+            <button
+              onClick={relaunch}
+              disabled={restarting}
+              className="mt-1.5 flex items-center gap-1.5 rounded-md text-body font-medium text-brand-ink transition-opacity duration-150 hover:opacity-80 disabled:opacity-60"
+            >
+              <RefreshCw size={12} className={cn(restarting && "animate-spin motion-reduce:animate-none")} />
+              {restarting ? t("updateCard.relaunching") : t("common.tryAgain")}
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="shrink-0">
+      <div className="relative px-3 py-2.5">
+        <button
+          onClick={dismiss}
+          aria-label={t("common.dismiss")}
+          title={t("common.notNow")}
+          className="absolute right-1.5 top-1.5 rounded-md p-1 text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground"
+        >
+          <X size={12} />
+        </button>
+        <div className="pr-5 text-body font-medium text-foreground">{t("updateCard.newVersionAvailable")}</div>
+        <p className="mt-0.5 text-small leading-snug text-muted-foreground">
+          {version ? t("updateCard.versionDownloaded", { version }) : t("updateCard.updateDownloaded")}
+        </p>
+        <button
+          onClick={relaunch}
+          disabled={restarting}
+          className="mt-1.5 flex items-center gap-1.5 rounded-md text-body font-medium text-brand-ink transition-opacity duration-150 hover:opacity-80 disabled:opacity-60"
+        >
+          <RefreshCw size={12} className={cn(restarting && "animate-spin motion-reduce:animate-none")} />
+          {restarting ? t("updateCard.relaunching") : t("updateCard.relaunch")}
+        </button>
+      </div>
+    </div>
+  );
+}

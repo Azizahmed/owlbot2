@@ -1,0 +1,336 @@
+// The desktop app's window, when it runs against another computer, is
+// served by a small proxy on this one (electron/remote.mjs). Its storage
+// (folded sections, the sidebar, cards you closed) belongs to the page's
+// origin, which includes the port, so the port has to be one it can keep.
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer as createHttpServer, request as httpRequest, type ServerResponse } from "node:http";
+import { createServer } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
+
+import { doorOf, startLanProxy, startRemoteProxy } from "../electron/remote.mjs";
+
+const ui = mkdtempSync(join(tmpdir(), "owlbot-remote-ui-"));
+writeFileSync(join(ui, "index.html"), "<!doctype html><title>OwlBot</title>");
+after(() => rmSync(ui, { recursive: true, force: true }));
+
+// a relay nobody answers on: the proxy keeps retrying it quietly
+const profile = { relayUrl: "http://127.0.0.1:9", relayToken: "t", deviceId: "d", deviceToken: "token" };
+
+test("the proxy comes back on the port it is given, so the window keeps its storage", async () => {
+  const first = await startRemoteProxy(profile, { staticDir: ui });
+  const port = first.port;
+  first.stop();
+  await new Promise((r) => setTimeout(r, 50));
+  const again = await startRemoteProxy(profile, { staticDir: ui, port });
+  try {
+    assert.equal(again.port, port);
+    const page = await fetch(`http://127.0.0.1:${port}/`);
+    assert.equal(page.status, 200);
+  } finally {
+    again.stop();
+  }
+});
+
+test("a port someone else took fails at once instead of hanging", async () => {
+  const squatter = createServer();
+  await new Promise<void>((r) => squatter.listen(0, "127.0.0.1", () => r()));
+  const taken = (squatter.address() as { port: number }).port;
+  try {
+    const outcome = await Promise.race([
+      startRemoteProxy(profile, { staticDir: ui, port: taken }).then(
+        (proxy) => (proxy.stop(), "started"),
+        () => "refused",
+      ),
+      new Promise((resolve) => setTimeout(() => resolve("hung"), 3000)),
+    ]);
+    assert.equal(outcome, "refused");
+  } finally {
+    squatter.close();
+  }
+});
+
+// The proxy signs everything it forwards as this device, so it has to
+// hold the same line the server does: only the window on this computer.
+test("a page from elsewhere is turned away, and the window's own page is pinned like the server's", async () => {
+  const proxy = await startRemoteProxy(profile, { staticDir: ui });
+  const port = proxy.port;
+  const ask = (headers: Record<string, string>, path = "/api/bots") =>
+    new Promise<{ status: number; headers: Record<string, string | string[] | undefined> }>((resolve, reject) => {
+      const req = httpRequest({ host: "127.0.0.1", port, path, method: "POST", headers }, (res) => {
+        res.resume();
+        resolve({ status: res.statusCode ?? 0, headers: res.headers });
+      });
+      req.on("error", reject);
+      req.end("{}");
+    });
+  try {
+    // another site in a browser on this machine
+    assert.equal((await ask({ host: `127.0.0.1:${port}`, origin: "https://somewhere.example" })).status, 403);
+    // a hostile name pointed at 127.0.0.1 still carries its own Host
+    assert.equal((await ask({ host: `rebound.example:${port}` })).status, 403);
+    // a page on another loopback port, or a sandboxed one
+    assert.equal((await ask({ host: `127.0.0.1:${port}`, origin: "http://127.0.0.1:3000" })).status, 403);
+    assert.equal((await ask({ host: `127.0.0.1:${port}`, origin: "null" })).status, 403);
+    // the window's own page, same origin
+    const page = await fetch(`http://127.0.0.1:${port}/`);
+    assert.equal(page.status, 200);
+    assert.match(page.headers.get("content-security-policy") ?? "", /default-src 'self'/);
+    // and may play the voices it fetched, which it does from a blob
+    assert.match(page.headers.get("content-security-policy") ?? "", /media-src 'self' blob:/);
+    // and its own requests get past the door (the relay here answers
+    // nobody, so what comes back is the proxy's own "could not reach")
+    const own = await ask({ host: `127.0.0.1:${port}`, origin: `http://127.0.0.1:${port}` });
+    assert.notEqual(own.status, 403);
+  } finally {
+    proxy.stop();
+  }
+});
+
+/** A relay whose event stream does what `line` says with each dial, and
+ * which notes when each dial came. */
+async function relay(line: (res: ServerResponse) => void) {
+  const dials: number[] = [];
+  const server = createHttpServer((req, res) => {
+    if (req.url !== "/space/client/stream") return void res.writeHead(404).end();
+    dials.push(Date.now());
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    line(res);
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  return {
+    dials,
+    profile: { ...profile, relayUrl: url },
+    close: () => {
+      server.closeAllConnections();
+      server.close();
+    },
+  };
+}
+
+const until = async (check: () => boolean, ms: number) => {
+  for (const end = Date.now() + ms; Date.now() < end && !check(); ) await new Promise((r) => setTimeout(r, 20));
+  return check();
+};
+
+// The wait between dials went back to a second on any answer at all, so
+// a relay that answered and dropped the line at once was dialled every
+// second, forever, while the window still said connected.
+test("a relay that drops the line before saying hello is dialled less and less often", async () => {
+  const r = await relay((res) => res.end());
+  const proxy = await startRemoteProxy(r.profile, { staticDir: ui });
+  try {
+    assert.ok(await until(() => r.dials.length >= 3, 8_000), `only ${r.dials.length} dials`);
+    const [first, second, third] = r.dials;
+    assert.ok(second - first >= 800, `the second dial came ${second - first} ms after the first`);
+    assert.ok(third - second >= 1_800, `the third dial came ${third - second} ms after the second, no later than the one before`);
+  } finally {
+    proxy.stop();
+    r.close();
+  }
+});
+
+test("a line the relay ends cleanly is reported gone, not left showing connected", async () => {
+  const r = await relay((res) => res.end(`data: ${JSON.stringify({ kind: "hello", online: true })}\n\n`));
+  const states: Array<Record<string, unknown>> = [];
+  const proxy = await startRemoteProxy(r.profile, { staticDir: ui, onState: (state) => states.push(state) });
+  try {
+    assert.ok(await until(() => states.length >= 2, 900), `heard only ${JSON.stringify(states)}`);
+    assert.deepEqual(states.slice(0, 2), [{ connected: true }, { connected: false }]);
+  } finally {
+    proxy.stop();
+    r.close();
+  }
+});
+
+// A hosted workspace's desktop is passed to the door its answer named, so
+// the door has to be somewhere this app is willing to send a desktop.
+test("a desktop's door is an https origin, or loopback for a test, and nothing else", () => {
+  assert.equal(doorOf("https://machine-1.example.app"), "https://machine-1.example.app");
+  assert.equal(doorOf("https://machine-1.example.app/some/path"), "https://machine-1.example.app");
+  assert.equal(doorOf("http://127.0.0.1:4100"), "http://127.0.0.1:4100");
+  for (const bad of ["http://machine-1.example.app", "https://user:pw@example.app", "file:///etc/passwd", "javascript:alert(1)", "", null, 42]) {
+    assert.equal(doorOf(bad), null, String(bad));
+  }
+});
+
+test("a desktop path with no ticket this window was given goes nowhere, and neither does its socket", async () => {
+  const proxy = await startRemoteProxy(profile, { staticDir: ui });
+  try {
+    const page = await fetch(`http://127.0.0.1:${proxy.port}/hosted/desktop/${"b".repeat(48)}/vnc.html`);
+    assert.equal(page.status, 404);
+    const { connect } = await import("node:net");
+    const answer = await new Promise<string>((resolve) => {
+      const socket = connect(proxy.port, "127.0.0.1", () => {
+        socket.write(`GET /hosted/desktop/${"b".repeat(48)}/websockify HTTP/1.1\r\nHost: 127.0.0.1:${proxy.port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n`);
+      });
+      let got = "";
+      socket.on("data", (chunk) => (got += chunk));
+      socket.on("close", () => resolve(got));
+      socket.on("error", () => resolve(got));
+    });
+    assert.match(answer, /^HTTP\/1\.1 404/);
+  } finally {
+    proxy.stop();
+  }
+});
+
+// A server paired by its address, or a workspace joined on the owner's
+// network, answers its desktop's viewer itself, under a ticket. The
+// stand-in here once served its own page for that path instead, and the
+// expanded desktop was a blank frame on every paired computer.
+test("paired by address, a desktop's viewer and its socket are passed to that computer, without this device's token", async () => {
+  const asked: Array<{ url: string; authorization?: string }> = [];
+  const server = createHttpServer((req, res) => {
+    asked.push({ url: req.url ?? "", authorization: req.headers.authorization });
+    res.writeHead(200, { "content-type": "text/html" });
+    res.end("<title>noVNC</title>");
+  });
+  server.on("upgrade", (req, socket) => {
+    asked.push({ url: req.url ?? "", authorization: req.headers.authorization });
+    socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+    socket.on("data", (chunk) => socket.write(Buffer.concat([Buffer.from("echo:"), chunk])));
+    socket.on("end", () => socket.end());
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const at = `127.0.0.1:${(server.address() as { port: number }).port}`;
+  const ticket = "c".repeat(48);
+  try {
+    for (const profile of [{ url: `http://${at}`, deviceId: "d", deviceToken: "device-token" }, { lan: at, deviceId: "d", deviceToken: "device-token" }]) {
+      const proxy = await startLanProxy(profile, { staticDir: ui });
+      try {
+        for (const kind of ["local-vm", "hosted"]) {
+          const page = await fetch(`http://127.0.0.1:${proxy.port}/${kind}/desktop/${ticket}/vnc.html?autoconnect=true`);
+          assert.equal(page.status, 200);
+          assert.equal(await page.text(), "<title>noVNC</title>", `${kind} through ${Object.keys(profile)[0]}`);
+          assert.equal(asked.at(-1)?.url, `/${kind}/desktop/${ticket}/vnc.html?autoconnect=true`);
+        }
+        const { connect } = await import("node:net");
+        const echoed = await new Promise<string>((resolve, reject) => {
+          const socket = connect(proxy.port, "127.0.0.1", () => {
+            socket.write(
+              `GET /local-vm/desktop/${ticket}/websockify HTTP/1.1\r\nHost: 127.0.0.1:${proxy.port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n`,
+            );
+          });
+          let got = "";
+          socket.on("data", (chunk) => {
+            got += chunk.toString();
+            if (got.includes("\r\n\r\n") && !got.includes("echo:")) socket.write("ping");
+            if (got.includes("echo:ping")) {
+              socket.destroy();
+              resolve(got);
+            }
+          });
+          socket.on("error", reject);
+          setTimeout(() => reject(new Error(`no echo: ${got}`)), 5_000);
+        });
+        assert.match(echoed, /^HTTP\/1\.1 101/);
+        assert.ok(asked.every((a) => a.authorization === undefined), "the ticket is the credential; the device's token stays here");
+        // the window's own pages are still its own, and nothing else upgrades
+        assert.equal(await (await fetch(`http://127.0.0.1:${proxy.port}/`)).text(), "<!doctype html><title>OwlBot</title>");
+        const refused = await new Promise<string>((resolve) => {
+          const socket = connect(proxy.port, "127.0.0.1", () => {
+            socket.write(`GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:${proxy.port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n`);
+          });
+          let got = "";
+          socket.on("data", (chunk) => (got += chunk));
+          socket.on("close", () => resolve(got));
+          socket.on("error", () => resolve(got));
+        });
+        assert.match(refused, /^HTTP\/1\.1 404/);
+      } finally {
+        proxy.stop();
+      }
+    }
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+// An agent's terminals are an event stream that never ends. Paired by
+// address, the proxy once waited for the whole answer before sending a
+// byte, so the terminal panel sat empty with its + greyed out for good.
+test("paired by address, an agent's terminal streams reach the window as they come", async () => {
+  const asked: Array<{ url: string; authorization?: string }> = [];
+  const server = createHttpServer((req, res) => {
+    asked.push({ url: req.url ?? "", authorization: req.headers.authorization });
+    if (req.url === "/api/bots/off/terminals/stream") {
+      res.writeHead(403, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ error: "terminals are off on this server" }));
+    }
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+    res.write(req.url?.includes("/terminals/") ? 'data: {"list":[]}\n\n' : 'data: {"out":"$ "}\n\n');
+    // and never ends, as a live stream does
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const at = `127.0.0.1:${(server.address() as { port: number }).port}`;
+  const firstFrame = async (port: number, path: string) => {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 3_000);
+    try {
+      const answer = await fetch(`http://127.0.0.1:${port}${path}`, { headers: { accept: "text/event-stream" }, signal: abort.signal });
+      assert.equal(answer.status, 200);
+      assert.match(answer.headers.get("content-type") ?? "", /^text\/event-stream/);
+      const { value } = await answer.body!.getReader().read();
+      return Buffer.from(value!).toString("utf8");
+    } finally {
+      clearTimeout(timer);
+      abort.abort();
+    }
+  };
+  try {
+    for (const profile of [{ url: `http://${at}`, deviceId: "d", deviceToken: "device-token" }, { lan: at, deviceId: "d", deviceToken: "device-token" }]) {
+      const proxy = await startLanProxy(profile, { staticDir: ui });
+      try {
+        assert.equal(await firstFrame(proxy.port, "/api/bots/b-1/terminals/stream"), 'data: {"list":[]}\n\n');
+        assert.equal(await firstFrame(proxy.port, "/api/bots/b-1/terminal/stream?id=t1"), 'data: {"out":"$ "}\n\n');
+        assert.equal(asked.at(-1)?.url, "/api/bots/b-1/terminal/stream?id=t1");
+        assert.equal(asked.at(-1)?.authorization, "Bearer device-token");
+        // a stream the server refuses is said as it said it, not hung
+        const refused = await fetch(`http://127.0.0.1:${proxy.port}/api/bots/off/terminals/stream`, { signal: AbortSignal.timeout(3_000) });
+        assert.equal(refused.status, 403);
+        assert.deepEqual(await refused.json(), { error: "terminals are off on this server" });
+      } finally {
+        proxy.stop();
+      }
+    }
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+// An answer that breaks off after its headers went out once threw inside
+// the error path (headers already sent), and the window waited forever.
+test("paired by address, an answer cut off midway still ends for the window", async () => {
+  const server = createHttpServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json", "content-length": "1000" });
+    res.write('{"partial":');
+    setTimeout(() => res.destroy(), 50);
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const at = `127.0.0.1:${(server.address() as { port: number }).port}`;
+  const proxy = await startLanProxy({ lan: at, deviceId: "d", deviceToken: "device-token" }, { staticDir: ui });
+  try {
+    const outcome = await fetch(`http://127.0.0.1:${proxy.port}/api/bots`, { signal: AbortSignal.timeout(3_000) }).then(
+      async (answer) => {
+        try {
+          await answer.text();
+          return `ended ${answer.status}`;
+        } catch {
+          return "ended broken";
+        }
+      },
+      (e: Error) => (e.name === "TimeoutError" ? "hung" : "ended broken"),
+    );
+    assert.equal(outcome, "ended 503");
+  } finally {
+    proxy.stop();
+    server.closeAllConnections();
+    server.close();
+  }
+});

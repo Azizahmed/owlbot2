@@ -1,0 +1,137 @@
+import { CreatureMark } from "./Avatar";
+import { cn } from "@/lib/cn";
+
+/**
+ * The OwlBot mark: the owl from the brand file (public/brand/owlbot-mark.svg).
+ * `fill` draws it as a single-colour silhouette, masked from the art, for
+ * places where the full palette would shout.
+ */
+export function OwlBotMark({
+  size = 32,
+  fill,
+  className,
+}: {
+  size?: number;
+  /** Single-color override; omit for the full-color brand mark. */
+  fill?: string;
+  className?: string;
+}) {
+  if (fill) {
+    return (
+      <span
+        role="img"
+        aria-label="OwlBot"
+        className={cn("inline-block shrink-0", className)}
+        style={{
+          width: size,
+          height: size,
+          backgroundColor: fill,
+          maskImage: "url(/brand/owlbot-mark.svg)",
+          WebkitMaskImage: "url(/brand/owlbot-mark.svg)",
+          maskSize: "contain",
+          WebkitMaskSize: "contain",
+          maskRepeat: "no-repeat",
+          WebkitMaskRepeat: "no-repeat",
+          maskPosition: "center",
+          WebkitMaskPosition: "center",
+        }}
+      />
+    );
+  }
+  return (
+    <img
+      src="/brand/owlbot-mark.svg"
+      width={size}
+      height={size}
+      alt=""
+      aria-hidden
+      className={cn("shrink-0", className)}
+    />
+  );
+}
+
+/** A pixel sparkle: five squares in a plus. */
+function Sparkle({ size, color }: { size: number; color: string }) {
+  const c = size / 3;
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} aria-hidden>
+      <g fill={color}>
+        <rect x={c} y={0} width={c} height={c} />
+        <rect x={0} y={c} width={c} height={c} />
+        <rect x={c * 2} y={c} width={c} height={c} />
+        <rect x={c} y={c * 2} width={c} height={c} />
+      </g>
+    </svg>
+  );
+}
+
+/**
+ * Decorative pixel weather behind full-screen moments (onboarding, new
+ * agent): stepped clouds, sparkles, stray blocks. Pointer-transparent.
+ */
+export function BlockField() {
+  return (
+    <div
+      aria-hidden
+      className="pointer-events-none absolute inset-0 overflow-hidden opacity-[0.16] dark:opacity-[0.14]"
+    >
+      <CreatureMark
+        shape="cloud"
+        size={110}
+        fill="#3fc3f0"
+        className="absolute left-[7%] top-[13%]"
+      />
+      <CreatureMark
+        shape="cloud"
+        size={72}
+        fill="#a468f7"
+        className="absolute right-[9%] top-[24%]"
+      />
+      <CreatureMark
+        shape="drop"
+        size={46}
+        fill="#2ec9a9"
+        className="absolute left-[22%] bottom-[24%]"
+      />
+      <div className="absolute left-[15%] top-[58%]">
+        <Sparkle size={21} color="#f972b6" />
+      </div>
+      <div className="absolute right-[18%] top-[64%]">
+        <Sparkle size={27} color="#ffd93b" />
+      </div>
+      <div className="absolute right-[28%] top-[10%]">
+        <Sparkle size={15} color="#3bc76b" />
+      </div>
+      <div className="absolute left-[36%] bottom-[12%]">
+        <Sparkle size={18} color="#4c86f5" />
+      </div>
+      <div className="absolute right-[7%] bottom-[18%] size-[22px] bg-[#ff9432]" />
+      <div className="absolute left-[9%] bottom-[38%] size-[13px] bg-[#f04438]" />
+    </div>
+  );
+}
+
+/** The full wordmark from the brand file, swapped per theme. */
+export function OwlBotLogo({
+  compact = false,
+  className = "h-12",
+}: {
+  compact?: boolean;
+  className?: string;
+}) {
+  if (compact) return <OwlBotMark size={28} />;
+  return (
+    <>
+      <img
+        src="/brand/owlbot-wordmark-light.png"
+        alt="OwlBot"
+        className={`${className} w-auto dark:hidden`}
+      />
+      <img
+        src="/brand/owlbot-wordmark-dark.png"
+        alt="OwlBot"
+        className={`hidden ${className} w-auto dark:block`}
+      />
+    </>
+  );
+}

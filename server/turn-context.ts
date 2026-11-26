@@ -1,0 +1,88 @@
+// What a turn carries when the engine behind a lane changes.
+//
+// Session-cursor engines remember a conversation by resuming a session;
+// the session belongs to one engine. Switch the lane's model and the new
+// engine either has no session (it sees one bare message) or, switching
+// back, an old session that missed everything the other engine did. Both
+// are silent context loss. The cure is cheap: detect the switch, replay
+// the story inline once, and never trust a cursor across it.
+export interface FreshnessInput {
+  /** The instance about to serve this turn. */
+  instanceId: string;
+  /** The instance that served the lane last, when known. */
+  lastInstanceId?: string;
+  /** Cursors by instance id, for lanes older than the marker. */
+  resumeCursors: Record<string, unknown>;
+  /** A lane with no user turn yet has nothing worth replaying. */
+  hasUserTurn: boolean;
+}
+
+/** True when the engine about to serve missed part of the conversation. */
+export function engineIsFresh(input: FreshnessInput): boolean {
+  if (!input.hasUserTurn) return false;
+  if (input.lastInstanceId !== undefined) return input.lastInstanceId !== input.instanceId;
+  // Legacy lanes predate the marker: the cursor map is the only witness.
+  // Exactly our own cursor and nothing else means nobody else served it.
+  const holders = Object.keys(input.resumeCursors).filter(
+    (id) => input.resumeCursors[id] !== undefined,
+  );
+  return !(holders.length === 1 && holders[0] === input.instanceId);
+}
+
+/**
+ * The inline replay a fresh session-cursor engine receives.
+ *
+ * The transcript is expected bounded already (boundHandoff in
+ * server/context.ts); `left` is how many messages that left out, said so
+ * the agent knows the story has a gap rather than assuming it has all of
+ * it. `why` is what the opening line says happened: another engine had
+ * the conversation, the old session could not be carried on, or it was
+ * left in another folder or on another account of the engine, or the
+ * person branched it off another conversation (server/branch.ts). `from`
+ * names the tool a conversation brought over from before OwlBot was had
+ * in (server/session-import.ts), which says more than either.
+ */
+export function freshTurnText(
+  transcript: ReadonlyArray<{ role: "user" | "assistant"; text: string }>,
+  turnText: string,
+  opts: { left?: number; why?: "engine" | "session" | "folder" | "account" | "branch"; folder?: string; from?: string } = {},
+): string {
+  if (transcript.length === 0) return turnText;
+  const history = transcript
+    .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`)
+    .join("\n\n");
+  const opening = opts.from
+    ? `You are picking up a conversation the person had in ${opts.from} before OwlBot. It was brought over, and you carry it on here.`
+    : opts.why === "session"
+      ? "You are picking up this conversation in a new session; the earlier one could not be carried on."
+      : opts.why === "folder"
+        ? `You are picking up this conversation in a new session${opts.folder ? ` in ${opts.folder}` : ""}: the person changed the working folder, and the earlier session belonged to the folder it ran in.`
+        : opts.why === "account"
+          ? "You are picking up this conversation in a new session, on another account of the same engine and the same model: the earlier session belonged to the account it ran on."
+          : opts.why === "branch"
+            ? "You are picking up this conversation in a new session: the person branched it off another conversation at the last answer below, to try a different direction from there. Nothing said after that answer in the other conversation is part of this one, and the files in the workspace are shared with it, so they may have changed since."
+            : "You are picking up this conversation mid-thread; a different engine handled it until now.";
+  const left = opts.left ?? 0;
+  const gap =
+    left > 0
+      ? ` To keep this short, ${left === 1 ? "one earlier message is" : `${left} earlier messages are`} left out; ask if you need something from them.`
+      : "";
+  return `${opening}${gap} The conversation so far:\n\n${history}\n\n--- the new message ---\n\n${turnText}`;
+}
+
+/**
+ * What a session that is resumed after another engine answered for a
+ * while is told (GitHub 284): only the messages it missed, since it
+ * still has everything before them. `missed` is expected bounded already
+ * and whole; a catch-up that would leave messages out is a new session
+ * told the story instead. `by` is the engine that answered.
+ */
+export function catchUpText(
+  missed: ReadonlyArray<{ role: "user" | "assistant"; text: string }>,
+  by: string,
+  turnText: string,
+): string {
+  if (missed.length === 0) return turnText;
+  const history = missed.map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`).join("\n\n");
+  return `You are back on this conversation after ${by} answered in your place. Your session has everything up to then. What was said since:\n\n${history}\n\n--- the new message ---\n\n${turnText}`;
+}

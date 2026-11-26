@@ -1,0 +1,189 @@
+import assert from "node:assert/strict";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { test } from "node:test";
+import { sendMessage } from "../src/lib/sendMessage.ts";
+import { codexCommands, waitFor } from "./helpers/codex-commands.ts";
+
+/** A real driver whose stand-in acknowledges steering but delays its exit
+ * after SIGTERM. Stop's HTTP answer must not mean it can hear the follow-up. */
+function delayedStop(root: string) {
+  appendFileSync(join(root, "fake-codex.mjs"), `
+import { writeFileSync as fixtureWrite } from "node:fs";
+process.on("SIGTERM", () => {
+  fixtureWrite(root + "/stop-requested", "");
+  const timer = setInterval(() => {
+    if (existsSync(root + "/stop-gate")) { clearInterval(timer); process.exit(0); }
+  }, 10);
+});
+`);
+}
+
+test("a stop-and-send follow-up waits for the old process and starts once in its named lane", async t => {
+  const s = await codexCommands(t);
+  delayedStop(s.root);
+  const created = await s.post(`/api/bots/${s.bot.id}/tasks`, { title: "Plans" });
+  const lane = created.bot.threadId;
+  assert.notEqual(lane, s.bot.threadId);
+  s.spec({ hold: true, used: 0 });
+  await s.say("HOLD the original task", { taskId: lane });
+  await waitFor(() => s.calls().some(c => c.method === "turn/start"));
+  try {
+    const stopped = await s.post(`/api/bots/${s.bot.id}/interrupt`, { taskId: lane });
+    assert.equal(stopped.ok, true);
+    await waitFor(() => existsSync(join(s.root, "stop-requested")));
+    s.spec({ hold: false, used: 0 });
+    const sent = await s.say("Use the revised outline", { taskId: lane, steer: false });
+    assert.equal(sent.queued, true, "it joined the dying turn instead of waiting");
+    assert.equal(s.calls().filter(c => c.method === "turn/steer").length, 0);
+    assert.equal(s.calls().filter(c => c.method === "turn/start").length, 1);
+    writeFileSync(join(s.root, "stop-gate"), "");
+    await waitFor(() => s.calls().filter(c => c.method === "turn/start").length === 2);
+    await s.settled();
+    const follow = (await s.messages(lane)).filter(m => m.role === "user" && m.text === "Use the revised outline");
+    assert.equal(follow.length, 1);
+    assert.notEqual(follow[0].midTurn, true);
+    assert.equal(follow[0].queued, false);
+    assert.equal((await s.messages()).filter(m => m.text === "Use the revised outline").length, 0);
+    assert.equal(s.calls().filter(c => c.method === "turn/start").length, 2);
+  } finally {
+    writeFileSync(join(s.root, "stop-gate"), "");
+  }
+});
+
+test("ordinary input still steers, and Stop alone starts no replacement turn", async t => {
+  const s = await codexCommands(t);
+  delayedStop(s.root);
+  s.spec({ hold: true, used: 0 });
+  await s.say("HOLD the original task");
+  await waitFor(() => s.calls().some(c => c.method === "turn/start"));
+  try {
+    const sent = await s.say("Adjust the current task");
+    assert.equal(sent.steered, true);
+    assert.equal(s.calls().filter(c => c.method === "turn/steer").length, 1);
+    assert.equal(s.calls().filter(c => c.method === "turn/start").length, 1);
+    await s.post(`/api/bots/${s.bot.id}/interrupt`, { taskId: s.bot.threadId });
+    await waitFor(() => existsSync(join(s.root, "stop-requested")));
+    writeFileSync(join(s.root, "stop-gate"), "");
+    await s.settled();
+    assert.equal(s.calls().filter(c => c.method === "turn/start").length, 1);
+  } finally {
+    writeFileSync(join(s.root, "stop-gate"), "");
+  }
+});
+
+test("a delayed answer to earlier steering cannot consume the stop-and-send follow-up", async t => {
+  const s = await codexCommands(t);
+  delayedStop(s.root);
+  const cli = join(s.root, "fake-codex.mjs");
+  const script = readFileSync(cli, "utf8");
+  const marker = 'if(m.method==="turn/steer"){';
+  assert.ok(script.includes(marker));
+  writeFileSync(cli, script.replace(marker, marker + `
+    await new Promise(resolve => {
+      const timer = setInterval(() => {
+        if (existsSync(root + "/steer-gate")) { clearInterval(timer); resolve(); }
+      }, 10);
+    });`));
+  s.spec({ hold: true, used: 0 });
+  await s.say("HOLD the original task");
+  await waitFor(() => s.calls().some(c => c.method === "turn/start"));
+  const earlier = s.say("Adjust the current task");
+  try {
+    await waitFor(() => s.calls().some(c => c.method === "turn/steer"));
+    await s.post(`/api/bots/${s.bot.id}/interrupt`, { taskId: s.bot.threadId });
+    await waitFor(() => existsSync(join(s.root, "stop-requested")));
+    s.spec({ hold: false, used: 0 });
+    const sent = await s.say("Start the replacement task", { steer: false });
+    assert.equal(sent.queued, true);
+    assert.equal(s.calls().filter(c => c.method === "turn/steer").length, 1);
+    writeFileSync(join(s.root, "steer-gate"), "");
+    assert.equal((await earlier).steered, true);
+    assert.equal(s.calls().filter(c => c.method === "turn/start").length, 1);
+    writeFileSync(join(s.root, "stop-gate"), "");
+    await waitFor(() => s.calls().filter(c => c.method === "turn/start").length === 2);
+    await s.settled();
+    const follow = (await s.messages()).filter(m => m.role === "user" && m.text === "Start the replacement task");
+    assert.equal(follow.length, 1);
+    assert.notEqual(follow[0].midTurn, true);
+    assert.equal(follow[0].queued, false);
+  } finally {
+    writeFileSync(join(s.root, "steer-gate"), "");
+    writeFileSync(join(s.root, "stop-gate"), "");
+    await earlier;
+  }
+});
+
+// GitHub 452: message A already waits when the person presses
+// Command-Enter on draft B. B starts the next turn alone, then A, each once,
+// whether the stopped turn ends at once or only after the request is done.
+for (const quick of [true, false]) {
+  test(`stop and send now starts the draft alone, ahead of what already waits (${quick ? "turn ends at once" : "turn ends later"})`, async t => {
+    const s = await codexCommands(t);
+    delayedStop(s.root);
+    if (quick) writeFileSync(join(s.root, "stop-gate"), "");
+    s.spec({ hold: true, used: 0 });
+    await s.say("HOLD the original task");
+    await waitFor(() => s.count("turn/start") === 1);
+    try {
+      const waiting = await s.say("A: the separate follow-up", { delivery: "wait" });
+      assert.equal(waiting.queued, true);
+      s.spec({ hold: false, used: 0 });
+      // the composer's own path, against the real server
+      const api = (path: string, init?: RequestInit) => s.post(path, JSON.parse(String(init?.body ?? "{}")));
+      await sendMessage(api, { botId: s.bot.id, taskId: s.bot.threadId, text: "B: the revised plan", stopFirst: true });
+      writeFileSync(join(s.root, "stop-gate"), "");
+      const input = (n: number) => s.calls().filter(c => c.method === "turn/start")[n].params.input
+        .filter((i: { type: string }) => i.type === "text").map((i: { text: string }) => i.text).join("");
+      await waitFor(() => s.count("turn/start") >= 2);
+      assert.match(input(1), /B: the revised plan/);
+      assert.doesNotMatch(input(1), /A: the separate follow-up/, "A went in the turn meant for B");
+      await waitFor(() => s.count("turn/start") >= 3);
+      await s.settled();
+      assert.match(input(2), /A: the separate follow-up/);
+      assert.doesNotMatch(input(2), /B: the revised plan/);
+      assert.equal(s.count("turn/start"), 3);
+      const said = (await s.messages()).filter(m => m.role === "user" && /^[AB]: /.test(m.text ?? ""));
+      assert.deepEqual(said.map(m => [m.text, m.queued]), [["B: the revised plan", false], ["A: the separate follow-up", false]]);
+    } finally {
+      writeFileSync(join(s.root, "stop-gate"), "");
+    }
+  });
+}
+
+// Stop and send now while the turn it stops is still getting ready: what
+// was joining that turn waits behind the draft, and words said while the
+// draft's own turn gets ready wait behind those, each going in once.
+test("stop and send now during a turn's preparation starts the draft alone, then what was joining, in order", async t => {
+  const s = await codexCommands(t);
+  s.spec({ hold: true, holdThread: true, used: 0 });
+  await s.say("FIRST: the original task");
+  await waitFor(() => s.count("thread/start") === 1);
+  const joining = await s.say("JOIN: an addition to it");
+  assert.equal(joining.delivery?.route, "pending", "the addition did not wait to join the turn getting ready");
+  const api = (path: string, init?: RequestInit) => s.post(path, JSON.parse(String(init?.body ?? "{}")));
+  const sent = await sendMessage(api, { botId: s.bot.id, taskId: s.bot.threadId, text: "B: the revised plan", stopFirst: true });
+  assert.equal(sent.stopped, true);
+  await waitFor(() => s.count("thread/start") === 2, "the draft's own turn did not start getting ready");
+  const later = await s.say("LATER: said while the draft gets ready");
+  assert.notEqual(later.delivery?.route, "pending", "later words joined the draft's turn ahead of the earlier addition");
+  s.threadGate();
+  const inputs = () => s.calls().filter(c => ["turn/start", "turn/steer"].includes(c.method)).map(c => c.params.input
+    .filter((i: { type: string }) => i.type === "text").map((i: { text: string }) => i.text).join(""));
+  await waitFor(() => s.count("turn/start") >= 1);
+  assert.match(inputs()[0], /B: the revised plan/);
+  assert.doesNotMatch(inputs()[0], /FIRST: |JOIN: |LATER: /, "the draft did not go alone");
+  s.gate();
+  await waitFor(() => s.count("turn/start") >= 2);
+  await s.settled();
+  assert.equal(s.count("turn/start"), 2, "the stopped turn or a later word ran a turn of its own");
+  assert.match(inputs()[1], /JOIN: an addition to it[\s\S]*LATER: said while the draft gets ready/);
+  for (const word of ["JOIN: ", "B: ", "LATER: "]) {
+    assert.equal(inputs().filter(input => input.includes(word)).length, 1, `${word} went in more or less than once`);
+  }
+  assert.equal(inputs().filter(input => input.includes("FIRST: ")).length, 0, "the stopped turn's words still went in");
+  const said = (await s.messages()).filter(m => m.role === "user" && /^(JOIN|B|LATER): /.test(m.text ?? ""));
+  assert.deepEqual(said.map(m => [m.text, m.queued]), [
+    ["B: the revised plan", false], ["JOIN: an addition to it", false], ["LATER: said while the draft gets ready", false],
+  ]);
+});

@@ -1,0 +1,316 @@
+// Holding a turn open while a person decides.
+//
+// An agent partway through a turn sometimes needs an answer: permission to
+// run something, or a genuine question it should not guess at. The model
+// is blocked until it hears back, so something has to hold that request,
+// surface it, and unblock the turn when the answer arrives (or when it
+// becomes clear no answer is coming).
+//
+// That is all this is. It is deliberately not Claude-specific: the shape
+// is the same for any driver whose CLI can be pointed at an out-of-process
+// prompt tool, and keeping it here means the driver files stay about their
+// own protocol.
+//
+// The transport is a unix socket because the asking end is a separate
+// process the CLI spawned, not something we can hand a callback to. One
+// socket per turn, deleted when the turn ends.
+import { createServer, type Server } from "node:net";
+import { randomBytes, randomUUID } from "node:crypto";
+import { chmodSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { isQuestionTool } from "../policy.ts";
+import type { AskAnswers } from "./ask-questions.ts";
+
+export interface PendingAsk {
+  id: string;
+  kind: "permission" | "question";
+  tool: string;
+  input: Record<string, unknown>;
+  at: number;
+}
+
+export interface ResolvedAsk extends PendingAsk {
+  behavior: string;
+  /** Who ended it: the person, a timeout, or the turn finishing. */
+  source: string;
+}
+
+/** Fifteen minutes. Long enough to answer a card you noticed on your phone
+ * after a meeting; short enough that a forgotten turn eventually releases
+ * the agent instead of pinning a process open indefinitely. */
+const DEFAULT_TIMEOUT_MS = 15 * 60_000;
+
+/**
+ * What an unanswered request resolves to.
+ *
+ * The two cases pull in opposite directions and that is the point. An
+ * unanswered *permission* denies, because doing something consequential
+ * that nobody approved is the one outcome worth ruling out. An unanswered
+ * *question* answers with guidance instead, because a question is not a
+ * gate: refusing it would strand a turn that could have finished fine.
+ */
+const TIMED_OUT_PERMISSION =
+  "OwlBot: nobody answered this permission request in time. Skip this action and finish what you can without it.";
+const TIMED_OUT_QUESTION = "OwlBot: nobody answered in time. Use your best judgment and continue.";
+const TURN_ENDED_PERMISSION = "OwlBot: the turn ended";
+const TURN_ENDED_QUESTION = "OwlBot: the turn is ending, wrap up.";
+
+/** One readable line describing what is being asked, for the card. The
+ * useful field moves around by tool, so the likely ones are tried in the
+ * order that produces the most informative summary. */
+export function summarise(ask: PendingAsk): string {
+  const input = ask.input ?? {};
+  if (typeof input.question === "string") return input.question.slice(0, 300);
+  // AskUserQuestion nests its prompts: {questions: [{question, options}]}.
+  // The person should read the question, never the envelope around it.
+  // The card reads every question (ask-questions.ts); this line, with its
+  // count of the rest, is for the clients that read only one.
+  if (Array.isArray(input.questions) && typeof input.questions[0]?.question === "string") {
+    const first = input.questions[0].question.slice(0, 300);
+    return input.questions.length > 1 ? `${first} (+${input.questions.length - 1} more)` : first;
+  }
+  if (typeof input.command === "string") return input.command.slice(0, 200);
+  if (typeof input.url === "string") return input.url.slice(0, 200);
+
+  const serialised = JSON.stringify(input);
+  return serialised === "{}" ? (ask.tool ?? "tool") : serialised.slice(0, 200);
+}
+
+/** The room a unix socket's path has in the kernel's address (sun_path),
+ * its closing NUL included: 104 bytes on macOS and the BSDs, 108 on
+ * Linux. */
+const SUN_PATH = process.platform === "linux" ? 108 : 104;
+
+/** Whether a socket path fits its address. Bytes, not characters: a home
+ * folder with an accented name is shorter on screen than in the kernel. */
+export function socketPathFits(path: string, room = SUN_PATH): boolean {
+  return Buffer.byteLength(path) < room;
+}
+
+/**
+ * Where a turn's bridge can actually listen, or null when nowhere can.
+ *
+ * The preferred path sits in the data folder, beside everything else of
+ * ours. A deep home folder pushes it past what a socket address holds,
+ * and nothing says so: depending on the runtime the path is cut short or
+ * refused on its way into the kernel, the engine's side of the bridge
+ * meets a refused connection, and every permission it asks for reads as
+ * a deny nobody saw. So a path that does not fit moves to a folder of
+ * this user's own in the temp folder, made private before anything
+ * listens in it, under a short random name. The broker removes the
+ * socket when it closes, the same as it would the preferred one.
+ *
+ * Windows has no such address: a local socket there is a named pipe, and
+ * a pipe has to be named under \\.\pipe\. A file path given to listen
+ * fails, the failure was swallowed, and every approval a Windows turn
+ * asked for came back "permission broker unavailable" with no card (web
+ * searches and reads of shared files among them). So Windows gets a pipe
+ * of its own, under a name nobody can guess: other users' processes can
+ * read a pipe's name but not write to one this user made.
+ */
+export function bridgeSocketPath(
+  preferred: string,
+  options: { tempDir?: string; room?: number; platform?: NodeJS.Platform } = {},
+): string | null {
+  const room = options.room ?? SUN_PATH;
+  if ((options.platform ?? process.platform) === "win32") return `\\\\.\\pipe\\owlbot-${randomBytes(12).toString("hex")}`;
+  if (socketPathFits(preferred, room)) return preferred;
+
+  const uid = process.getuid?.();
+  const dir = join(options.tempDir ?? tmpdir(), `owlbot-${uid ?? "user"}`);
+  try {
+    mkdirSync(dir, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") return null;
+  }
+  try {
+    // A shared temp folder is anyone's to write in. A link, or a folder
+    // somebody else made under our name, could hand them the socket that
+    // carries this user's approvals, so only a real folder of our own is
+    // used, and it is closed to everyone else before it is.
+    const found = lstatSync(dir);
+    if (!found.isDirectory() || (uid !== undefined && found.uid !== uid)) return null;
+    if ((found.mode & 0o077) !== 0) chmodSync(dir, 0o700);
+  } catch {
+    return null;
+  }
+  const short = join(dir, `p-${randomBytes(5).toString("hex")}.sock`);
+  return socketPathFits(short, room) ? short : null;
+}
+
+export interface AskBrokerOptions {
+  socketPath: string;
+  /** A request has arrived and needs to reach the user. */
+  onAsk: (ask: PendingAsk) => void;
+  /** It has been settled, however that happened. */
+  onResolve: (resolved: ResolvedAsk) => void;
+  /** A reply capability of this turn only, not a permission request. */
+  onReply?: (input: unknown) => Promise<string>;
+  timeoutMs?: number;
+}
+
+export interface AskBroker {
+  /** Deliver a person's decision. False when the id is unknown, which
+   * usually means it already timed out. `answers` is one per question,
+   * for an ask that put several (server/harness/ask-questions.ts). */
+  answer(askId: string, behavior: string, message?: string, answers?: AskAnswers): boolean;
+  /** Stop taking new connections and remove the socket, but keep the
+   * ones already open and their asks. For a turn that has ended while its
+   * process runs on (a background task can still ask), so the next turn's
+   * socket is never confused with this one. */
+  retire(): void;
+  /** End the turn: settle anything still open and remove the socket. */
+  close(): void;
+}
+
+export function createAskBroker(options: AskBrokerOptions): AskBroker {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+
+  interface Entry {
+    ask: PendingAsk;
+    settle: (behavior: string, message: string | undefined, source: string, answers?: AskAnswers) => void;
+  }
+  const open = new Map<string, Entry>();
+
+  // A stale socket file from a process that died badly would make bind
+  // fail. Nothing else can legitimately own this path.
+  try {
+    unlinkSync(options.socketPath);
+  } catch {
+    /* nothing there, which is the normal case */
+  }
+
+  let retired = false;
+  const server: Server = createServer((connection) => {
+    // The proxy going away is ordinary (its CLI exited); the turn's own
+    // settle path handles the consequences.
+    connection.on("error", () => {});
+
+    let pending = "";
+    connection.on("data", (chunk) => {
+      pending += chunk;
+      for (;;) {
+        const cut = pending.indexOf("\n");
+        if (cut === -1) break;
+        const line = pending.slice(0, cut);
+        pending = pending.slice(cut + 1);
+
+        let frame: any;
+        try {
+          frame = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (frame.t === "reply") {
+          const id = String(frame.id ?? "");
+          const send = !retired && options.onReply;
+          void (send ? send(frame.input) : Promise.reject(new Error("this turn cannot reply to a sender")))
+            .then((message) => connection.write(JSON.stringify({ t: "answer", id, behavior: "answer", message }) + "\n"))
+            .catch((error) => { if (!connection.destroyed) connection.write(JSON.stringify({ t: "answer", id, behavior: "deny", message: error instanceof Error ? error.message : "Reply failed" }) + "\n"); });
+          continue;
+        }
+        if (frame.t !== "ask") continue;
+        if (retired && options.onReply) {
+          connection.write(JSON.stringify({ t: "answer", id: String(frame.id ?? ""), behavior: "deny", message: "This person's turn has ended." }) + "\n");
+          continue;
+        }
+
+        const id = String(frame.id ?? randomUUID());
+        const kind = frame.kind === "question" ? ("question" as const) : ("permission" as const);
+        const ask: PendingAsk = {
+          id,
+          kind,
+          tool: frame.tool ?? "tool",
+          input: frame.input ?? {},
+          at: Date.now(),
+        };
+
+        const settle = (behavior: string, message: string | undefined, source: string, answers?: AskAnswers) => {
+          // delete() doubles as the guard: whoever removes it first wins,
+          // so a timeout racing a tap cannot answer twice.
+          if (!open.delete(id)) return;
+          clearTimeout(timer);
+          try {
+            connection.write(JSON.stringify({ t: "answer", id, behavior, message, ...(answers ? { answers } : {}) }) + "\n");
+          } catch {
+            /* the proxy is gone; the turn is ending anyway */
+          }
+          options.onResolve({ ...ask, behavior, source });
+        };
+
+        const timer = setTimeout(() => {
+          if (kind === "question") settle("answer", TIMED_OUT_QUESTION, "timeout");
+          else settle("deny", TIMED_OUT_PERMISSION, "timeout");
+        }, timeoutMs);
+        // never hold the process open just to expire a card
+        timer.unref?.();
+
+        open.set(id, { ask, settle });
+        options.onAsk(ask);
+      }
+    });
+  });
+
+  server.on("error", () => {});
+  server.listen(options.socketPath);
+
+  return {
+    answer(askId, behavior, message, answers) {
+      const entry = open.get(askId);
+      if (!entry) return false;
+
+      // Whatever the person decided settles the ask, as something its tool
+      // has a contract for. A decision that did not fit used to be refused
+      // here, and the refusal was read as the ask being gone: the card
+      // closed while the CLI went on waiting for it (GitHub 254).
+      // A question takes any decision as its reply, put aside included. A
+      // permission is allowed or refused, and words typed on its card
+      // refuse it with those words. The one exception asks permission to
+      // ask (the CLI's own question tool): its words are the answer, and
+      // the bridge hands them over as one (server/permission-proxy.ts).
+      const asksSomething = entry.ask.kind === "question" || isQuestionTool(entry.ask.tool);
+      // Answers per question only ever go with an answer to a question.
+      const settled = asksSomething || behavior === "allow" ? behavior : "deny";
+      entry.settle(settled, message, "user", asksSomething && settled === "answer" ? answers : undefined);
+      return true;
+    },
+
+    retire() {
+      if (retired) return;
+      retired = true;
+      try {
+        server.close();
+      } catch {
+        /* already down */
+      }
+      try {
+        unlinkSync(options.socketPath);
+      } catch {
+        /* already gone */
+      }
+    },
+    close() {
+      for (const entry of [...open.values()]) {
+        if (entry.ask.kind === "question") {
+          entry.settle("answer", TURN_ENDED_QUESTION, "shutdown");
+        } else {
+          entry.settle("deny", TURN_ENDED_PERMISSION, "shutdown");
+        }
+      }
+      if (retired) return;
+      retired = true;
+      try {
+        server.close();
+      } catch {
+        /* already down */
+      }
+      try {
+        unlinkSync(options.socketPath);
+      } catch {
+        /* already gone */
+      }
+    },
+  };
+}

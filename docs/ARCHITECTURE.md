@@ -1,0 +1,5998 @@
+# Architecture
+
+Three pieces, one rule.
+
+| Layer | Location | Responsibility |
+| --- | --- | --- |
+| React app | `src/` | Chat, rooms, agent roster, panels, avatars |
+| Harness server | `server/` | HTTP API, one SSE stream, provider registry, persistence, approvals |
+| Electron shell | `electron/` | Desktop window, one server per workspace, speech and computer bridges |
+
+**The client holds no transports.** The React app never opens a
+connection to a model provider. It dispatches typed commands over HTTP
+and folds a single server-sent event stream into reducer state. Every
+provider process runs inside the harness.
+
+Everything below follows from that.
+
+## A turn, end to end
+
+1. `StoreProvider` loads `/api/bots`, `/api/owlbot`, `/api/instances`,
+   `/api/providers` and `/api/config`, then opens `/api/events`.
+2. You send a message. The client dispatches `send`, which POSTs to
+   `/api/bots/:id/messages`.
+3. `startTurn` in `server/index.ts` builds the persona (role, skills,
+   your profile, house style, and in a room the roster plus recent
+   transcript), ends the briefing with the reply rules (`replyRules` in
+   `server/house-style.ts`, last on purpose, since agents read past the
+   same asks higher up), photographs the agent's folder
+   (`server/checkpoints.ts`), then calls the driver's `sendTurn`.
+4. The driver translates its provider's native output into the canonical
+   events in `server/contracts.ts`.
+5. The bus subscriber folds those events into the transcript, persists
+   them, and broadcasts to every connected client.
+6. The reducer folds the same events into messages, streaming text, busy
+   flags and approval cards.
+7. On `turn.completed` the folder (or, for a rehearsal, its clone) is
+   photographed again. If anything
+   changed, a `changes` message lands under the reply, and
+   `/api/checkpoints/:id/diff` and `/revert` serve its diff and its undo.
+
+The canonical event stream is the source of truth. The persisted
+transcript and every client view are projections of it.
+
+A lane reads as working from step 2, but its engine is only started at
+the end of step 3, which can be a moment or, with a box to wake or a
+large folder to photograph, a minute. A stop in between has no engine
+turn to interrupt, so it is kept (`stoppedGettingReady`,
+`interruptLane`) and honoured at the last check before `sendTurn`, the
+same check that turns away a turn for an agent archived or held in that
+time: the turn ends there with a notice, and its engine never hears it.
+
+## Drivers
+
+A driver turns one provider into the contract in `server/contracts.ts`.
+There are three shapes:
+
+**CLI over a native protocol.** `claude.ts` and `codex.ts` drive their
+official CLIs headless over the protocols those CLIs expose. They carry
+tool calls and permission requests.
+
+**CLI over the Agent Client Protocol.** `acp.ts` is generic: ACP is a
+JSON-RPC protocol that agent CLIs speak so editors can drive them, so one
+implementation serves any agent that speaks it. Gemini CLI was the first;
+OpenCode, Command Code (`command-code acp`), Devin (`devin acp`), the Grok
+CLI, Pi, Cursor (`cursor-agent acp`) and Cline (`cline --acp`) followed.
+Adding another is an entry in `ACP_SPECS`, which can also say how the CLI
+reports its sign-in (`signInCheck`, a command, for Cursor's keychain login
+and Devin's `devin auth status`), which ACP auth method to call before a
+session (`authMethod`, Cursor's `cursor_login`), which session mode every
+turn selects (`permissionModes`: Command Code's `default` or `bypass`,
+Devin's `accept-edits` or `bypass`; a mode the session does not list, or
+one it does not confirm, stops the turn before the prompt), and the oldest
+release that works (`minVersion`, 3.0.68 for Cline; an older one is
+unavailable with that reason, and its row offers an update). Every CLI engine can be
+started from a path of the person's choosing (`enginePaths` in
+`config.json`, set with `PUT /api/engines/:kind/path` from this computer
+only), which applies to each instance of that driver that names no CLI
+of its own.
+
+**OpenAI-compatible HTTP.** `openai-compat.ts` is generic too. Nearly
+every lab now answers `/chat/completions`, so providers are data in
+`server/providers.ts` rather than code. These are transcript-replay: the
+harness hands them the folded history each turn. They stream text but
+they do not run tools.
+
+Their model lists come from `GET /models`. A list that cannot be had
+keeps the status and the provider's own words (`catalogError` on the
+snapshot, with any key the provider echoed taken out), and is looked at
+again after a minute rather than on every snapshot. An engine left with
+nothing to pick, which is a custom endpoint, since it has no list of its
+own, reports itself unavailable for it; one with a list from before, or
+the spec's, keeps working and carries the reason. Settings shows it on a
+custom endpoint with Retry (`POST /api/custom-endpoints/:id/models`,
+which calls the instance's `refreshCatalog`).
+
+A custom endpoint can carry up to ten headers of its own
+(`CustomEndpoint.headers`), sent after the key and the content type on
+every request. Their values are secrets like keys: `custom[].headers` is
+in the backup's `SECRET_PATHS`, the built engine's `config.headers` is
+secret-bearing to an inspection, `storedSecrets` covers them, and the
+routes say names only. `PUT /api/custom-endpoints/:id/headers` takes the
+whole list, where a row without a value keeps the saved one, so a value
+never travels back to a window. Names the request owns (Authorization,
+Content-Type, Content-Length, Host, the connection's own) and anything
+with a line break are refused when saved and dropped again when an
+engine is built (`customHeaderProblem`, `sendableHeaders` in
+`server/providers.ts`).
+
+A custom endpoint whose owner turned on **Takes reasoning effort**
+(`CustomEndpoint.effort`, or `OWLBOT_MODEL_EFFORT=1` for the one from the
+environment) has `capabilities.efforts` of low, medium and high
+(`COMPAT_EFFORTS`), the three every server that takes OpenAI's
+`reasoning_effort` agrees on, so the pickers offer them and dispatch
+narrows a saved level to one of them. Each turn's request carries it,
+streamed or in every round of the tool loop; OwlBot's own one-shots (a
+title, a summary) never do. A 4xx that names the field ends the turn
+pointing at the switch, the way a refusal of tools does.
+
+**The browser and the computer.** Each driver says which of the agent's
+own browser and its computers (the cloud box, the Local VM, this Mac's
+screen) it hands its engine (`capabilities.screens`, `server/screens.ts`).
+Claude Code takes them all, and so do Codex and every ACP agent that
+takes MCP servers in `session/new`: all are sent the same stdio servers
+(`server/drivers/screen-servers.ts`), named `browser` and `computer` for
+Claude Code and `owlbot_browser` and `owlbot_computer` for Codex and ACP.
+Codex has them in the thread config of every `thread/start`,
+`thread/resume` and `thread/fork` (`screenConfig`), over stdin, so a
+turn with either switched off is a thread without it; they are mounted
+only on the owner's own turns, pre-allowed there
+(`default_tools_approval_mode = "approve"`) as Claude Code's
+`--allowedTools` has them, with a longer start and call limit than
+Codex's own, and the cloud box's key in the server's `env` table, never
+in argv or the app-server's environment, and taken out of the native
+copy (`withoutServerValues`). Working elsewhere, they stay on this
+computer and are reached over HTTP through the gate: by every Codex, and
+by an ACP agent only when its `initialize` says it takes HTTP servers.
+An agent that cannot reach one is told in its prompt that it has
+neither, and so is a Codex agent whose Codex refuses the servers. Pi and
+Cline accept MCP servers and drop them (`mcp: false` in their specs), so
+they take none. The API models reach the cloud box through the harness's
+tool loop and nothing else. Before a turn
+the harness gets ready only what the engine
+takes: the Local VM is not claimed and the cloud box is not woken for an
+engine that cannot use them, and the agent is told plainly what its
+engine cannot be handed (`engineNoComputerLine`, `engineNoBrowserLine`)
+instead of the desktop the setting would have given it. `GET
+/api/instances` carries the same answer, and the agent's settings say so
+beside Its own browser and Computer. The browser proxy starts Chrome in
+the agent's own profile (`server/cdp.ts`), headless on Linux when there
+is no `DISPLAY` or `WAYLAND_DISPLAY`.
+
+**The person's own MCP servers.** Before a turn is handed the servers
+granted to its agent, each stdio server's command is looked for
+(`server/mcp-command.ts`), never run: an absolute or `~/` path must be a
+runnable file, and a bare name must be on the PATH the engines get (the
+server's own `PATH` over it when it sets one, and PATHEXT on Windows).
+The look is bounded at about two seconds and remembered for fifteen,
+and anything other than a plain "nothing there" (a slow volume, a
+permission prompt) counts as found. A server whose command is missing
+is left out of the turn rather than handed to an engine that would fail
+to start it in silence. The agent is told in its system words, every
+turn it is so (`serversMissingNote`), and the conversation gets one
+notice ("Files did not start: its command was not found"), said again
+only when what is missing changes. `GET /api/mcp-servers` and the
+answers to adding or filling in a server carry `missing`, the program
+without its arguments and with the home folder as `~`, which Settings
+shows as "Command not found". A `~/` command is handed over expanded,
+since nothing spawns through a shell.
+
+Antigravity runs every turn over `agy acp` through the ACP driver (its
+entry in `ACP_SPECS`, `server/drivers/acp.ts`), so its servers reach it
+like any ACP agent's: in `session/new`, or `session/resume` when the
+conversation goes on, the connectors as the `owlbot_connectors` stdio
+bridge, stdio servers with their own environment, and the agent's
+browser and computer as stdio servers too, all over stdin, never in
+argv or agy's environment, and taken out of the native copy. agy 1.5.14
+does not say it takes HTTP servers, so an attached HTTP server refuses
+the turn with the reason, as for every ACP agent that does not. A
+resume cursor agy does not find opens a new session that is told the
+story.
+
+Where commands are looked for is PATH, and an app opened from Finder
+starts with launchd's. The desktop app asks the person's login shell
+(`-ilc`) for its PATH before it forks a server, and reads the answer
+from between two markers (`electron/shell-path.mjs`), so a banner, a
+hook that exits non-zero, or a slow exit after the PATH was printed keep
+the answer. A shell that printed nothing in four seconds is asked once
+more in the background for twenty; what it says then is merged into the
+app's own PATH and posted to each running server (`{ kind: "path" }`),
+which takes it (`adoptPath` in `server/path.ts`), describes its engines
+again and tells its windows to read their MCP servers again, so a "not
+found" that was only a slow shell goes away. Under all of that,
+`widenPath` appends the folders installers use that exist on disk:
+brew, npm and pnpm prefixes, nvm, volta, cargo, Bun, Go, the mise, asdf
+and pyenv shims, MacPorts and Homebrew on Linux, each where its own
+variable (`CARGO_HOME`, `GOPATH`, `PYENV_ROOT` and the rest) moves it.
+It is the only layer owlbot-server has, which under systemd starts with
+systemd's PATH.
+
+The registry (`server/harness/registry.ts`) turns a config map into live
+instances. An unknown driver or a bad config becomes an unavailable
+shadow entry rather than a startup failure, so a config written by a
+newer build downgrades safely.
+
+## Rooms
+
+A room is a transcript with several agents in it. Two things make it work
+like a workspace rather than a group chat with echoes:
+
+**One speaker at a time.** `postToRoom` runs members sequentially in
+ascending seniority, so each one sees what the last actually said and the
+lead speaks last. The lead is the member the person crowned for that room
+(`leadId`), or the most senior when nobody was (`leadOf` in
+`server/owlbot.ts`). Handoffs raised mid-round queue rather than
+interrupting, then drain in further rounds, bounded by `MAX_AGENT_HOPS`.
+
+**Sessions belong to agents, not rooms.** An agent's provider session is
+keyed to its own thread id. `activeRoom` redirects that agent's events
+into whichever room it is currently speaking in. That is why an agent
+remembers a room conversation when you DM it afterwards.
+
+Agents pass a room along between themselves three times at most before
+the person has a say (`MAX_AGENT_HOPS` in `server/room-hops.ts`). The
+count travels with the turn, not with the agent (`turnHops` in
+`server/index.ts`, by lane, set as the turn starts): none for a turn
+anything but a room mention started, the person's post in the room
+included, one more than the turn that named it for a mention's, and
+unchanged for a pickup, a backup engine or a retry. So a room chain that
+has ended does not hold what the same agent says from an unrelated turn
+afterwards, in the room or into it with `owlbot say`. A mention that
+waits for a busy agent (`server/room-tags.ts`) is delivered at the count
+it was made at. A mention from a turn already at the bound wakes nobody,
+and neither does one still waiting when a round's further rounds run
+out. Either way the room gets one notice saying who named whom and that
+posting there carries on, where the mention used to be stored and
+dropped without a word.
+
+**Who answers a message that names nobody** is the room's `answers`:
+`everyone`, `lead`, or `auto` (`server/room-route.ts`; a room from before
+reads its old `leadOnly`, which stays true for `lead` and `auto` alike so
+older clients still see the fallback). Naming a member with @ always
+reaches exactly who was named and never consults anything. In an Auto
+room, `routeRoomMessage` in `server/index.ts` gathers the members the
+sender may address there (`mayAddressInRoom` in `server/access.ts`: the
+sender and the agent both in the room), the last six lines and the new
+message, and asks one engine's `generateText` once. The engine is the
+one chosen in Settings (`rooms.router` in config.json), or by default the
+room's own: the first member engine with a small model, else the first
+with a one-shot call, so the room's words go nowhere its agents were not
+already sending them. The prompt gives members as short ids (`m1`, `m2`)
+with name, role and brief, and puts the room's words in a `<data>` block
+as JSON whose `<` and `>` are escaped, so nothing written in the room can
+close the block. The reply must be one JSON object with `ids` from that
+list (at most three), a `topic`, a `reason` and a `confidence` from 0 to
+1. An unknown id, too many, a missing or low confidence, no ids, an error
+or 2.5 seconds without an answer each mean the lead answers instead. The
+outcome (`RoomRoute`: who, topic, reason, or the fallback and why) is
+patched onto the person's message, which the room draws as a quiet line
+above the reply that opens to the reason, and for a room carried into a
+chat channel it is said there as a notice before the reply. A message an
+agent posts is never routed: it reaches only whom it names, as before.
+
+Team formation (`server/teams.ts`) sits on top: a senior agent can emit a
+fenced plan, which becomes an approval card. Only your yes creates the
+agents and the room.
+
+**Topics** (`server/room-topics.ts`) are threads inside a room, each with
+the agents who answer in it. A workflow's "Post in a room" step and a
+room's routine may name one (`topicId`): the post goes into that topic's
+thread and wakes only its agents. One closed or gone since it was set up
+fails the step or the run with the reason (`scheduledTopic`), never
+spilling into the main stream; saving a routine refuses a topic that is
+not open. The topics bar folds topics under their category
+(`topicFolders` in `src/lib/roomTopics.ts`): a folder with work or a
+question in it, or the topic being read, opens by itself, a quiet one is
+folded once there are several, and the person's choice wins. Every change
+to a room's topics is broadcast as `room.topics` too, which members hear
+(the owner's app has the whole room in its `owlbot` frame), so a member's
+screen follows topics opened, closed or changed by someone else.
+
+A workflow's "Post in a room" step may open a topic instead of naming
+one (`Step.newTopic`): each run opens it, its title filled in from the
+run's values, posts into it, and adds the topic's title and id to the
+step's values. The main stream says the workflow opened it.
+
+The room's lead can route work into topics, once the owner switches it
+on for the room (`OwlBotRecord.leadRoutes`, the switch in the topic dock on
+the main stream; `PATCH /api/owlbot/:id` refuses it to an agent). Then
+each person's message in the main stream reaches the lead with a note
+(`routingNote`): the message's id, the open topics and the command,
+`owlbot topic move <room> [<message>] --into <topic> | --new <title>
+[--to <agents>]`, which is `POST /api/owlbot/:room/topics/move`. The
+route checks it whole before anything changes (`mayMove`, `movable`,
+`moveWakes` in `server/room-topics.ts`): only the lead while the owner
+lets it, or the owner or an admin; only a person's own text in the main
+stream, and each message once; only agents who work in the topic woken,
+never the one who moved it, and a move that would wake nobody is
+refused. The message keeps its place and gains `topicId` and `moved`
+(who, when), the main stream says who moved whose message where, and the
+topic's agents are woken with it there through the room's queue
+(`RoomAuthor.existing` and `reach`), behind the round that is answering
+it. A new topic opened this way is the lead's, as one it opens itself.
+
+A topic's folder is held where OwlBot can hold it (`folderHold`). For a
+Claude Code turn on this computer in a topic with a folder, the driver
+hands the engine `server/topic-folder-hook.ts` as a PreToolUse hook on
+Write, Edit, MultiEdit and NotebookEdit (`SendTurnInput.writeOnly`),
+with the topic's folder under the turn's folder, the agent's own notes
+folder and the temp folder; a write anywhere else, through a link
+included, is refused before it runs and the agent is told why. It holds
+in every permission mode. It cannot hold a command run in a shell, any
+other engine's own tools, an agent that works elsewhere, one whose engine
+hooks the owner switched off, a shared room, or Windows, and the agent's
+brief says which (`folderHoldBrief`), as the topic dock does for people.
+
+## Persistence
+
+Plain JSON in the workspace's data folder (`~/.owlbot` for Personal, see
+Workspaces), written synchronously. No database.
+
+| Path | Contents |
+| --- | --- |
+| `bots.json` | Agent records, model selection, resume cursors |
+| `owlbot.json` | Rooms and members |
+| `sidebar.json` | The order of the sidebar's section headings |
+| `turns-in-flight.json` | Every turn while it runs, so one cut off by a stop is picked up |
+| `room-lines.json` | Room lines waiting for a busy agent, or for OwlBot to be back |
+| `engine-pauses.json` | Engines and models paused for a while, only while any are (see Engine pauses) |
+| `incidents.json` | What failed, who has it and how it ended, and the quiet desk's one card (see The incident desk) |
+| `workspace.json` | The workspace's name, kind and mark, as the app last said them, for invites |
+| `people.json`, `joining.json` | Members, guests and devices; invites, the join key and password, and the joining switches (see People in a workspace) |
+| `member-limits.json`, `owner-plan.json` | What each member may spend and has spent this month; the owner's plan as last known |
+| `reads.json` | How far each person has read each conversation (see Read positions) |
+| `last-read.json` | Where each person left off in each conversation (see Where you left off) |
+| `usage.json`, `model-prices.json` | Daily usage by agent, engine and person; the public price list estimates come from (see Usage and spending limits) |
+| `plan-cache.json` | The Plan page's last good answers from owlbot.dev, under a fingerprint of the key |
+| `location.json` | The owner's iPhone's last reading and whether each phone shares, never a trail; left out of backups and moves (see Location) |
+| `connections-audit.jsonl` | One line per request an agent made through a connection, sent or refused: when, which agent, what, the status. Never a header, a body or a query string (see Connections) |
+| `messages-<id>.json` | One transcript per agent or room, same key space |
+| `config.json` | Connected providers and keys, `0600` |
+| `skills/*.md` | Installed skills |
+| `skill-history/<id>.json` | Every version of each skill of the person's, whole, with who made it, when and why (see Skill versions) |
+| `skill-usage.json` | How often each skill and each version was used, and corrected straight after |
+| `proposals.json` | Suggested skills and changes to skills, staged until the person keeps or dismisses them |
+| `setup-import.json` | What was brought over from other agent tools, by item: a digest, where it went, and the exact text added |
+| `setup-import-runs.json` | The newest 20 imports from other agent tools, step by step, for undo; never a key |
+| `setup-transfer/` | An OpenBot transfer file the owner picked for Bring your setup, and the name it was picked under; left out of backups |
+| `session-import.json` | Which past Claude Code and Codex sessions became which lanes, with the digest of what came over |
+| `engine-sessions.json` | Engine session ids OwlBot itself ran, so they are never offered back as past sessions |
+| `events/`, `native/` | Canonical events, and raw provider traffic |
+| `checkpoints/` | Content-addressed file versions, one photograph per folder, and the undo records |
+
+Backups of all of it go beside it, never in it: `~/.owlbot-backups`, one
+file each (see Backups and restore).
+
+A store writes its whole file on every change, with one exception: a
+turn's tool call rows and their results wait up to a quarter second
+(`ROW_WAIT_MS` in `server/store.ts`) and go out with whatever else
+changed, one write per transcript, because rewriting a long conversation
+twice for every call took most of the server's time. Any other write of
+that transcript takes them along at once, and the turn's end and a
+process on its way out write what is waiting. Where losing that file
+would hurt (agents, transcripts, rooms, config and the like) the write
+goes through `server/atomic-write.ts`: to a file beside it, flushed, then
+renamed over the old one, so a crash leaves the old file or the new one,
+never half. Such a file that is there and will not parse is moved aside
+as `<name>.corrupt-<time>` before its store starts empty, so the next
+save cannot write over the only copy.
+
+Checkpoints are not git. On a Mac without the developer tools
+`/usr/bin/git` is a stub that opens an installer, so the store hashes
+files itself: each version is kept once by its sha256, a file whose size
+and mtime have not moved is not read again, and regenerated folders
+(`node_modules` and friends) are skipped. An undo restores a file only if
+it is still exactly what the turn left behind.
+
+Memory has its own journal (`server/memory-journal.ts`). An agent's
+MEMORY.md and topic files are read before and after each turn, and any
+difference becomes an entry with the whole text before and after, as do
+edits made from the Memory place. Undo follows the checkpoint rule: only
+a file still exactly as that change left it goes back, and a file that
+has become a link is never written through. A change recorded through
+OwlBot while a turn of that agent runs (the agent's own `owlbot memory`
+write, an API engine's `memory_write`, the person's edit) also updates
+the turn's photograph, so the turn's end does not find it again: one
+edit, one entry, by whoever made it. An agent's write through the CLI
+or a tool is the agent's; an agent file's import, a copy from another
+agent and the editor are the person's.
+
+Shared memory is one `DATA_DIR/shared/MEMORY.md` the person keeps for
+every agent, under the same 200 line and 24,000 byte budget, journaled
+under the owner id `_shared` with the same undo (`/api/memory/shared`,
+its `journal` and `journal/:id/undo`). It is the standing prompt's third
+moving part (`server/standing-prompt.ts`), so a resumed Claude Code
+session keeps its cached copy and hears a change in its message, and it
+has the notes' gate: never in a shared room, a stranger's mail or a
+Telegram person's turn, and never in a workspace member's turn or any
+turn of a member's own agent, since the owner wrote it for their own. Agents read it (`owlbot memory --shared`, and the
+prompt) and never write it; the write route refuses an agent's
+credential and the agent guard does not list it.
+
+Memory is a place on the main rail (`src/components/MemoryPlace.tsx`):
+a sidebar of its own lists Shared, About you and every agent, and the
+page beside it is the one picked. The sidebar is a page column
+(`src/components/SideColumn.tsx`), as Settings', Plugins', an agent's
+settings' and Automations' lists are: sized by its edge and folded with
+Cmd+B. Folded, Settings' pages are tabs along the top, and Memory's and
+Plugins' are a small switch at the top left of the page. Links open it
+with `openMemory` and a target (an agent's id, `you` or `shared`), which
+Back and forward remember. About you edits the same `profile.about`
+Settings does. The place reads `GET /api/bots/:id/memory/stats` for its
+meter (lines and bytes against the budget, topics with sizes and times),
+searches with `GET /api/memory/search` (every listed agent's memory and
+the shared memory, from recall's own indexes), and copies with
+`POST /api/bots/:id/memory/copy` (picked topics, appended to one the
+agent already has, and picked MEMORY.md lines it does not have yet, each
+file one undoable entry). It follows `memory.changed` on the stream
+rather than polling; `botId` is `_shared` for the shared memory.
+
+API engines with tools keep memory with `memory_read` and `memory_write`
+(`server/drivers/openai-compat.ts`), answered by the workspace like
+`note_about_person`: refused for a stranger's mail and a Telegram
+person, a write refused in any shared room, and a read there only where
+the owner let the agent's memory in. An empty text for a topic forgets
+it. CLI engines have `owlbot memory --topics`, `--topic <name>` with
+`--write` or `--forget`, on their own topics only.
+
+Room ids and agent thread ids share one key space, which is why a room
+transcript and a solo transcript are the same kind of file.
+
+## Workspaces
+
+A workspace is a data folder and the one server that runs on it. Every
+path in this document that says `~/.owlbot` means the workspace's own
+folder, `DATA_DIR` in `server/config.ts`: `OWLBOT_DATA_DIR` when it names
+one, else `~/.owlbot`. The server, the command line tools in `bin/` and
+the safety floor all read it from that one place, and
+`server/data-lock.ts` keeps it to one server per folder.
+
+The desktop app keeps the list (`electron/workspaces.mjs`, pure and
+tested in `test/workspaces.test.ts`) in `workspaces.json` in its own user
+data folder: each workspace's id, kind (`personal`, `business`, `custom`
+or `joined`, `hosted` for the managed hosting that is coming, and
+`remote` for one on a server of the person's own), name,
+whether it is a team's, mark or logo, data folder, mute, notification
+level, order, last port and accent, and the person's own preferences
+(theme, the accent shared by every workspace when that is on, the
+name they go by, and `local`, "Run workspaces on this computer").
+
+A `remote` workspace is a `owlbot-server` the app is paired with as one of
+the owner's devices (`remote:connect` with a link from `owlbot-server
+pair`). There may be any number; each pairing is kept in the keychain as
+`joined-<id>.bin`, and each opens through its own `electron/remote.mjs`
+stand-in on loopback, like a hosted or a joined one. A server is known by
+the OwlBot Cloud space its pairing goes through, so pairing the same one
+again keeps its entry (`addRemote` with `same`) and pairing another adds
+one. One added without a name takes its computer's name from
+`/api/config`. With `local` off, `shownWorkspaces` lists only the kinds
+elsewhere, `launch` refuses to start a local one by any route, the local
+servers are stopped, and the window opens a server; it can't be turned
+off with no server listed, and the last server can't be removed while
+it is off, so the app always has somewhere to open. Before 3.2 a pairing
+made the whole app one server's window and restarted it, kept in
+`remote.bin`; the next start lists it as a `remote` workspace on the same
+port, with `local` off, and removes the file. The order is the person's: holding a workspace in the
+switcher and dragging it, or Option and the arrow keys, rewrites it
+(`reorder`), and every list of workspaces follows it. The first launch
+with workspaces finds no list and writes one with the folder OwlBot always
+had as Personal, exactly where it is: nothing is moved or rewritten to
+get there. Other workspaces get `<user data>/workspaces/<id>`, so a
+rename never moves a folder. Personal cannot be deleted. Marks are a 3x3
+pattern and a colour (`electron/workspace-marks.mjs`): Personal and
+Business start on their own, and a named workspace draws one that is
+neither of those and that no other workspace on the computer wears. Any
+of them can wear one the person picks from the picker's colours and
+shapes, at the Mac or from the owner's phone (`server/workspace-mark.ts`,
+which puts the phone's choice to the app), and the app keeps it only when
+no other workspace here wears it. On a joined workspace, the mark picked
+is the member's alone (`ownMark`), kept in their list and never sent to
+the owner, whose own mark stays beside it. A new workspace opens on a
+short welcome shaped by what was chosen for it
+(`src/lib/workspaceWelcome.ts`): a name and logo for a business, the
+agents for its work, inviting people for a team, and nothing about
+members for one person.
+
+`electron/main.mjs` starts one server per local workspace, a few at a
+time behind the window, each a `utilityProcess` with `OWLBOT_DATA_DIR`,
+`OWLBOT_PORT`, `OWLBOT_WORKSPACE_ID`, `OWLBOT_WORKSPACES_DIR` and the
+workspace's name, kind and mark in its environment. Personal keeps the
+port order it always had (`OWLBOT_PORT`, its `config.json`, the last port,
+then 8799, 18799 and 28799), because a phone paired on the network
+remembers it; the others take the port they had last, their
+`config.json`'s, or any free one. The window shows one workspace and
+switching points it at another server; the rest keep running, so a
+routine or a watcher in a workspace nobody is looking at still runs on
+time. A server that will not start is marked in the switcher with a way
+to try again, and the app opens on the next one that does. The safety
+floor keeps agents out of every folder under `OWLBOT_WORKSPACES_DIR`, not
+only their own workspace's.
+
+A development run (`pnpm dev:desktop`) shows the dev server and starts
+none of its own. `OWLBOT_DEV_WORKSPACES=1`, after `pnpm build`, makes it
+host the workspaces the way the installed app does.
+
+Each server talks to the app over the port Electron gives only its own
+children (`process.parentPort`), never the network:
+
+- **Banners.** What a window would have raised a banner for, decided by
+  the window's own rules (`server/desktop-notice.ts`, held to
+  `src/lib/notify.ts` by `test/desktop-notice.test.ts`) and marked
+  `needs-me` or `activity`, plus how many conversations are waiting. The
+  app holds each to that workspace's mute (15 minutes to 24 hours, or
+  until turned back on) and level (all, only what needs the person, or
+  nothing), and the Dock badge and the switcher's dots are the sum.
+- **The licence.** The app keeps one OwlBot Cloud licence in the keychain
+  for every workspace and hands it to each server as it starts
+  (`{ kind: "licence", key }`); a server that already held one offers it
+  back once, and `licence.forget` takes it away everywhere. Relay
+  activation names the workspace id, so one licence holds a space per
+  workspace: `GET /api/relay/plan` says how many are online in the
+  relay's words, and `DELETE /api/relay/space` frees this workspace's
+  place while keeping the licence, so `POST /api/relay/activate` with
+  `again: true` needs nothing typed. A workspace's own licence still wins.
+- **The plan and the name.** One plan holds for every workspace. A
+  server says the plan it knows (`desktop.plan`), and the app takes that
+  word only when it is about the app's own licence, keeps it under the
+  licence's fingerprint (`electron/account-plan.mjs`, `account-plan.json`
+  in its user data folder) and hands it to every server with the licence
+  (`{ kind: "licence", key, plan }`, then `{ kind: "plan" }`), so a
+  workspace made today is on the plan from its first frame and a new
+  workspace's Team choice can say what it needs. The owner's name
+  (`desktop.name`) the app keeps once and hands to every workspace
+  (`{ kind: "name" }`).
+- **Stopping.** `{ kind: "stop" }` ends a server cleanly on every
+  platform, engines and folder lock included.
+
+A workspace joined on somebody else's computer has no folder here. It
+opens through the remote proxy (`electron/remote.mjs`) with the member's
+credentials, kept in the keychain like a server's, and the window
+draws a member's app from the member routes (see People in a
+workspace). One joined without OwlBot Cloud is reached on the owner's own
+network only, through `startLanProxy`, a loopback stand-in like the
+relay proxy.
+
+## Clients that are not on this machine
+
+The phone, a browser at owlbot.dev/web, and the desktop app in remote mode
+all reach a workspace the same way. Each is a paired device with its own
+token; the workspace keeps only its sha256. Both ends derive one AES-GCM
+key per direction from it (`server/relay-crypto.ts`), every request and
+every event frame is sealed for one device, and the relay in between
+carries ciphertext it cannot open. A browser keeps the two keys as
+non-extractable WebCrypto keys and never the token. Routes that mint new
+pairings answer this machine and the owner's own paired devices, the only
+way in to a server with no screen, and never a member's device or an
+agent; switching phone access off and removing every device answer this
+machine alone, since from a device they cut that device off too. A member's
+device, or a desktop app that joined the workspace, reaches it the same
+way with a member credential and is held to its own surface (see People
+in a workspace); one that joined on the owner's network alone calls it
+over plain HTTP on that network with its device token as the bearer.
+
+Pairing on the same network (`server/pairing.ts`) is off until phone
+access is switched on (`PUT /api/pair`), and the bind follows the switch
+only at the next start. Settings, Phone and devices is a short onboarding
+until a phone is paired, then the list (`src/components/DevicesSection.tsx`).
+No code exists until somebody asks: `POST /api/pair/start` mints a six
+digit code and a QR token, in memory only, one at a time, for five
+minutes; the window asks for the next just before one runs out while the
+panel is open and visible, and `POST /api/pair/cancel` closes it the
+moment the panel closes. `POST /api/pair/claim` takes either credential
+and counts every try, and five checked tries close the code. The QR
+carries the server's own addresses, wherever the card is drawn: the home
+network's first, then IPv6 unique local addresses (Tailscale's first),
+then a Tailscale IPv4 address, and the card lets the person pick which
+one the code carries when there is more than one. On the network the
+server listens on IPv4 and IPv6 both (`::`), so a phone can come over a
+Tailscale IPv6 address, which iOS talks plain HTTP to as it does to the
+home network; it refuses Tailscale's IPv4 range, and the phone says to
+use the IPv6 address instead. Of IPv6 peers only loopback, unique local
+and link-local ones may connect (`reachablePeer`); a global IPv6 peer is
+dropped before a byte is read, so listening on IPv6 reaches no network
+the IPv4 bind did not. A machine without IPv6 listens on IPv4 alone.
+owlbot-server never listens on the network, so there `GET /api/pair` says
+so (loopback, no restart pending, no addresses), `start` refuses, and the
+card shows the OwlBot Cloud link (`POST /api/pair/link`) as a QR instead.
+Where the card is on another computer, `computer` and `here` name the one
+the phones reach.
+
+A phone whose saved address went stale finds the Mac again on its own.
+While phone access is on and the server listens on the network, a server
+the desktop app started on a Mac announces itself as `_owlbot._tcp`
+through `dns-sd` (`server/announce.ts`), named for the computer alone (a
+workspace's name can be a client's, and the whole network hears it), with
+`ws=` in its TXT record: `workspaceTag()`, a
+hash of a random `announce-key` in the workspace's folder, which
+`/api/health` also says as `tag`. A small shell watches the server and
+ends the announcement with it, however it went. The phone trusts nothing
+it hears: before its token goes to a new address it sends a hint (the
+first 16 hex of a sha256 of its token's digest) and a nonce to
+`POST /api/pair/prove`, and only an OwlBot holding its pairing can answer
+with the HMAC of that nonce keyed by the digest.
+
+A phone the owner paired with one workspace can learn the others on the
+computer and pair one in a tap (`server/other-workspaces.ts`):
+`GET /api/workspaces/others` and `POST /api/workspaces/others/:id/pair`,
+for the owner's own paired devices only. The question goes to the app
+over the parent port, since only the list knows the workspaces; it names
+only the person's own (`OWN_LOCAL_KINDS` in `electron/server-line.mjs`),
+starts the one asked for if it has to, and asks its server for a single
+use pairing of three minutes, through OwlBot Cloud when it is online, else
+on the network when phone access listens there (`mintPairing`). A device
+gets five in ten minutes (`MintLimiter`), and the app shows a notification
+for every one made, whatever the workspace's notification settings.
+
+A person can watch an agent's browser or cloud computer from the phone and
+work it. Live frames go out on the stream only on this machine and the
+same network; a phone through OwlBot Cloud asks `GET /api/bots/:id/screen`
+for the newest one, and `?watch=1` keeps the browser or box pictured for a
+minute after its last look (`watchScreen`), turn or no turn, without
+opening a browser or waking a box to do it. `POST /api/bots/:id/browser/:act`
+and `POST /api/bots/:id/computer/:act` take a click, a scroll, a key or
+typing (`handsFrom`), never from an agent's credential. While an agent's
+turn drives the Mac itself (`drivingMac`), the same screen route answers
+the person with a picture of the Mac's screen: the server asks the app
+(`desktop.screen`), which takes one only if Screen Recording is already
+granted and never asks macOS for it (`answerScreen` in
+`electron/main.mjs`), at most about once a second however many ask. It is
+never broadcast, never answered to an agent's credential, and there is no
+route that clicks on the Mac.
+
+The line to the relay (`server/relay-link.ts`) is two things. The stream
+in, which carries asks, is watched for silence and redialled. What goes
+back out, answers and event frames, is its own health reading: an answer
+is retried until the relay's 20 second wait is over (the relay settles an
+ask once, so a repeat is harmless), and `delivering` drops when an answer
+is lost or half the recent posts failed. Status shows green only when
+both hold, because a lossy network can keep the stream open while every
+reply goes nowhere.
+
+The relay takes 2 MB a payload, and sealing grows an answer by about 1.8
+times. So a request that arrives through it gets transcripts cut to their
+newest part: `GET /api/bots`, `GET /api/owlbot` and a lane switch each fit
+in about 700 KB of messages, shared evenly so one long conversation cannot
+starve the rest, and each transcript says how many `olderMessages` stayed
+behind. `GET /api/bots/:id/messages?thread=&before=` and
+`GET /api/owlbot/:id/messages?before=` page back through them. A paired
+device on the network (a phone, the desktop app paired by address or on
+the LAN, a browser at the web door) is cut the same way: its path may be a
+Tailscale relay or a weak cellular link, where an agent list in full waited
+so long the phone gave up (GitHub 473). Requests from this machine are not
+cut. An answer that would still be too big is replaced with a short 413,
+so the phone hears why instead of waiting out the relay's timeout.
+
+Off this machine, JSON and the built interface's text, scripts, styles
+and SVG go gzipped to a client whose `Accept-Encoding` takes it, from
+1 KB up, with `Vary: Accept-Encoding` either way (`server/compress.ts`).
+An answer over 64 KB is squeezed on libuv's thread pool, so a 700 KB agent
+list never holds up other requests, and each version of a built file is
+squeezed once. Event streams are never compressed, and nothing on this
+machine is: the app's window and OwlBot Cloud's replay of a phone's request
+read it on loopback.
+
+A file is often more than one answer carries: about a megabyte when it
+does not compress. A device that says it takes parts (`parts: true` on a
+raw GET, feature `raw-parts`) is answered a part at a time
+(`servePart`): each part is 768 KB of the file, an ordinary ask and
+answer under the relay's limits, with the whole's `size`, how many
+`parts`, which `part` and a `tag` for the version of the file. The rest
+are asked for by number with that tag, and a part asked for by a tag the
+file no longer has is a 412, so two versions are never joined. The route
+is asked for each part's bytes alone with a `Range` header (the artifact
+route answers ranges and an `etag`); one that does not is read whole and
+sent whole when it fits, cut only when it does not. Past 50 MB a device
+is told so in a 413 that says the limit, before anything is read. A
+device that does not say it takes parts gets what it always did. The
+desktop app's stand-in server joins the parts (`electron/raw-parts.mjs`,
+a loop with no imports that a browser can use too), so the window opens
+and downloads a file of any size up to the limit, and
+`GET /api/attachments/where` says `openMaxBytes` to an app that comes
+through OwlBot Cloud and takes parts, so a card says a file is too large
+before anybody clicks. `owlbot share` still shares a file over it, and its answer carries
+a `warning` saying so while OwlBot Cloud is on.
+
+A phone's Live Activities follow the turns the owner is waiting on
+(`server/live-activities.ts`): only a turn the owner's own message started
+or joined, from any device, never one another agent, a routine, a watcher,
+a webhook or a member started. The phone hands over its activity tokens
+with `POST /api/live-activities` (feature `live-activities`), and a
+push-to-start token on iOS 17.2 or later. A turn that is still running a
+few seconds after it began gets an activity on each owner phone that does
+not have one for that agent already, at most two per phone with the
+newest replacing the oldest; an unanswered card turns it to waiting; and
+once its lane has stayed free for a few seconds (so a retry or the backup
+engine taking over is the same wait), every phone's activity for it is
+ended. These go through the relay as ActivityKit pushes, which Apple
+reads, so they carry only a state word, the turn's start time and opaque
+ids, with the agent's name and the conversation sealed for the device.
+
+An activity's end is silent, so the same turns also say when their
+answer is ready (`server/answer-ready.ts`): once, as the turn's
+`reply.settled` goes out, a wake with reason `reply` to the owner's
+phones, its preview (the agent, the answer's first words, the lane)
+sealed for each. Only for a turn that ended well in a conversation with
+one agent, not one asked from Telegram, an agent whose notifications are
+off, a goal's turn, or a workspace that is muted or set to fewer
+notifications. The server keeps that word in its data folder
+(`attention.json`, `server/attention.ts`), so a restart, or a server no
+app started, still has it; a server nobody ever told is not muted. The
+desktop app hands it to a server it started as `attention`, and says it
+to your hosted workspace, or one joined as its owner, on
+`PUT /api/workspace/attention` through the stand-in, only when it
+changed. The owner may set it there from any device of theirs (feature
+`attention`); agents, members and admins are refused, and a change on
+a server the app started is put to the app first, so the switcher
+shows it too. And not while
+any of the person's screens shows that conversation: windows and phones
+say what they have in front of the person with `POST /api/viewing`
+(feature `viewing`), again every thirty seconds while they do and null
+when they stop, and a word older than 75 seconds no longer counts.
+
+While the owner is actively using OwlBot on a computer, their phones stay
+quiet altogether (`server/presence.ts`, feature `presence`): no wake of
+any reason reaches the owner's own phones (a wake that also names a
+member still reaches the member), no new Live Activity starts on them,
+and the activities already there end, in silence, the moment the person
+sits down. The owner's own windows say it with `POST /api/presence`
+`{window, active, seq}` (`src/lib/presence.ts`): active is a window that
+is shown and focused, on a computer with a fine pointer, with the
+person's own input in it in the last two minutes, said again every
+thirty seconds and said to be over the moment it is not. A word older
+than 75 seconds no longer counts, so a computer that sleeps or locks
+releases the phone soon after. A turn still running when the person
+leaves gets its phone activity then; nothing held back is ever replayed,
+and a turn that ended meanwhile gets nothing. The word is a yes and a
+time, kept in memory only; agents and members are refused, and a device
+that is unpaired says nothing more.
+The tokens are kept per paired device, swept against the pairing every
+minute (which also ends what a restart left behind), and dropped when the
+device is unpaired. Without OwlBot Cloud there is no way to push, and the
+phone keeps only the activities it starts and ends itself.
+
+Both list routes accept `?messages=N` to keep only the newest N messages
+of each conversation, including zero for names and rosters alone. The CLI
+and MCP room discovery use zero; their history reads use the separate room
+messages route. Missing or invalid counts keep the full local transcript,
+so app hydration still has its history. For a paired device, `olderMessages`
+counts everything omitted, including when the requested tail is zero.
+
+The desktop also windows the rendered rows. `useHistoryPaging` reveals the
+next local window or asks `useEarlier` for one server page when an opening
+or resized transcript leaves unused height. It stops when filled, exhausted,
+on a nonadvancing page or error, or after eight automatic expansions. Folded
+pages can advance without growing the column. The manual button remains at
+that ceiling, and intentional upward paging shares the same exclusion latch.
+Each visit owns its requests and measurement frames. Prepending holds an
+identified visible row measured after the wait, so new tail content does not
+move a reader who scrolled away. Find targets and the room's topics lens
+suppress paging that could displace their position.
+
+## People in a workspace
+
+A workspace has one owner, the person whose computer it is, who holds no
+Person record and no role. Everyone else is either a member of the
+workspace, with the role `member` or `admin`, or a guest of some of its
+rooms (`server/people.ts`, `people.json`, version 3). A member came in
+through a workspace invite, or was made an admin by the owner, and
+reaches the workspace's team agents and the rooms open to them. A guest
+came in through one room's own invite (the older share flow) or only
+ever talks from a linked chat channel, has no role, reaches that room
+and nothing else, never hears the members list, and counts against the
+room's places rather than the workspace's. Room memberships still exist
+underneath, because a room keeps its own roles (collaborator, viewer)
+and its own joining date for what history a person sees.
+
+### Who may see what
+
+Every rule is in `server/access.ts`, as plain functions over plain data,
+and the server asks it before anything leaves:
+
+- Every agent that is not solo is a team agent with one shared team
+  conversation. Its access list is everyone (the default), only some
+  people, or everyone except some (`PATCH /api/workspace/agents/:id/access`,
+  with whether admins are always in). The owner always is.
+- A room is everyone or chosen people (`PATCH /api/workspace/rooms/:id/access`).
+  Anybody in a room meets every agent in it there, whatever the agent's
+  own list says. `GET /api/workspace/access` lists both, with each room's
+  own guests apart.
+- Anybody who can reach a team agent, in its team conversation or a
+  room, also has a private conversation with it. Nobody else reads it,
+  the owner included, unless the owner turns on "Owner and admins can
+  read members' private conversations" (`PATCH /api/workspace/joining`
+  with `privateReadable`), and every member is told which way it is set
+  (`privacy.line`). While it is on, `GET /api/workspace/private/:botId`
+  lists them for the owner, to read only.
+- A solo agent is its maker's alone: not listed for anyone else, its
+  conversations theirs, and only they can put it in a room.
+- A private conversation is private past its transcript (GitHub 431).
+  The agent keeps a memory of that member's own there (`memoryOf`), at a
+  desk of theirs with the agent, `people/<id>/agents/<botId>/`, which is
+  also where it works unless the owner gave the agent a folder. The
+  standing prompt loads that memory, not the agent's own; `memory_read`
+  and `memory_write` reach it; the owner's Memory place and the nightly
+  tidy never do. On Claude Code the turn's file tools may not read or
+  change any agent's workspace or anybody else's folder, even with a yes
+  (`SendTurnInput.deniedDirs`), and Claude Code's own per-folder memory is
+  off. A conversation from before desks starts a new session at the desk
+  once, told the conversation (`TaskRecord.desk`).
+- Looking back is held to the same line (`mayRecall`): from a member's
+  private conversation, that conversation and the team conversation they
+  are on; from the team conversation, itself; from the owner's own, never
+  a member's private conversation, whatever the reading setting, which
+  lets the owner read and does not hand the words to an agent. The
+  owner's own `GET /api/search` and recall from their device reach a
+  member's private conversation only while reading them is on, and a
+  member's solo agent never.
+- A member's own apps and keys (`server/personal.ts`, below) are used by
+  a turn they asked for in their private conversation or their solo
+  agent (`personalAccountsFor`), and by nothing else.
+- The owner's own apps, keys, credential, profile and shared memory go
+  only to a turn the owner asked for on an agent of the owner's
+  (`runsAsOwner`). A member's solo agent works for its maker whoever
+  speaks to it (`agentOwner`), so a room turn the owner sets going on it
+  is still not the owner's. Every other turn is sent with
+  `SendTurnInput.forOthers`, and the driver keeps out what the engine
+  brings of its own accord on the owner's computer: on Claude Code the
+  claude.ai connectors (`ENABLE_CLAUDEAI_MCP_SERVERS=false`), every MCP
+  server OwlBot did not name (`--strict-mcp-config`), CLAUDE.md files
+  (the working folder's own two are read back in) and auto memory; on
+  Codex each MCP server in the owner's own settings
+  (`mcp_servers.<name>.enabled = false`) and `features.apps`, with the
+  turn refused (`OWNERS_OFF_REFUSED`) when Codex cannot say what its
+  settings hold or will not take the switch. A member's turn outside
+  their own conversation is told it has nobody's apps there, and its
+  `request_connection` and `request_secret` plant no card.
+- Approvals in a team conversation or a room are answered by the person
+  whose message started the work, the owner or an admin; in a private
+  conversation or a solo agent, by its person.
+- In a team conversation or a room, the owner or an admin may tell an
+  agent to message somebody who can reach it. The agent posts into that
+  person's private conversation, marked as sent on their behalf:
+  `message_person` on Claude Code's bridge and on API engines, `owlbot
+  message-person` for the engines with a shell. A turn an admin started
+  gets a credential that can do that one thing. Members never message
+  each other through an agent.
+
+A member's device reaches `server/member-access.ts` and nothing else.
+Every route a member may call is named there, and anything unnamed is
+refused, so a route added anywhere else in the server is closed to
+members until somebody decides here that it should not be. The member
+routes (`/api/member/...`) give the workspace as a member sees it, the
+agents they reach and their own solo agents (made within their cap, on
+the engines they are allowed, and deleted by them alone), each agent's
+`team` and `private` messages and cards, their usage, their own notes
+about themselves (kept apart in `people/<id>/profile-notes.json`), what
+each agent remembers of them (`GET /api/member/memory`, and
+`DELETE /api/member/memory/:botId` to forget it), their own apps and keys
+(below), whether they have seen the welcome (`you.welcomed` on
+`GET /api/member/workspace`, set by `POST /api/member/welcomed`, so one
+device's welcome is every device's), their read positions, and leaving
+(`POST /api/member/leave`, which revokes every device, closes their
+streams, archives their solo agents, drops their private conversations
+and removes their folder with its desks, apps and keys, and tells the
+owner with a `workspace.left` frame).
+
+A member's own apps and keys (`server/personal.ts`,
+`people/<id>/own.json`, 0600) are theirs to manage from their own
+device and nobody else's: `GET /api/member/connections` (their Composio
+key by its last four characters, the apps offered, their keys by name;
+never a value), `PUT` and `DELETE /api/member/connections/apps` (a
+Connect key, `ck_`, checked with Composio before it is kept),
+`GET .../apps/services`, `POST` and `DELETE .../apps/:slug` (a sign-in
+link to open, or every account of that app removed, all under the
+member's key), and `PUT` and `DELETE .../secrets/:NAME` (the owner's
+reserved names refused the same way). A turn that uses them gets the
+member's key as its Composio access and their keys in its environment
+on an engine with a shell, and is told so by name. In that turn
+`request_secret` and `request_connection` plant no card: the agent is
+told, and a line in the conversation tells the member, to add it under
+Your connections. The owner's own card routes refuse a card in a
+member's private conversation, so nothing there is ever saved into the
+owner's keys or signed in under the owner's account. The values are in
+`redactSecrets`. The event stream reaches a member only through
+`memberFrame()`, which strips what is the owner's (tool arguments,
+screenshots of the owner's screen, file paths, the buttons on
+approvals); a reply's words stream to whoever may read its
+conversation. An admin's device also reaches the people routes:
+invites, requests to join, roles, limits and access. The join password
+and the approval switch stay the owner's.
+
+### Invites and joining
+
+One invite is one person (`server/invites.ts`): a code, a QR and a link
+that are all the same invite, single use, for a day, cancellable, and at
+most twenty waiting (`POST /api/workspace/invites` with an optional name
+and a role; `PATCH` and `DELETE /api/workspace/invites/:id`). The code is
+8 characters from an alphabet with no 0, O, 1, I or L, shown as
+`K7QF-M2XR` and read in any case, with or without spaces and dashes. The
+link is `https://owlbot.dev/j/<publicId>#<code>`: the public id only names
+the preview card, and the code sits after the `#`, which no server sees.
+Kept in `joining.json`, readable by the owner alone: the code's sha256
+(what the relay indexes) and the code itself, so the owner can read it
+out again, with the role, name, expiry and tries. OwlBot Cloud learns the
+hash, the public id and the preview (workspace name, mark, inviter,
+role), and rate limits lookups.
+
+A code is short enough to read out, which makes it guessable, so three
+things stand behind it. Guessing is slow: OwlBot Cloud limits lookups,
+and this computer limits guesses from its own network. A join password,
+when the owner sets one (`PUT` and `DELETE /api/workspace/joining/password`),
+is hashed with scrypt, checked only here, and never in the invite; five
+wrong tries close that invite and tell the owner. And with Approve each
+person on (the default), nobody is in until the owner has read the same
+four words as the person asking (`POST /api/workspace/requests/:inviteId/approve`
+or `.../decline`). The words are an HMAC keyed with the code's hash over
+the joiner's device token hash and this workspace's join key
+(`joinPhrase`), so a relay that swapped the key to read the request shows
+different words on the two screens.
+
+Joining is a sealed conversation about one thing. The joiner makes an
+X25519 key and derives one key per direction with HKDF-SHA256
+(`owlbot-join-v1:joiner-to-host`, `owlbot-join-v1:host-to-joiner`) against
+the workspace's join key, then asks `/api/join/lookup`, `/api/join/claim`
+(name, password, the device token's sha256, the kind of device),
+`/api/join/status` and `/api/join/cancel`, through the relay's ask route,
+or on the same network through `GET /api/join/key` and
+`POST /api/join/ask`, where the link carries the host's address after the
+code. Each ending has its own code: `wrong_code`, `expired`, `cancelled`,
+`used`, `closed`, `declined`, `password_required`, `wrong_password` with
+the tries left, `already_member`, `full`, `rate_limited`. An approved
+claim answers with the person's id and role, the relay to use (or none,
+and the owner's network address instead), and a welcome naming the
+agents. The device token never leaves the joiner's computer; the host
+keeps its sha256, as with pairing. On a desktop, `server/join-client.ts`
+is the joiner's half, behind `/api/joining/...` for the window, and the app
+keeps the result as a joined workspace. It says what it runs on as the
+kind of device (`mac`, `pc` or `computer`, from `server/this-machine.ts`),
+so the owner's request card and Members page name it. A desktop older
+than 3.2 says `mac` whatever it runs on; a kind the page does not know
+reads as a computer.
+
+`GET /api/workspace/members` gives the Members page everything at once:
+the workspace, who is asking, each member's role, devices, solo agents,
+spend this month and limits, the waiting invites, the joining settings,
+the plan and the limit. `PATCH /api/workspace/members/:id` changes a role
+(which ends that person's sessions) or limits, and `DELETE` removes them.
+`GET /api/workspace/waiting` is the count for the switcher's dot.
+
+### Limits, the plan and the owner's name
+
+Every turn a member starts runs on the owner's engines and keys, so it is
+the owner's bill. Per member (`server/member-limits.ts`,
+`member-limits.json`), the owner and admins set a monthly limit on what
+API keys cost, a share of OwlBot AI's month, how many solo agents they may
+make (three unless changed) and which engines those may use. Usage is
+booked to whoever started the turn (`personId` in `usage.json`), and a
+OwlBot AI call carries the member's hashed tag, never a name. A member at
+their limit has their own requests refused with words saying why and who
+can raise it; nobody else notices.
+
+Members are OwlBot Team's (`server/plan-limits.ts`). The owner's plan
+comes from the relay when this workspace is online, else from the
+licence checked with owlbot.dev (`server/owner-plan.ts`, kept in
+`owner-plan.json`), and an unanswered check keeps the last answer, so a
+network blip never throws anybody out. Not on Team, inviting, claiming
+and approving refuse with `402 team_required`, and members already in
+are paused: every member route answers the same 402, except
+`GET /api/member/workspace` (which says `paused`), health and leaving.
+Nothing is deleted, and all of it returns with the plan. A room shared
+through its own invite takes new guests on Team, or on an older Cloud
+licence the relay says holds a shared room.
+
+Nobody else may see "The owner". The owner's name is kept in
+`config.profile.name` (`server/owner-name.ts`): setup asks for it,
+prefilled from this computer's account, and lets it be skipped; making a
+Team workspace, sharing a room and inviting somebody refuse with
+`409 name_required` until there is one, and the window asks there and
+carries on. Agents are told the name in the owner's own conversations.
+In conversations people go by their first name, with a last initial where
+two in one workspace share it.
+
+## Read positions
+
+How far each person has read each conversation, room or agent lane, is
+kept in `reads.json` (`server/reads.ts`): the last message they had on
+screen, per person, the owner as `owner`. A position only moves forward,
+because a person reads from more than one device in no particular order.
+Agents never write one. The owner's window says its own with
+`POST /api/threads/:threadId/read` once the messages have been on screen
+with the window in focus, a member's with
+`POST /api/member/threads/:threadId/read`, and each is broadcast as a
+`read` frame and carried on the history routes, so a fresh load shows
+them. Who sees whose is `readsShown` in `server/access.ts`: in rooms and
+team conversations everybody sees everybody's; in a private conversation
+its person sees their own, and the owner only while reading private
+conversations is on, never an admin. Seen by is drawn only where at
+least one other person is in the conversation, and never under the
+reader's own message.
+
+## Where you left off
+
+Where each person left off in each conversation is kept apart from
+Seen by, in `last-read.json` (`server/last-read.ts`): after which message
+they had read, per person per conversation, the owner as `owner`. It is
+what the green New line in a transcript is drawn from, and it is never
+shown to anybody else: no frame carries it, no transcript route returns
+it, and the only answer that mentions it goes to the person's own screen.
+A place moves forward as the person reads and back only when they mark a
+conversation unread from a message, which Seen by must never do.
+
+The chat asks once as a conversation opens:
+`POST /api/threads/:threadId/last-read` (a member's
+`POST /api/member/threads/:threadId/last-read`) answers `from`, the
+message the line goes above, from the place as it was, and moves the
+place on to `through` when given. From then on the window says
+`through` as messages arrive, only while it is shown and focused, so a
+conversation left open on a screen nobody looks at is not read for them
+(`src/lib/lastRead.ts`). The line stays where it was put until the person
+sends or leaves; writing in a conversation reads it to the end on the
+server, from whichever screen the words came. `from` is the first
+message after the place that is not the person's own, provided something
+after it is news as the unread dot counts it (`newFrom`): what the agent
+said, a card, a file, a notice or another person's words, never tool
+calls, screens, messages between agents, a routine's prompt, a quiet
+check-in, the engine's markers or words still waiting to go. So a
+conversation opened while a turn runs shows no line for the work going
+on, and a turn that ran while they were away is new from its start.
+The owner's place is kept only where the owner takes part: their own
+conversations, team conversations and rooms, never a member's private
+one, even while the owner may read those.
+
+Mark unread from here, in the menu of an agent's message or another
+person's (never the person's own words), is
+`POST /api/threads/:threadId/unread-from` with the message: the owner's
+place goes back to just before it and the lane is marked unread
+(`store.markLane`), so the dot comes back and every screen opens with the
+line above that message. On the screen it was pressed on, the line moves
+there at once and nothing more is read for them until they send or leave,
+as the sidebar's Mark as unread keeps its dot. Only the owner's own and
+team conversations take it; a member has no unread to mark.
+
+A screen that does not keep the place itself (the iPhone app, an older
+desktop app) reads a conversation to the end when it opens it or clears
+its dot (`activate`, `PATCH ... unread: false`), so every screen agrees;
+the app's own chat says `keepsPlace` on those calls. Opening at the line:
+when what came since is taller than the transcript, the chat opens at the
+line rather than the end, unless the palette sent it to a message; a line
+further back than the drawn part opens up to 300 messages more, or asks
+for up to three earlier pages where the transcript arrived as its newest
+part, and otherwise waits for Show earlier.
+
+A room, or a team conversation with another person on its list or
+speaking in it, draws every message as a bubble, with a face and a name
+on the others' and runs from one sender grouped; a chat with one agent
+keeps its full width prose.
+
+## Copying out of the chat
+
+Chromium writes a selection's computed styles into `text/html`, so a
+reply pasted into Mail, Docs or Word would arrive in the theme's colours
+with the action row's buttons. One `copy` and `cut` listener for the
+whole window (`installCleanCopy` in `src/lib/cleanCopy.ts`, installed in
+`src/main.tsx`) writes the selection's text to `text/plain` as the
+browser would, and rebuilds `text/html` from an allowlist
+(`cleanCopyHtml`, a pure function over the cloned selection): headings,
+paragraphs, lists, quotes, tables, `pre` and `code`, `strong` and `em`,
+line breaks, and links whose address is http, https or mailto, each
+bare, with no attribute but that address. Buttons, icons, pictures,
+`time`, fields, anything `aria-hidden`, `sr-only`, `select-none` or
+`hidden`, and anything marked `data-copy="skip"` (the action rows, the
+day line, reactions, a quoted reply, "edited", a code block's bar) go
+with their contents; a link drawn as a button around words (a shared
+file named in a reply) says `data-copy="keep"`. Every other element is
+unwrapped to its words, a box of words becoming a paragraph, and a
+person's own line breaks become `<br>`. A selection inside code, a link
+or one list or table keeps those around it. Text is always escaped. A
+copy in a field being typed in, or one a component already answered,
+is left to the browser, and the Copy buttons write their own text as
+before.
+
+## Shared files
+
+An agent's deliverables folder (`server/artifacts.ts`) is the one place a
+file is served from, and a name is a path inside it, folders included
+(`reports/q3.pdf`). Every name is judged twice: as words (no `..`, no
+hidden segment, no backslash or control character, decoded once before
+judging, so `%2e%2e%2F` is a climb), then as the file it really is, with
+links followed, which has to land inside the folder. A link out is a file
+that is not there. `GET /api/bots/:id/artifacts/:name` takes the name
+encoded as one segment or with its slashes, answers byte ranges (a
+`Range` header, which a video player seeks with, or `?range=` for OwlBot
+Cloud, which carries no request headers), and names a download in
+RFC 5987 form so any character survives. `GET /api/bots/:id/artifacts`
+lists the folder, folders included.
+
+The sweep at the end of a turn still cards only new files at the top of
+the folder: a turn that writes a site with forty images in a folder
+should not leave forty cards. Anything else reaches the chat by
+`owlbot share <file> [--as <name>]` (`POST /api/bots/:me/artifacts`). A
+file already in the folder, nested or unchanged since before the turn,
+is carded where it is. A file anywhere else is read by the command, as
+the agent and inside whatever sandbox it runs in, and its bytes are
+streamed in under a free name (`q3 (2).pdf` beside an existing `q3.pdf`),
+written to a hidden file and renamed in once complete. The route never
+opens a path it is handed, so sharing cannot become a way to read the
+disk. Only this computer can share in. The answer carries the card's
+`href` and a markdown link to write in the reply, and the shared file's
+fingerprint goes into the baselines of the conversation it went to and
+of the turn that shared it, so the sweep does not card it twice, and
+every other turn of the agent running at the time leaves that version
+alone.
+
+Every conversation of an agent saves into the one folder, so two of them
+running at once both see a new file between their two snapshots
+(GitHub 460). `server/artifact-turns.ts` knows which turns of an agent
+overlapped, kept while both run, the way the change card does for a
+shared working folder. A turn that ran alone cards everything that
+changed, as before. One that overlapped others cards a file only on the
+strongest evidence any of them has for it: its engine named the file in
+a write or edit (or brought it back from its outbox elsewhere), then it
+said the file's name in a command or its reply, then one of its calls
+that may write without naming files (a shell command) was running when
+the file was last written. Two turns tied at either of the first two
+both card it, in their own conversations; a tie at the third, or no
+evidence at all, cards it nowhere rather than under the wrong reply, and
+the file stays in the agent's files to share on purpose.
+
+A link in a reply that is the file route, a path or a `file:` URL is a
+`file` token in `src/lib/inlineMarkdown.ts`, never an `<a>`. Clicking it
+asks `GET /api/artifacts/resolve?path=` what it is: a path inside some
+agent's folder (lexically or after links are followed) answers that
+agent and file, and anything else answers 404 with `shared: false` and a
+sentence saying to ask the agent to share it. A code span reads as a
+file only when it looks like a path in a deliverables folder, so the
+paths in a coding conversation stay text. Card and link open the same
+viewer: PDF, image, video (no autoplay; an unplayable format says so and
+offers the download), Markdown rendered with its source a click away,
+text, tables, HTML in a sandboxed frame. A failure says why
+(`failureKind` and `failureActions` in `src/lib/sharedFile.ts`). Try
+again, which asks for the file again and never starts a turn, is
+offered only for a way there that failed for now (no answer, 408, 429,
+5xx): asking again for a file that was not shared, is gone, is not
+allowed or is too large only gets the same answer. For `shared: false`
+in the owner's own chat with the agent, Request share (GitHub 543)
+writes the ask into that chat's composer, after anything already
+typed, naming the exact path (`shareRequestText`, a `file:` URL as its
+path); `ChatView` provides it through `ShareRequestContext`
+(`src/lib/shareRequest.ts`), and a member's app or a room, which do not,
+say to ask the agent instead. Nothing is sent until the owner sends it.
+The agent then shares the file with `owlbot share`, or says why it
+cannot; the link itself grants nothing, and the file opens only once it
+is shared, through the same checks as any shared file.
+
+An open viewer follows its file (`src/lib/followFile.ts`). The route
+answers `?version` with the file's `tag` and `size` and none of its
+bytes: the same tag it sends as the file's `ETag`, from the open file's
+device, inode, size and times, through the same open and so the same
+access. The viewer asks every 2 seconds (6 through OwlBot Cloud, where
+each ask is a sealed round trip) while it is open and the window can be
+seen, and at once when the window is shown again. When the tag moves it
+reads the file again in place: text, Markdown, tables and HTML keep the
+elements they were drawn in, so the scroll stays (a page in the
+sandboxed frame starts at its top, since the frame is not ours to read),
+and a picture, video or PDF is asked for at a new URL, a video carrying
+on from where it was. A quiet Updated mark says so, as a polite status,
+and nothing takes focus. A 404 shows "This file was removed" until the
+file comes back; any other failure is no news. There is no watcher: the
+folder may be on a server reached through OwlBot Cloud, and the end of a
+turn would miss everything that is not the agent.
+
+Access is the artifact route's: an owner's device on this computer, the
+network or OwlBot Cloud reads any agent's files, a member of a shared
+room is shown a card's name and nothing it could open, and an agent's
+credential lists and shares into its own folder only and cannot resolve
+paths. A phone reads `shared-files` in `/api/health` before offering
+nested names, ranges or path links; through OwlBot Cloud it takes a file
+a range at a time, since one answer has to fit the relay's payload.
+
+## Rehearsals
+
+`server/rehearsals.ts` clones the agent's folder (copy-on-write with
+`cp -c` on APFS, `--reflink=auto` on Linux, a plain copy elsewhere) and
+runs the turn in a lane of its own pinned to the clone. The checkpoint is
+taken between the real folder before and the clone after, so the card is
+the same one undo uses, marked as a rehearsal. `/api/checkpoints/:id/apply`
+writes each file only if the real one still matches what it was when the
+rehearsal began, then the record undoes like any other; applying one
+attempt of a compared task discards the rest. Copies are deleted when an
+attempt is applied or discarded, and swept after a week. Attempts are
+listed on Overview, the whole width below the brief, and a ready one
+puts a dot on Overview in the main rail.
+
+## Rewind
+
+`POST /api/threads/:lane/rewind` takes a lane back to before one of the
+person's messages. It reverts the lane's checkpoints from that message
+on, newest first, with the same rule as undo: a file whose current
+content is not what the turn left is skipped and named. The message and
+everything after it are marked `rewound` (and `deleted`, so no
+transcript carries them), a context summary that covers any of them is
+dropped, and the lane's engine cursors are cleared, so the next turn is
+a fresh session that is replayed only what is left. Memory notes are not
+touched; the memory journal has its own undo. Rooms and rehearsal lanes
+refuse.
+
+## Branch
+
+`POST /api/threads/:lane/branch` with a `messageId` and a `requestId`
+makes a new lane for the same agent from one of its answers in this one,
+opens it, and answers as opening a lane does (`bot`, `seq`, and the new
+`threadId`). The lane it came from is not changed at all. The rules are
+in `server/branch.ts`:
+
+- Only an answer: an agent's text message, not taken back, not a message
+  to or from another agent. A branch from the person's own words is
+  Rewind.
+- The copy is every message up to and including that answer that was
+  part of the conversation (nothing `deleted`, `queued`, `unsent` or
+  dismissed), under new ids with the times they were said, replies
+  pointing at their copies. Nothing in it is live: a card still waiting
+  is closed and loses its request, a secret or connector card that waited
+  is dismissed, a changes card is marked `copied` so Undo stays with the
+  original's card, and transport fields (a Telegram return address, a
+  queue place, a service wake, a Continue, held messages) stay behind.
+  The original engine's compaction and session markers are left out.
+  Attachments are shared rather than copied: they are files under the
+  data folder's `attachments/` that no lane owns and closing a lane never
+  removes, so the copied words name the same files, and an agent's
+  deliverables are the agent's, not the lane's.
+- Then one notice with `branch: { from, messageId, title }` and the text
+  "Branched from {title}. Files in the workspace are shared with the
+  original.", which the app draws as a line that opens the original at
+  that answer. When the original is closed, every such line is patched
+  to `gone` and says it was deleted.
+- The new lane has no engine cursors and no `lastInstanceId`, so its first
+  turn is a new session told the copy (`freshTurnText` with `why:
+  "branch"`); a running summary goes with it only when it covers nothing
+  past the branch point. An engine's own fork copies a session to its
+  end, not to a chosen answer, so it is not used.
+- Its title is the original's with "(branch)", then "(branch 2)" and on,
+  the first number free among the agent's lanes, kept to 40 characters.
+- Refused for an agent's credential (403), for a lane the owner cannot
+  write in (403), for a room, the team lane, the guest mail lane and a
+  Signal person's lane (400), and while the lane's turn runs or its
+  changes card is being made, for a rehearsal, an archived agent, or an
+  agent at its lane limit (409). The lane summary's `noBranch` names the
+  kinds that never branch, so the app greys the item with the reason.
+- One branch per `requestId`: the same id again opens the branch it made
+  (200), whatever the lane is doing by then; the id on a different
+  answer is a 409. The id is kept on the lane, so a retry after a
+  restart is still the same branch.
+- The answer names the branch's copy of the answer it started from
+  (`messageId`, `branchAnswerId`), for Branch with this.
+
+Members of a Team workspace have one private conversation per agent and
+no way to open more on their surface, so their routes do not include
+branching yet.
+
+### Quoting a selection
+
+Words selected inside one message bring up a small toolbar
+(`src/components/chat/SelectionQuote.tsx`, `src/lib/selectionQuote.ts`)
+once the selection settles: on letting go of the mouse, after a moment's
+stillness from the keyboard, and on a touch screen after the handles
+rest, where it sits below the words so the system's own menu above them
+keeps its place. It is placed over the selection, never on it, kept
+inside the window, and goes on a scroll, a click elsewhere or Escape.
+A selection across two messages, or reaching into anything marked
+`data-copy="skip"` (the action row, a reply's quoted card), shows
+nothing; pressing it keeps the selection, so the copy listener
+(`src/lib/cleanCopy.ts`) and the tap menu (`useTapToShow`, which ignores
+a tap that ends a selection) are untouched. ⌘' (Ctrl+' elsewhere)
+quotes a selection without it.
+
+**Quote** sets the composer's reply to that message with `quote`, the
+exact selected words (lines kept, at most 2,000 characters, cut at a word
+with an ellipsis), shown in the reply strip and on the sent bubble's
+reply card. The server keeps it on `replyTo` (`replyRef`, same cap) and
+the engine hears it as a quote, line by line, with whose message it came
+from and how that message begins (`withReply`); a room's history line
+says "quoting" with the words. **Branch with this**, on one of the
+agent's answers, runs Branch from here and hands the quote to the new
+conversation's view (`src/lib/replyHandoff.ts`), which puts it in the box
+as a reply to the branch's copy of the answer, not sent. Rooms offer
+Quote alone.
+
+## Redo
+
+Saving an edit to a message only rewrites its stored text; the agent has
+already read the old words. `POST /api/threads/:lane/messages/:id/redo`
+with the new `text` is the edit that reaches it, in one call: the lane is
+claimed, the running turn is stopped and waited for (and its change
+card, since a turn's files are on record only then), the lane is rewound
+with the rewind's own function, and the words are sent. `GET` on the
+same path is read-only and says what that would take back (messages,
+files as the folder stands now, whether a turn sent anything that
+stays), or that it is not offered and why; the app's line under the
+editor is those numbers. A refusal before the rewind takes nothing back.
+A send that fails after it answers `sent: false` with the words, which
+is what a rewind leaves.
+
+Where it rewinds to is in `server/redo.ts`, read from the transcript
+alone. A checkpoint covers a whole turn, so a message said into a
+running turn (`joined`, written when the turn takes it) goes back to the
+message that started that turn, and the person's messages from the turn
+are sent again in order, as one burst through the lane's queue. A
+message still waiting (`queued`, `unsent`) is refused, as are words that
+are not the person's own typed here (`agent`, `via`, `fromTelegram`) and
+a message that joined a turn somebody else started. What waits above the
+composer is not taken back; it goes after the redone words.
+
+## Backup engines
+
+`server/failover.ts` reads a failed turn's runtime errors and stop
+reason for what kind of failure it was (`failureOf`): its engine being
+out (a usage or rate limit, no credit, an outage, signed out), a safety
+refusal by the provider, or anything else. For an engine that is out it
+also reads when it should be usable again (an epoch, "try again in
+20m", "resets 3pm", or a default per reason, capped at twelve hours).
+The engine rests in a per-instance table in memory, so every agent on it
+skips it until then. A stop, a stalled tool, a command and a
+conversation too long for the model (folded and asked again on its own)
+are not failures here.
+
+What happens to a failed solo turn (GitHub 284) is decided at its end
+(`recoverTurn` in `server/index.ts`), once per message. A refusal is
+asked again at once in a new session told the bounded story (see
+Compactions), and the refused session is dropped (`store.dropSession`:
+its cursor goes and `lastInstanceId` is emptied, so whichever engine
+comes next is told the conversation); a refusal in a session that was
+already new is not asked again. An engine that is out is not asked
+again. Anything else is asked again once in the same session after
+`RETRY_WAIT_MS` (a minute; `OWLBOT_RETRY_WAIT_MS` in tests), with the
+lane kept busy so new messages queue; Stop, an archive or a hold cancels
+the wait. When the retry fails, or there was none to make, the backup
+takes the message once, with `fallback: true`, for whoever asked: any
+`backupSelection` that is usable and is not what just failed (another
+engine, or another model on the same engine, which resumes the same
+session; after an engine that is out, another engine). When nothing can
+take it, the raw errors are shown as they were, one notice says why (no
+backup and where to set one, the backup unavailable, or both errors when
+the backup failed too), and the lane is marked for the person. The raw
+error is held back while a turn may still go on and said in the notice
+that says what happens next.
+
+After the backup answers, that lane stays on it (`stays`) for `STAY_MS`
+(half an hour; `OWLBOT_BACKUP_STAY_MS` in tests), or until the own
+engine's rest ends when it rests; the person changing the agent's engine
+or backup ends it. The own engine's stored session is remembered as away
+from the lane (`away`) from the first message another engine answered.
+When it serves the lane again it resumes that session and is told only
+the messages it missed (`catchUpText` in `server/turn-context.ts`),
+unless it has no stored session or what it missed would not fit a new
+session's bounded story, and then it starts a new session told the story
+as any engine switch does. Each turn after a failure (the retry, the
+backup, the first turn back, the next turn after a stop or after the
+agent gave up) opens with one line in its own words saying what failed,
+when, on which engine and model, and what OwlBot did (`failureNotes`).
+All of this is in memory: after a restart the own engine is simply tried
+again.
+
+### More than one account of an engine
+
+Claude Code and Codex can have accounts besides their own sign-in
+(`server/engine-accounts.ts`, GitHub 465). An account belongs to one
+engine instance and to the workspace, never to an agent. The engine's own
+sign-in is always the first (`MAIN_ACCOUNT`); each added one is a folder
+under `engine-accounts/` in the data folder, signed in with the engine's
+own login in Terminal (`CLAUDE_CONFIG_DIR=<folder> claude`,
+`CODEX_HOME=<folder> codex login`). OwlBot never reads what the engine
+writes there. The person's setup in the main folder (Claude Code's
+`settings.json`, `CLAUDE.md`, agents, commands, skills, plugins and output
+styles; Codex's `config.toml`, `AGENTS.md`, skills, prompts and rules) is
+linked into each added folder, so a turn has the same settings,
+permissions and skills on any account; the credential, `.claude.json` and
+the sessions are never linked. User MCP servers that Claude Code keeps in
+`.claude.json` stay with the main sign-in.
+
+The account is chosen as the turn is dispatched (`engineAccounts.pick`),
+only on this computer (not working elsewhere, not on a cloud computer),
+and is kept for the whole turn: the driver sets `CLAUDE_CONFIG_DIR` or
+`CODEX_HOME` from `SendTurnInput.account`, after the turn's own
+environment, and Claude Code's turn drops `CLAUDE_CODE_OAUTH_TOKEN` and
+`ANTHROPIC_AUTH_TOKEN` so the main sign-in's token cannot run it. The
+workspace has one account in use per engine. It moves, to the next account
+in the list that can take a turn, only when the one in use cannot: it
+rests after a turn on it ran out (a usage limit or a lapsed sign-in, read
+as for an engine, in a table keyed by instance and account), its plan
+windows say it is spent (`planBlockedUntil`, from the plan usage the
+drivers now keep per account), or its CLI said it is signed out. It never
+moves back on its own when the first account resets. With no account
+able, the turn goes to the one back soonest.
+
+A session lives in its account's folder, so a lane records the account
+each engine's session was made on (`TaskRecord.sessionAccounts`). A lane
+whose account changes leaves that engine's session (`store.moveTaskAccount`:
+its cursor goes and `lastInstanceId` is emptied) and its next turn is told
+the bounded story with an opening that says it is a new session on
+another account of the same engine and model (`freshTurnText`, `why:
+"account"`). The chat says so once. A command stays on the account that
+made the session it names.
+
+In `recoverTurn` a usage limit or a lapsed sign-in on an account rests
+the account, not the engine. While another account can take it, a solo
+turn is asked again at once on the next one, with the same model, before
+any retry or backup (step 0), and the next turn's opening line says
+where it went. Only when every account is out does the engine rest, until
+the first account is back, and the turn goes on as for an engine with one
+account: to the backup the person chose, said as out on all of its
+accounts, or it stops and says so. Turns record their account in
+`usage.json` and the engine report's turn log; the Usage page has an
+Account breakdown once an engine has run on more than one.
+
+Accounts are the owner's: never an agent's token or a member's. Seeing
+them and choosing the one in use work from the owner's devices; adding,
+signing in and removing (which runs the engine's own sign-out first, then
+deletes the folder) are this computer only. The folders are left out of
+backups and workspace moves, like a sign-in in the macOS Keychain.
+
+A Fast Codex turn that cannot have Fast (see Codex speed) is refused
+before any words reach the model, and its end carries `preInputRefusal`.
+It is not an engine failing: nothing rests, it is not asked again, and
+the session is kept. A backup takes it once if there is one that might
+run Fast (not Codex on a Box or Boat); otherwise it ends unsent, the
+reason said once, and whatever waited on it (a routine's run, a Telegram
+reply) hears that reason. Standard turns never meet this refusal.
+
+Room turns are not asked again or handed over, since they belong to the
+room's order of speakers. The error shows in the room, an engine that is
+out rests so the agent's next room turn uses its backup, a refused
+session is dropped, and the agent's next turn is told what failed. A
+turn that answers ends a sign-in rest on its engine early, since the
+login works again.
+
+Other agents read the same facts the person sees
+(`server/engine-readiness.ts`). With an agent's credential,
+`GET /api/bots` gives each agent an `engine`: `ready`, `signedOut`, `out`
+with `until` and `reason`, or `unavailable`, with the engine's name. It
+comes from whether the instance is there and switched on, its rest, and
+its own snapshot (installed, signed in), which is asked at most every half
+minute; an agent whose own engine cannot answer and whose backup can is
+ready. `owlbot agents` lists it as ready, not signed in, out until a time,
+or unavailable. A message from another agent to one that cannot answer is
+still delivered, and the answer to the sender carries an `engine`
+sentence saying why and who can fix it. No key, path or engine error is
+part of either.
+
+## Engine pauses
+
+The owner can pause an engine or a model for a while
+(`server/engine-pauses.ts`, based on GitHub 305): a family of models
+(every Anthropic one, told from the model's id and the engine serving
+it, `familyOf`), a kind of engine (every Codex), one configured engine,
+or one model, for every agent or for the ones named, until a time. Every
+pause has an end, a week at most. Nothing about any agent's engine or
+backup is changed, so there is nothing to put back when it ends. The
+owner adds, sees and ends pauses in Settings, Engines and keys, Pauses, here or
+from a paired device (`/api/engine-pauses`, feature `engine-pauses`). An
+agent may pause only itself, for a day at most, and sees only the
+pauses that cover it, with no other agent named (`owlbot pause`,
+`owlbot pauses`, `owlbot unpause`); it ends only its own. A shared room's
+members never reach any of it.
+
+One door decides: `selectEngine` passes over an engine paused for the
+agent, as it passes over a resting one, for the agent's other engine
+when that one may go (a turn handed to the backup has only the backup),
+and `startTurn` holds a turn whose engine is still paused. With no pause
+saved, the door is one length check: nothing is read, written or
+recorded per turn, and no turn behaves differently. The list is read
+once at start and written, atomically, only when a pause is added or
+ended; ended pauses are dropped then.
+
+What a pause holds waits where it would wait for a busy lane or a drain,
+and goes on its own when the pause ends (a timer at its end, with the
+routine tick as a backstop, `releasePaused`), or as soon as it is ended
+early. Words for one of the agent's lanes wait in that lane's queue, on
+disk, shown above the composer as waiting for the pause and until when
+(`waitsFor: "pause"`, `waitsUntil`); the conversation says once that it
+is held. Room lines wait as they do for a busy agent, and the room is
+told once (in a shared room, only that the agent is paused and until
+when). A routine is recorded as held without spending its slot, as at
+the chain limit, and runs when the pause ends if that is inside its
+missed-run grace, otherwise at its next time; run by hand it is refused
+with the reason. A watcher holds without looking, so the change is
+still there for the first look after. A job goes to someone free, or
+waits open on the board. A workflow's ask step waits and the run says
+why. A webhook's event waits in the lane, and an email in its line.
+Summaries, skill reviews and a goal's judge are not asked of an engine
+paused for the agent. A retry, a backup handover, a pickup after a
+restart, a rehearsal and a member's request are refused with the
+reason, which shows where they would have run.
+
+A turn already running when a pause starts finishes on its engine,
+unless the owner chose "Also stop what is running on it now": then it
+is stopped as by Stop, with a notice saying why, and not picked up after
+a restart. An agent cannot stop anything with a pause.
+
+A saved file that cannot be read never stops work it does not name. The
+pauses that can be read still hold; the rest are left out, the file is
+copied aside as `engine-pauses.json.corrupt-<time>`, and Settings says
+so. A file that cannot be opened at all holds nothing, and new pauses
+are refused until it can be, rather than written over it. A lane's queue
+after a restart follows the queued-message rule: words older than twelve
+hours are marked not sent rather than run.
+## Codex speed
+
+Codex runs at Standard or Fast (`server/codex-speed.ts`). The workspace
+has a default (`codex.speed` in the config, Standard when unset) and an
+agent may have its own (`codexSpeed`; null follows the workspace). One
+choice covers the agent's primary and backup Codex. It is resolved once,
+when a turn is dispatched, and handed to the driver with the turn; a
+steer or a setting changed mid-turn applies from the next turn. An agent
+may read its speed (`whoami`) and set its own to Standard or back to the
+default, but not to Fast, which spends the person's plan faster; Fast
+and the workspace default are the owner's.
+
+Standard is Codex as it always ran: nothing about the tier is sent, so a
+Codex older than the field works unchanged, and a host or project config
+of Codex's own still applies. Fast asks for the priority tier on
+`thread/start` or `thread/resume`, with `features.fast_mode` on for that
+process, and goes ahead only when the answer names `priority`. A Codex
+that leaves the tier out of its answer, names another, or rejects the
+field refuses the turn before input, saying to update Codex or choose
+Standard. A model the catalog said within five minutes has no Fast is
+refused before a process starts. Codex on a Box or Boat cannot be asked
+for a tier yet, so Fast is refused there before the box is woken;
+Standard runs there as before.
+
+While a Fast turn, or one at an agent's own choice, runs, its lane
+carries `codexDispatch` (the choice and the tier Codex said it
+configured; Codex never reports the tier that served), and the desktop
+shows a line for it. Standard by the workspace default carries nothing,
+as before. It is never a message and goes when the turn ends. The phone
+checks the `codex-speed` feature before offering the choice.
+
+## Compactions
+
+Claude Code compacts its own session when it fills, and says so with a
+`compact_boundary` frame; the driver turns that into `context.compacted`,
+which leaves a one-line marker in the conversation. Its numbers are the
+lane's own request readings, not the engine's compaction metadata, which
+counts differently: before is the last request the session made ahead of
+the boundary, and after is the first one it makes once past it, patched
+into the same marker when it comes (`store.beginCompaction` and
+`resolveCompaction`). Until then the marker says only where it started
+from, and the lane has no fill to show. A request from another engine,
+model or session (a switch, a rewind, a new session after a resume that
+failed) cancels the wait rather than completing it, and a subagent's own
+boundary or usage never marks or measures the lane it works for. With
+idle compaction on (Settings, off by default), a minute
+timer in `server/index.ts` finds Claude Code lanes over 100k tokens whose
+last request was 55 minutes ago, inside an hour's cache, and sends
+`/compact` into the resumed session with the same tools and system prompt
+as the lane's last turn, so it reads the cache rather than writing it
+again (`idleCompactionDue` in `server/context.ts`). It runs as the lane's
+turn, so anything said meanwhile queues, but nothing else a turn does
+happens: no message in the person's name, no unread, no other agent or
+room. Two run at a time, and a lane whose window has passed is skipped.
+
+How full a lane is comes from the engine, not from the turn's token
+total: `context.reading` events carry the latest request's size and the
+window, which Claude Code gives per message (`promptSize`) and in its
+result (`modelUsage[model].contextWindow`), Codex in
+`thread/tokenUsage/updated` (`last.inputTokens` against
+`modelContextWindow`), an ACP agent in `usage_update` (`used`, `size`),
+and an OpenAI-compatible provider in each response's `prompt_tokens`, one
+reading per request of a tool loop. The lane keeps the latest as
+`reading`, with the engine and model that made it (`store.noteReading`),
+and `laneFill` uses it only while the agent is on that engine and model,
+with the table in `server/context.ts` as the fallback window, which the
+lane then says is the table's. Without such a reading, or with neither
+an engine's window nor a model the table knows, the lane has no fill at
+all: the 32k default stays a margin for the fold, never a number shown.
+The Usage tokens, the turn's own spend, are kept apart and counted as
+before. The chips, the sidebar rows and Activity show that fill past
+their own thresholds, and the composer of an agent's chat shows it as
+one ring from the first answer on (`src/components/ComposerRing.tsx`),
+only while the lane has a reading. Hover or a tap opens a card: the
+tokens used of the window ("about" when the window is the table's), a
+line when OwlBot summarised the earlier part, and what the engine's plan
+has left. Claude Code reports its plan's windows in `rate_limit_event`
+(`unifiedWindows`) and Codex in `account/rateLimits/updated`; each engine
+instance keeps only the latest, in memory (`server/plan-usage.ts`), and
+`GET /api/plan-usage` serves it to this Mac alone, never to a phone, a
+remote window or an agent, and it is never put in a prompt. A room has
+no ring, since every agent in it has a context of its own. A turn that
+answered with no tokens reported
+(Pi does not report any) counts as unmeasured, and Activity says "not
+reported" rather than showing zero.
+
+A native session sends its whole context again on every tool call, so a
+long one turns one tool-heavy message into millions of input tokens
+(GitHub 222, 223). Before a turn resumes a session whose reading is over
+the line (the lower of 60% of the window and a ceiling, 200k by default,
+set in Settings as "Compact before a long turn" or off), the session is
+compacted first (`compactBeforeTurn`). Claude Code is sent `/compact`
+into the resumed session from `server/index.ts` with the turn's own tools
+and system prompt, through the idle compaction's books (`compactThenSend`),
+and the turn goes on once it ends; a person who stops the turn meanwhile
+stops both. Codex is asked in the same process with
+`thread/compact/start`, and an ACP agent with its own `/compact` when it
+lists that command. When the engine cannot (an older app-server, an agent
+without the command, a compaction that fails), the driver opens a new
+session and sends the turn's `handoff` instead; an engine with no way to
+compact at all gets a new session from the start. This applies to direct
+and room lanes alike. A compaction that did not bring a lane under the
+line is not asked for again until it has grown a tenth past where that
+one started. A turn already running is never interrupted to compact; it
+is checked again before the next one.
+
+Whenever a new session starts on an existing conversation (an engine
+switch, a backup taking over, a rewind, a cursor that no longer resumes,
+or a replacement after a compaction it could not do), the story it is
+told is bounded (`boundHandoff`): the running summary, then recent
+messages whole while they fit, each clipped to a quarter of the budget,
+which is 15% of the window and never more than 16k tokens. When that
+leaves messages out and the agent's engine can summarise, the older part
+is folded into the summary first; otherwise the message says how many
+were left out. The thread itself keeps every message.
+
+A cursor that no longer resumes is how Claude Code's own session cleanup
+looks from here: `--resume` exits before the session starts, saying "No
+conversation found with session ID" (GitHub 477). The Claude driver then
+goes on once, inside the same turn, in a new session (`--session-id`)
+sent the turn's `handoff`, as Codex and ACP do when a resume fails; in a
+room that is the room as a first turn there hears it. Only before
+anything of the turn reached a session: no init, no result, no words
+steered in, nobody stopping it, and never for a `/compact`. Otherwise the
+turn fails as it did, and on those words alone the cursor is dropped
+(`dropSession`), so the next turn starts a new session told the
+conversation rather than failing on the same id forever.
+
+A fold reads every message it covers, in order (`summaryPasses`). Up to
+40,000 characters is one summary request; a longer stretch is read in
+several, each carrying the summary so far, and a message too long for
+one is read in labelled parts. Past eight such requests they grow
+instead of multiplying, up to half the window of the model that writes
+the summary (counted a character to a token), so a long fold costs about
+the length of what it reads once, not dozens of waits. Nothing is saved
+until the last request is done, and nothing at all if one fails or the
+conversation changes under it.
+
+A saved summary counts the first `through` settled messages
+(`summaryCounts`). Taking one of them back (`DELETE
+/api/threads/:lane/messages/:id`) or editing it to new words (`PATCH`)
+drops the summary before the message changes, as a rewind does, so its
+old words are not told again and the count cannot start a message late.
+The next turn is told what is left whole and summarises again when that
+fills up. Both routes save the message before they say it changed; one
+that cannot be saved fails with a 500 and stays as it was.
+
+The same cache is why a resumed Claude Code session keeps its system
+prompt byte for byte (`server/standing-prompt.ts`). The agent's
+MEMORY.md and the notes about the person stay as they were when the
+session started; a change since the agent last heard is said ahead of
+the turn's message, after the cached history. In a room, the room's
+recent conversation goes there too, only the lines this session has not
+been shown. A fresh session gets everything current in its system
+prompt, and other engines get the whole persona each turn as before.
+
+## Turns cut off
+
+A turn the Mac slept through, or one running when OwlBot stopped, is
+picked up rather than left dead, and both are picked up the same way
+(`server/cut-off.ts`): a notice the person reads, and a separate note
+telling the agent to carry on and to check what already happened before
+repeating anything, naming the tool call that was running. Neither is a
+message from the person, and the original request is not sent again.
+
+Sleep is noticed while OwlBot runs. A stop is not, so every turn is
+written to `turns-in-flight.json` when it starts and taken out when it
+ends, which makes a crash count as much as a quit. At startup each one
+left is taken off the list and then picked up once, in the same lane,
+room and engine session, for whoever asked for it; queued messages for
+that lane go in the same turn. One somebody stopped, a workflow step, or
+one whose agent was archived is dropped. One left longer than the queued
+message window (twelve hours), or a pickup cut off in its turn, gets a
+notice with Continue instead. Questions and approvals the old engine was
+waiting on are marked cut off, and `/respond` delivers nothing for an ask
+this run did not raise.
+
+A settings change rebuilds only the engines it changes (a custom
+endpoint, a key, a provider connected), and the rest keep running. A
+turn on a rebuilt engine is ended where it stands, which frees the lane,
+and picked up on the new engine the same way; one whose engine was
+removed says so instead. An engine updated from the app is rebuilt too,
+because engines read their models when they are built, but only once
+nothing is running on it: right away when it is quiet, otherwise when
+its last turn ends.
+
+## Restarting for an update
+
+Before a planned restart OwlBot drains (`server/drain.ts`): nothing new
+starts, what is running carries on, and the restart waits until nothing
+is running or a deadline passes (twenty minutes unless asked otherwise,
+an hour at most). The updater asks for it before it installs, and
+`owlbot-server drain` does the same for a server you restart yourself;
+both go through `/api/maintenance/drain`, which answers only this
+computer. A turn still running at the deadline is cut off and picked up
+like any other, from the record it already has. While the updater
+waits, the update card says how many turns it is waiting for and how
+long is left, and offers to restart now (what is running is picked up
+after) or to call the drain off and update later
+(`electron/drain-wait.mjs`).
+
+The restart itself is a chain, and every link in it has a time limit
+(`electron/update-restart.mjs`): one more look for a newer release, the
+drain, the native installer having the update, then the quit that hands
+over to it. A link that fails or runs out of time does not stop the
+next. Once the drain is past, nobody can call the restart off and the
+process ends: by the orderly quit when that works, by closing a window
+that stayed open ten seconds later, and by a plain exit ten seconds
+after that. On macOS the installer swaps the app only once the running
+one has gone, so an app that does not exit is an update that never
+installs. Each step is written to the updater's log (`updater.log` in
+the app's log folder), each line starting `restart:`. Before the quit a
+note of the version being left goes into the app's data folder, and a
+start that finds itself still on that version says on the update card
+that the update did not install, once, with the offer to try again or
+to get the installer from owlbot.dev.
+
+A `owlbot-server` on a computer of its own is updated by its owner from
+Settings, About, on any of their own devices, or with
+`owlbot-server update` (`server/server-update.ts`). The page says the
+app's version and the server's apart, since neither update touches the
+other. An install that `owlbot-server` started from the release's
+folder, which the account it runs as can write, and which nothing else
+starts updates itself through a helper, as below. So does one systemd
+runs, when its `versions/` folder is writable by that account (the rest
+may be root's), its unit's `Restart=` (read with `systemctl show`) is
+`always` or `on-failure`, and the release folder's own launcher is
+3.2.0 or newer. Every other one (launchd, pm2, supervisord, a
+container, a hosted machine, a source checkout, the app itself) is
+shown the steps to do it by hand, and a systemd one is told which of the
+three it lacks. The server takes GitHub's
+latest stable release, downloads its tarball only once the checksum
+published beside it is there, keeps it only if it matches that and
+GitHub's own digest of the file, and unpacks it under `versions/` in
+the install folder. Then it drains, writes its orders, starts a helper
+(`server/server-update-finish.ts`) in a process group of its own, and
+stops. The helper waits for it to go, points `versions/current` at the
+new version with one rename, starts the install folder's
+`bin/owlbot-server.mjs` (which hands over to the newest of its own
+version and `versions/current`), and waits for the new version to
+answer `/api/health` from its own pid. If it does not within two
+minutes, the helper stops it, points the link back and starts the old
+one. Either way it writes `server-update.json` in the data folder,
+which the page reads, and the started server's output goes to
+`server.log` beside it. The data folder itself is never touched.
+
+Under systemd a helper would die with the unit's cgroup, and a server it
+started would be nobody's to restart, so there is none. After the drain
+the server writes `versions/.trial.json` (where it switched from, how
+long the new version has), marks `server-update.json` pending, points
+`versions/current` at the new version and exits 75. systemd starts
+`bin/owlbot-server.mjs` in the release folder again, which counts the
+try in the trial, arms a two minute timer and hands over. The new
+server, once it has been listening five seconds as the version the
+trial names, removes the trial, prunes `versions/` and writes the record
+ok (`confirmTrial`); if a different version started, it switches back
+and says so. A start that finds the trial already tried (the last one
+fell over), or a timer that fires with the trial still there (it never
+came up), points the link back, writes the record and, for the timer,
+exits 75 for systemd to start the old version. The launcher hands over
+to `versions/` only when that folder belongs to its account or root and
+not every account may write it (root's alone when it runs as root).
+
+Nothing that arrives meanwhile is turned away. `startTurn` is where every
+turn starts, so it is where a drain holds them: words for one of an
+agent's lanes wait in that lane's queue, as they would behind a busy
+turn, and that queue is the transcript, so it outlives the restart and
+joins any pickup. Room lines wait the way they do for a busy agent, now
+on disk too. What has no queue waits where it already would: a routine
+stays due and fires late, inside its grace window; a workflow step waits
+for its lane; a job stays open on the board; a watcher set to rehearse
+keeps the change unseen and sees it again; an email waits in its line,
+which is in memory, as it does for a busy Email lane. Questions, approvals and
+workflow gates are left exactly as they are. A drain lives in memory,
+so a restart ends it, and calling it off lets everything held go at once.
+One whose restart never comes ends itself the same way, ten minutes past
+its deadline.
+
+## When the window fails
+
+The servers and every agent keep working whatever happens to the window,
+so the window is what comes back. A page process that dies loads the app
+again (`electron/renderer-watch.mjs`); three deaths inside a minute show
+a plain page with a Reload link instead of a loop. A page that stops
+answering is waited on and written down, never killed. In the page, an
+error boundary under the whole interface (`src/components/ErrorBoundary.tsx`)
+puts a calm panel in its place when any part throws while it draws, with
+Reload and the details to copy, instead of an empty window, and says so
+to the app log.
+
+That log is the app's own (`electron/app-log.mjs`): a few lines about the
+window and its processes, a helper process that went away and why, in
+`app.log` in the app's logs folder beside `updater.log`, moved aside to
+`app.1.log` at 512 KB, never in a workspace's folder and never sent
+anywhere. What the page asks to write is budgeted (`lineBudget`). A native
+crash leaves a minidump in the computer's crash folder: the crash
+reporter starts with `uploadToServer: false`, and there is no server to
+send one to.
+
+## ⌘Q on a Mac
+
+Quitting the app stops every agent and routine it runs, so on a Mac ⌘Q
+in an OwlBot window asks to be held for about a second or pressed twice
+within about 0.6 seconds (`electron/quit-guard.mjs`). The first press
+shows a hint over the window, in a panel that never takes the keyboard
+or a click, and the line under its words fills while the key is held.
+The keys are heard in every page's `before-input-event` (the app, a
+terminal, the OwlBot browser's tabs), only while that page has the
+keyboard, and kept there from the menu; the menu's own Quit is an item
+rather than the stock role, and from its key it asks the guard too,
+which never counts one press twice. A Mac may keep Q's release from the
+page while ⌘ is down, so ⌘ coming up, another key or the window losing
+focus counts as the release. OwlBot goes only once the keys are up (or
+after three seconds), so a held ⌘Q never lands on the app that comes
+forward next, and a repeat of ⌘Q held from before the window had the
+keyboard is not a press. Quit with the mouse, the Dock, the tray, an
+update and the system logging out all quit at once as before.
+"Hold ⌘Q to quit" in Settings, General, Window is on unless turned off,
+kept with the theme (`prefs.quitGuard` in `electron/workspaces.mjs`),
+and offered only on a Mac.
+
+## Backups and restore
+
+`server/backup.ts` writes the whole data folder to one file in
+`~/.owlbot-backups` (0700), named with the local date and time, the
+version, and `-auto` or `-before-restore` for those kinds. It is a
+gzipped tar, so any archive tool opens it: `owlbot-backup.json` first (the
+format, version, time, kind, and whether the Undo history and saved keys
+are inside), the workspace under `owlbot/`, and `manifest.json` last, with
+every file's size, mode, time and SHA-256, written last so each file is
+read once and hashed on the way through. A file is read from an open
+handle up to the size it had when opened, which is one whole version of
+a store (stores replace their files by rename) and a clean prefix of a
+log being appended to. Left out, and named in the manifest: `native/`,
+browser profiles, rehearsal copies (their `index.json` stays), caches,
+dependency folders anywhere (`node_modules` and friends, never `.git`),
+temp files, sockets and links, the server's `server.lock` and `port`,
+and `checkpoints/` unless the Undo history is asked for.
+
+With a passphrase the archive is sealed: scrypt (N 2^17, r 8, p 1) gives
+an AES-256-GCM key, and the archive goes in pieces of a megabyte, each
+with its own nonce and bound to the header, its number and whether it is
+the last, so a piece changed, moved or cut off fails to open. The header
+stays readable, with the summary and an HMAC of the key, so a list needs
+no passphrase and a wrong passphrase is told apart from a changed file.
+Saved keys in `config.json` (the paths in `SECRET_PATHS`, paired device
+digests included, since the relay's keys come from them) go only into a
+sealed backup; otherwise they are taken out of the copy and the manifest
+lists where, and old copies such as `config.json.corrupt-*` stay out too.
+Verifying reads a backup end to end and holds each file to the manifest.
+
+The daily backup is looked for every ten minutes and made when nothing is
+running (the drain's own idle test), no drain or other backup is under
+way, and the newest automatic one is a day old. The newest seven are
+kept; manual backups and the ones taken before a restore are never
+pruned. It is on unless `backups.auto` is false, and never holds keys.
+
+A running server holds every store in memory and writes it back on each
+change, so a restore never swaps the folder under it. The routes
+(`/api/backups`, this computer only, never a paired device or an agent's
+credential) take it in steps: open the backup far enough to know it is
+one and the passphrase is right, drain (ten minutes unless asked), back
+up the workspace as it is (`-before-restore`), unpack the archive into
+`~/.owlbot.restoring-<time>` beside the data folder and check every file,
+then write `~/.owlbot.restore-pending.json` and stop the server the way a
+quit does. `server/pending-restore.ts` is the first import of
+`server/index.ts`, so on the next start, before any module reads the
+folder, it renames `~/.owlbot` to `~/.owlbot.before-restore-<time>` and the
+unpacked copy into its place; it waits while another live OwlBot holds the
+folder, and a swap that cannot finish puts back what it moved. A backup
+without keys gets this computer's keys carried into its `config.json`.
+Paths in an archive must stay under `owlbot/` with no `..`, links and
+devices are refused, and nothing is written for an entry that fails. The
+desktop page relaunches the app when the server says it is restarting,
+and a browser waits for a new pid. `owlbot-server backup` writes from its
+own process, and `owlbot-server restore FILE` does the whole thing with
+OwlBot stopped, or copies the file into the backups folder and hands it to
+the running server.
+
+## Queued messages
+
+What the person says to a lane in the middle of a turn is read first
+(`server/delivery.ts`, `deliveryFor` in `server/index.ts`), from the app
+and the phone; Telegram follow-ups and words typed into a card skip the
+reading and go in as described below. Each agent has a delivery mode
+(`BotRecord.delivery`, `PATCH /api/bots/:id` with `auto`, `interrupt`,
+`queue`, or `null` to follow the workspace; never from an agent's
+credential), and the workspace has `delivery.mode` in config.json
+(`PUT /api/config`, Settings, Behaviour), Automatic when unset. Automatic
+reads the words by rules: a short stop stops the turn, and the message
+starts the next one; "wait", a correction ("no", "actually",
+"instead"), urgent words, or a short reply to a question the agent's
+latest words in this turn asked go in now; words that say they are for
+afterwards, and everything else, wait. Only words the rules have
+nothing to say about are put to a model, only when the person turned
+that on (`delivery.askModel`, off by default, since each ask is a call
+on their key), and only to the agent's own engine when it has a small
+one (`ProviderInstance.smallText`, an
+OpenAI-compatible provider's named small model), for at most 1.5
+seconds; no answer means wait. Interrupt sends everything in now (a
+stop still stops), which is how every message went before modes
+existed, and Queue waits whatever the words. The person's one tap
+(`delivery: "now" | "wait"` on `POST /api/bots/:id/messages`) outranks
+both. Going in now uses the steer below; an engine with no `steerTurn`
+is stopped instead (`stopForYou`) and the message starts the next
+turn, but only for the person's own turn in its own lane
+(`mayStopForWords`). What happened is kept on the message
+(`Message.delivery`: route `steered`, `stopped` or `queued`, why, and
+the line said under it, such as "Queued until Research Analyst
+finishes" or "Interrupted to take your correction") and returned on the
+send. `POST /api/bots/:id/delivery` says, by the rules alone, which way
+words would go before they are sent, so the composer can say so with
+Send now or Wait instead beside it. `POST /api/bots/:id/queued/now` is
+the flip afterwards: the person's waiting words go into the running
+turn as themselves, in order (`sendWaitingNow`, moved rather than
+copied), or the turn stops for them when the engine cannot take words
+midway. With a `messageId` it is that one message alone (a phone's
+long press on it), and what else waits keeps its place and its order.
+Words that wait on purpose do not hold back a correction sent
+after them; words that wait only because they could not go in still
+do.
+
+A room's flip, `POST /api/owlbot/:id/queued/now` (owner only), stops
+nobody (`sendRoomWaitingNow`). The person's waiting room words go into
+the turn of each member speaking there whose engine can take them
+(`steerRoomTurn`, only a turn the owner asked for, framed as room
+lines), and into the room's history at once. When no speaking turn can
+take them they wait for the room's next boundary, the moment between
+two speakers (`roomBoundary` in `speakInTurn`), and say so on the
+waiting row ("Goes in when Ada finishes"). Every member who speaks after
+they went in is told them as new and counted as having heard them
+(`roomHeardEarly`); the words' own turn in the room's queue then wakes
+only those it was for who have not. Each message enters the history
+once, in the order it was said, and a second tap, the next speaker and
+the words' own turn all wait for a Send now still asking an engine. A
+shared room's members' words keep their own place in the queue. The
+room's Stop is `POST /api/owlbot/:id/stop` (`stopRoom`, owner only): it
+stops every member speaking there and ends the round, so the next
+member does not start in their place and nobody named meanwhile is
+handed it; what waited behind the round goes next.
+
+Waiting words go in the order of their line, and the person may change
+it for their own: `POST /api/threads/:id/messages/:mid/move` with
+`{ before }`, another waiting message's id or null for the end
+(`moveWaiting`). An agent's line is its steer queue; a room's is the
+posts it has yet to start (`roomQueue`), each link of the room's chain
+taking whichever is first when its turn comes, so every post still goes
+exactly once. Words being handed to a turn (a preparation not at
+`next`), words sent with stop and send now, and OwlBot's own notes keep
+their places, and the rest trade places around them
+(`server/queue-order.ts`, which the strip uses too). The transcript is
+put in the same order, the waiting words moved to its end with patches
+that say they moved, so a restart (`recoverQueued`) and every screen
+read the same line. A member's words in a shared conversation wait in a
+line of their own after the owner's, and the owner's are never moved
+past them. Who may move a message is whoever may reword it: the owner,
+from this computer or their own devices, never an agent's credential
+(403) and never a member, whose surface has no such route. Words that
+have started going, or a place that is no longer in the line, are
+refused with 409 and the plain reason, and the refusal carries the line
+as it stands for the screen to catch up.
+
+When words go in now, they go into that turn when its engine can take
+them (`steerLane` in `server/index.ts`). Claude Code keeps the stdin
+it was given the prompt on open and reads another stream-json message
+after the step it is on; Codex takes it through `turn/steer`, naming the
+turn it is running. A driver says it can with `steerTurn` in
+`server/contracts.ts`. The message joins the conversation as the turn
+takes it, after what the agent has said so far, and nothing is
+interrupted; Stop is still how to do that. Claude's stdin is closed at
+the first `result`, since that is what lets the process end; words
+written just before it are answered by the same process in the same
+turn, which ends on the last result. When the turn cannot take them (the
+engine refused, its input is closed, the turn is a room's, someone
+else's, or a quiet session being compacted, or OwlBot is draining for a
+restart), they wait as below. A Telegram follow-up goes into the turn
+its chat is waiting on, and one answer covers both; a turn that did not
+start from Telegram takes the words too, or they wait, and either way
+the answer goes back to the chat instead of a refusal.
+
+Words said while a turn is still getting ready, before its engine has
+the prompt, join that turn rather than waiting for its first answer.
+`prepareFollowup` admits only the requester, audience and delegate of
+the start that claimed the lane (`PreparationAttempt`), and the owner's
+Telegram chat joins only a turn that chat started, since that is where
+its answer goes. Each waiting row is its own record: at the engine's
+input boundary the driver commits the ready rows into the first input
+(`TurnPreparation` in `server/contracts.ts`), with their words, sender
+and grant read again then; later ones go in through `steerPrepared`,
+which tells a refusal from an outcome it cannot confirm. An engine that
+cannot tell (Claude Code below 2.1.300, or one in a workplace) is not
+offered this, and the rows go to the next turn as before. A row whose
+delivery could not be confirmed is never sent again on its own: it
+holds what was said after it, across a restart too, until the owner
+dismisses it in the strip. A file for a turn that runs elsewhere, or a
+picture past the turn's eight, waits for the next turn with everything
+said after it.
+
+Command/Ctrl+Enter in the app is one request (`src/lib/sendMessage.ts`):
+`stopFirst: true` on `POST /api/bots/:id/messages`, naming the
+conversation when one is named (GitHub 452). The server writes the words
+down ahead of everything already waiting, behind only earlier such words,
+as a turn of their own (`alone` on the queue item, read by
+`queuedSegment`), and only then stops the turn. However soon that turn
+ends, the next one is these words alone, and what waited before goes
+after it, in its order, once each. They never join the turn being
+stopped, nor one still getting ready, and a message whose delivery could
+not be confirmed does not hold them back, though it still holds what
+follows it. The answer says `stopped: true`. An older server ignores the
+field, and `steer: false` keeps the words out of the dying turn there;
+the client then stops the turn itself, as it used to. A failed request
+uses the normal draft recovery; a failed fallback Stop does not, since
+the words are in. The `alone` mark is kept in memory, so after a restart
+the waiting words go in transcript order. Plain Enter still steers.
+
+An empty composer receives failed text and attachments back immediately.
+If newer words or chips occupy it, `src/lib/drafts.ts` retains the failed
+payload separately under that conversation's existing draft key. The
+composer lists each saved submission with explicit Restore/Discard actions.
+Restore fills an empty box and never sends; an occupied box keeps both.
+Accepted input and recovery update the current draft synchronously before
+React renders, so batched failures cannot replace one another. This stays
+in window memory across conversation navigation, not reload or restart,
+and does not imply the server failed to receive a message whose reply was
+lost. Room composers keep their existing draft contract.
+
+Another agent can ask for the same thing when what it says changes the
+work under way: `owlbot say <agent> --now <text>`, which is `now: true`
+on `POST /api/bots/:id/messages` from an agent's credential. It is
+honoured only when the sender's own message started the running turn
+(`replyingTo`) or the sender may stop that agent anyway (`mayStop`),
+both decided in `mayJoin`; joining is the gentler of the two, since
+nothing is thrown away and the agent reads it after the step it is on.
+Then it goes in through `steerLane` like the person's words, the engine
+hears who it is from, the conversation keeps it as that agent's
+message, and the sender is told the agent reads it after its current
+step. Otherwise, or when the turn cannot take it, it waits as below and
+the sender's answer says why. Without `--now` nothing changes, and a
+room never takes it: its members speak one at a time.
+
+Everything else said to a lane in the middle of a turn (another agent,
+a webhook, a watcher, a routine, or the person on an engine that cannot
+take words mid-turn) is written down at once, flagged `queued`, and
+waits in memory (`steerQueues` in `server/index.ts`) until the lane
+settles; everything waiting goes in one turn. None of it is part of the
+conversation until then. The app shows it in a strip
+above the composer, where your own can be reworded, sent now or taken
+back, and when they go `deliverQueued` moves them to the end of the
+transcript (`Store.moveToEnd`, ids unchanged) with a `message.patch`
+frame marked `moved`. So the stored order is the order the agent heard
+things in, and everything that reads it (a room's history, a replayed
+transcript, an export) agrees. A room's own queue behind its current
+round, and a pickup after a restart, deliver the same way.
+
+A burst that carries the person's own words alongside anybody else's
+(another agent, a webhook, a watcher, a note from OwlBot) is theirs
+(`Burst`, `burstOf`). Their words go last, in the order they were
+written, both in the transcript and in the turn, so the answer sits
+right under them; each says whose it is, "(From the person. It waited
+for this turn.)", so it cannot read as the tail of the agent message
+before it; and another agent's words in it do not offer the bare quiet
+word. Another agent's words that join a running turn somebody is
+waiting on (`owlbot say --now`) do not offer it either. A turn with
+another agent's words in it may still end on a bare QUIET, asked about
+it earlier or not (`agentWordsInTurn`); when somebody is waiting on that
+turn the word is kept out of the chat and the live preview all the
+same, and when the person's words are in it and it saved no reply, it
+ends with a notice that it finished without a reply to them (GitHub 461).
+A turn the person started on their own, with nobody else's words in it,
+shows QUIET like any reply.
+
+## Wakes from local services
+
+A scheduler or another program on this computer can start work in one
+exact conversation without posing as the person
+(`server/service-wakes.ts`). `POST /api/bots/:id/wakes` takes exactly
+`{taskId, wakeId, text}`, the two ids UUIDs and the text at most 64 KB,
+and admits it only to that agent's ordinary private conversation: not a
+shared room's lane, a team conversation, a member's, a guest's mail, a
+Signal person's, an imported one or a rehearsal, and never anywhere else
+when that one has gone. It answers only a direct request on loopback
+with a loopback Host, no Origin and no Authorization header, never one
+through the relay: the same trust the owner's local API already has,
+and nothing more. It is not tied to one program, so the wake is labelled
+for what it is. It is written durably as a queued message with
+`via: "service"` and `serviceWake` (the wake id and a hash of its
+words), waits behind a running turn like a webhook's event, at most 20
+and 100 KB a conversation, and every wake is a turn of its own
+(`queuedSegment`). The engine hears it framed as a local service's
+request, never the person's words or approval (`fromServicePrompt`);
+the app labels it "From a local service" and offers no edit. The turn is
+one nobody waits on, so a bare QUIET or `owlbot quiet` ends it silently,
+and a real answer is said and notified like a reply. Sending the same
+wake again returns its record, the same id with other words is a 409,
+and `GET /api/bots/:id/wakes/:wakeId?taskId=` reads whether it is
+`queued`, `dispatched` (written before work can begin, not a claim that
+it finished), `unsent` or `unconfirmed` (no record: never a reason to
+send it blindly again). Ordinary messages, edits and imports can never
+carry service provenance.
+
+## Agents writing to agents
+
+`owlbot say` to an idle agent starts a turn there, a paid one, and a
+turn's own budget (`TURN_BUDGET` in `server/agent-cli.ts`) starts again
+in every one of them, so it bounds a turn and not the back and forth.
+That is counted on its own: each lane's latest turn has a place in a
+chain (`agentChain` in `server/index.ts`), 0 when the person, a routine,
+a watcher, a webhook or an email started it, and one more than the
+sender's turn when an agent's message did, an agent writing to itself
+included. A message that would start or wait for a turn past the
+workspace's `agents.turnLimit` is refused, with no message kept for
+later delivery. It defaults to twelve (`MAX_AGENT_CHAIN` in
+`server/agent-chain.ts`) and takes a whole number from 1 to 50; there is
+no Off, because the whole-chain count is the bound on cost. Settings,
+Behaviour exposes the live setting. A malformed
+stored value reads as twelve, and one above 50 as 50. The recipient's
+notice names the undelivered item or skipped run, the reached limit, its
+cost reason and where the limit is set. It does not say that the task
+failed or that the person must continue it; the sender is told to finish
+its turn and report any unfinished work. Whoever the person writes to
+next starts over at 0, whether their words start the turn, join it, or
+are among what it takes when it goes. A burst of waiting messages takes
+the furthest place among them, and a pickup, a backup engine or a retry
+keeps the place of the turn it continues. The places live in memory,
+with the queue they ride on, rather than on the lane record: a restart
+begins every chain again, which lets a loop that spans one run a stretch
+more at most, and leaves nothing on disk to clear when a lane closes.
+
+A new conversation is its own command, and the only way an agent opens
+one (GitHub 408). `owlbot tab <agent-id|me> [--title <title>] <first
+message>` is `POST /api/agent/conversations` with `{ to, text, title }`:
+a lane of the recipient's (itself when `to` is left out or `me`) with
+that message as its first words, made in the background so the person's
+screen stays on the lane they had open. `to` is read as `agentNamed`
+reads it, so a member's own agent is no such agent, as on the roster an
+agent reads. The words go through `sendUserMessage` with the sender's
+`chainFrom`, as `say`'s do, and are counted as one change. Everything
+that would refuse `say` to that agent is checked first and refuses this
+before a lane exists: archived, somebody at the wheel, or past the
+chain limit or the person's budget, in which case the words are held
+where `say`'s would be, on the notice in the recipient's first
+conversation. A send that still fails takes its empty lane away again.
+Twenty lanes is the cap here as everywhere. The answer names the agent,
+the lane's id and its title, and `queued`, `note` and `engine` when a
+message would carry them; the sender's own conversation records it as
+it records a `say`. The person's own route for an empty lane, `POST
+/api/bots/:id/tasks`, and switching lanes stay off an agent's list. So
+there are three things an agent asked for "a new conversation" may
+mean, and the command line keeps them apart: `tab` is a new lane, `say
+--task <name>` names the work a message hands off for counting turns
+and lands where any `say` would, and `fresh` keeps the lane it is in
+with a new engine session.
+
+Where a `say` lands is the server's to work out, never which lane the
+person has open (GitHub 493). Each message one agent writes another
+carries the lane it was written from (`AgentNote.laneId`), and the
+lane it arrives in remembers it (`TaskRecord.peerLanes`, by peer), so
+the answer goes back to the tab that asked: first to the lane whose
+message started the running turn, then to the one this lane is in
+exchange with (`replyLaneFor`, `agentLaneFor`). A new request goes to
+the recipient's first conversation (`mainLaneOf`). When the tab an
+exchange was in has been closed, the words go to the first
+conversation and the receipt says `laneClosed`, once: the stale peer
+lane is forgotten as it is found.
+
+An agent may also name a lane with `taskId`, and that is held to a
+rule, because a lane id is a capability: words written there arrive as
+its next turn (GitHub 494). `agentLaneRefusal` allows one of the
+sender's own lanes, the recipient's first one, a lane the sender opened
+with `tab` (`TaskRecord.createdBy`), or one it is in exchange with
+either way round (the lane's `peerLanes` names the sender, or one of
+the sender's lanes names it), and refuses anything else with a 403
+that states the rule, before anything is claimed or written, on the
+kept-back message as on any other. A member's private lane is refused
+to every agent, its own included. The routes an agent uses on its own
+lanes by id (`/show`, `/artifacts`, renaming one) check the same rule;
+closing, `fresh`, `quiet` and the summary already take only the lane
+the turn is in, and `take-back` and `interrupt` name no lane. A lane
+that does not exist is a 404 as before, and the person's own
+credential never meets the rule.
+
+Words that waited behind a busy agent carry where the sender's record
+of them is (`AgentNote.record`), and the record follows them once
+(`settleRecord`). When they are dropped before they were read, the
+record says why on `AgentNote.dropped`: `taken-back` by the sender,
+`removed` by the person, `not-sent` (the recipient archived or held,
+a refusal at the engine, a restart that found them stale), or
+`closed`, when the lane they waited in is closed or cleared, or its
+agent deleted, with them still in it (`waitingAgentWords`). The
+sender's turn has usually ended by then, so its next turn in that lane
+hears every such record in one line, once (`droppedWordsNote`, beside
+the notes on proposals the person answered), and the records are
+marked `told`. Nothing starts a turn just to say it. Words taken back
+from the very lane that sent them are marked told at once: the
+command's own answer said so.
+
+Which of those fits what the person asked, with the rest of the command
+line, is a built-in skill, `using-owlbot` (`OWLBOT_GUIDE` in
+`server/skills.ts`). It rides along as `page-design` does
+(`withOwlBotGuide`), one line in the skills index and its body read on
+demand with `owlbot skill using-owlbot`, but only on the turns that get
+the full credential it describes: the owner's own, outside a shared
+room, on an engine that runs a process. It names every command `owlbot
+help` lists, which `test/agent-tab.test.ts` checks against the shipped
+CLI, and what only the person can do, pointing at `where`, `open` and
+`settings propose` below rather than naming pages from memory.
+
+Separate tasks are counted apart only when the person allows it
+(GitHub 326). `agents.taskBudget` is off until they set it in Settings,
+Behaviour, to a whole number from 2 to 100; an agent is refused the
+config route like any other setting. An agent can name the task a
+message hands off (`owlbot say --task <name>`). The server keeps, beside
+each lane's place, the task its turn is on (`chainTasks`) and where in
+the chain that task's handoffs started, which is always the sending
+turn's own place and never anything the agent says: a message naming a
+task other than its turn's starts that task there, and one naming none
+goes on with its turn's. With a budget, a turn on a named task counts
+its task's own run against `agents.turnLimit` and the whole chain
+against the budget; a turn on no named task counts the whole chain
+against the limit, as without one (`chainPast` in
+`server/agent-chain.ts`). So a reviewer moving from one task to the next
+is not held as one exchange, a loop on one task is still held at the
+limit, and a loop of any number of agents that renames its work every
+time is held at the budget. The notice says which bound held it, the
+task by name or the budget as the person's own. A burst keeps a task
+only when every agent's message in it agrees on one, and routines,
+watchers, jobs and room mentions an agent sets going carry only the
+chain's place, so they count the whole chain against the limit.
+
+A turn's own budget is twelve general changes and one more kept back:
+past the twelve, the only change a turn may still make is one direct
+message to another agent, so an agent that spent its twelve on the work
+can still say what it did (`claimReport` in `server/agent-cli.ts`). Not
+to itself and not to a room, and the chain limit still applies to it,
+so the thirteenth cannot keep a loop going. The kept-back message gets a
+receipt, held on the credential through its renewals: the same words to
+the same place, sent again, read that receipt (accepted, queued or
+steered, with the note and the engine-readiness warning any message
+gets) without delivering anything a second time, and different words
+are refused. A refusal before anything reached the recipient leaves the
+slot free. One that might have arrived (the engine's pipe closing
+mid-steer, say) is answered as uncertain, keeps the slot, and is never
+queued again; Codex answering a steer with an error is a definite no,
+and the message waits for the next turn as any other does.
+
+Rooms and the job board carry the count too, or an agent could keep
+another going through them. An agent naming someone in a room, from the
+room or from a conversation, hands the turn it wakes a place one past
+its own; past the limit nobody is woken and the room says why. A room
+also keeps the latest such place (`roomChain`) for a turn that waited,
+behind a busy agent or a round, and anyone but an agent posting there
+clears it as the post goes out. A job posted from an agent's turn
+records the place its taker's turn would take; past the limit it is not
+offered, and the person offering it again clears it. Routines and
+watchers an agent files or changes do the same (`chain` on each): past
+the limit a routine's attempt is recorded as held without consuming its
+scheduled slot, and a watcher holds without looking. When the live value
+allows, an enabled routine runs at its next allowed occurrence under its
+existing missed-run grace, and a watcher rechecks on its next arm,
+clearing the stale error on a good look. A once routine disabled by
+older code is not revived. A once slot past grace stays enabled but
+needs a manual run or deletion; it still counts against the routine
+limit. One latest hold record is kept beside the normal run history, so
+repeated holds cannot evict real runs. Agents cannot file workflows. A
+room has a shorter bound of its own as well (`MAX_AGENT_HOPS`, see
+Rooms), carried with the turn the same way; a mention past both leaves
+one notice in the room, not two.
+
+Changing the limit changes where the line is, never the count: a running
+turn keeps its place and is judged by the live value at its next handoff.
+The setting API stays unavailable to agents and to a shared room's
+members.
+
+A refusal is said where the person will find it
+(`chainNotice`): a notice in the conversation the next turn would have
+gone on in, naming the whole count and its last step, that conversation
+marked unread. The record does not wake the phone or raise a desktop
+banner: a mechanical hold does not itself ask the person to decide.
+A routine or a watcher says so once when its hold starts, not at every
+tick or look. Direct refusals dedupe consecutive notices by sender,
+recipient, depth and limit, ignoring the redacted excerpt. A person's
+message between refusals allows a fresh notice. These notices retain
+`chainHeld` and explain the limit in the conversation.
+
+## Who reports to whom
+
+The roster is flat until the owner gives it a shape (GitHub 525). On the
+Agents page of the rail each agent may be given a lead, the one agent it
+reports to, and a line in the owner's words on what to contact it for.
+Both live in `registry.json` in the data folder, read and written by
+`server/registry.ts`, and only the owner sets them: `/api/registry` is
+on the agent command line's NEVER list, refuses a member's credential,
+and takes the owner's own paired devices. A loop is refused when it is
+set, and dropped if a hand edit makes one. A lead that is archived is
+passed over for the nearest lead above it; one that is deleted hands its
+reports up to its own lead. Rooms are the teams people hire, so the page
+lists them too, each with the lead `leadOf` gives it.
+
+Agents read the same picture: `owlbot org` (`GET /api/agent/registry`)
+is every agent with its lead and reports, the teams, and where the
+caller sits; `owlbot who <words>` (`GET /api/agent/registry/contacts`)
+ranks agents by the owner's contact line, then role, skills and brief,
+and says of each whether the caller may write to it directly or through
+which lead. The MCP server has the same two as `org_chart` and
+`who_to_contact`. A placed agent's briefing names its lead and its
+reports; an agent with no place is told nothing. An agent's lead may
+stop its turn and join it with `--now`, as the agent that hired it may.
+
+Nothing about how agents talk changes until the owner turns on "Ask
+their lead before reaching across teams" (`leadFirst`). Then
+`routeMessage` holds `owlbot say` and `owlbot tab` from an agent with a
+lead to an agent outside its team, which is everyone under its lead,
+unless the recipient is above it, shares a room with it, or wrote the
+message its turn is answering. The refusal is a 403 before anything is
+claimed or written, kept-back message included, and names the lead with
+its id so the next step is one command. An agent with no lead is at the
+top of its tree and reaches anyone. Rooms, jobs, intents and the
+person's own messages are not routed by it.
+
+The sidebar can list Favorites instead of every agent
+(`src/lib/agentFilter.ts`, a choice kept on the device): the pinned
+agents, the one on screen, and any other only while it has an unread
+reply or a conversation stopped for the person. A line under the list
+counts the rest and opens the Agents page, whose last group lists the
+archived agents with Restore beside each (the same `restoreBot` the
+sidebar's archive uses; deleting for good stays there).
+
+A team stays a room. A separate teams store was the other way, and it
+would have held a second list of members and a second lead beside the
+room's own, to be kept in step by hand; rooms already have the members,
+the crown and the place the team works. So New team on the Agents page
+(`src/components/NewTeamDialog.tsx`, the room dialog's picker and
+drawing) is `POST /api/registry/teams`: the room opened by the same
+`openRoom` as `POST /api/owlbot`, answering through its lead unless the
+owner picks otherwise, and with "Members report to the lead" on, each
+member put under that lead in `registry.json` (`withTeamLead`). A line
+that cannot be drawn (the lead is under one of them) refuses the lot
+before the room is made. Each agent's card on the page shows its model,
+skills and teams, and its menu opens its conversation and settings,
+makes it a team's lead, or moves it. Moving is `POST
+/api/registry/agents/:id/team` with the team it leaves and the one it
+joins, either of them none; a team is never left with one agent, never
+given a ninth, and both rooms say what happened in a notice. A new lead
+is `POST /api/registry/teams/:room/lead`, the room's crown. The
+reporting lines follow those two only where they already matched the
+team (`afterTeamMove`, `afterHandover` in `server/registry.ts`): an
+agent that reported to the lead of the team it left reports to the lead
+of the one it joins, and a new lead takes the old one's place, the old
+one under it, when the team reported to the old one. Otherwise only the
+rooms change. All three routes are the owner's, refused to an agent
+(`/api/registry` is on NEVER), a member, and anyone but the owner's own
+devices, with the same check as the chart's.
+
+## Goals
+
+A conversation can be given a goal, and then keeps working turn after
+turn without anyone typing "keep going": what done looks like, a command
+that has to exit 0 for it to count (optional), and how many turns it may
+take, twenty unless the person says otherwise and a hundred at most.
+`/goal` in an agent's chat sets one, with `check:` and `turns:` on lines
+of their own; on its own it opens the same dialog as Set a goal in a
+conversation's menu, which is `PUT /api/bots/:id/tasks/:taskId/goal`
+(`PATCH` pauses, resumes or gives it more turns, `DELETE` clears it).
+`/goal` is OwlBot's own: the messages route reads it before anything
+else, so it never reaches an engine, where a command of that name would
+run as one. The goal lives on the lane (`TaskRecord.goal`), goes with it
+when the lane is closed or cleared, and `clientBot` ships a summary for
+the chip over the composer.
+
+Each turn in the lane that ends well is judged (`judgeGoal` in
+`server/index.ts`; the rules and words are `server/goals.ts`). The check
+runs first, in the lane's folder, through the shell as a watcher's check
+does (`runCheck`): its own process group, stopped after five minutes,
+the end of its output kept. Then the agent's own engine is asked once,
+through the one-shot call a fold uses (`generateText`), for a verdict as
+JSON: done, continue or blocked, with a reason and a next step. With no
+small model, or an answer that is not a verdict, the check decides, then
+the agent's own last line ("Goal: done", or "Goal: blocked," and what it
+needs), which every goal note asks for. Done needs the check to pass,
+whatever the judge read. Done and out of turns end the goal with a
+notice; blocked hands it back with what it needs and the lane reads as
+waiting on the person; continue queues the next turn.
+
+That turn goes in through the lane's queue (`queueGoalTurn`) as a
+message marked `via: "goal"`: a note from OwlBot, never the person's
+words, so it names no skill, runs no engine command, and keeps the chain
+place of the turn it follows (see Agents writing to agents), and the
+chat labels it as OwlBot's. It is counted before it is queued and none is
+queued past the budget, so the budget is a hard cap whatever the judge
+says. The person comes first. Whatever waited for the lane goes before
+the goal is judged, and a verdict is acted on only while nothing waits
+and no other turn has started in the lane since the one it judged
+(`laneTurns`). The person's Stop pauses the goal and takes back a next
+turn already queued; their answer to a blocked goal picks it up again
+after the turn that hears it; a turn that fails pauses it. A turn picked
+up after a cut off, handed to a backup or asked again after a fold is
+not over yet, and is judged when it is. A room's turn or an engine
+command in the lane is not the goal's work, but the goal is judged after
+it on the lane's own last reply rather than left with nothing to start
+its next turn. Goals stay out of shared rooms' lanes, the lane for
+unlisted mail and rehearsals. One left active after a restart with
+nothing running or waiting in its lane was between turns when OwlBot
+stopped, and is paused rather than judged again unattended.
+
+While a goal runs, its turns' replies raise no banner. Done and out-of-
+turns notices follow the agent's reply switch. A goal is judged blocked
+only when it cannot go on without the person, so its notice raises an
+urgent banner past that switch ("needs you") and wakes the owner's phone,
+the same as an unanswered question or approval card, including a
+workflow gate. A chain hold never does, whatever its words. An agent reads its goal with `owlbot goal`
+(`GET /api/agent/goal`, which reads the goal of the lane its credential
+was minted for), and nothing on its list reaches the routes that set
+one.
+
+## The same call, again and again
+
+An agent that has lost the thread can call one tool with the same
+arguments over and over, and every call sends the whole session to the
+model again. A driver that hears a call's arguments puts a `signature` on
+its `item.started`: the tool and the arguments, normalised (keys in
+order, runs of spaces made one) and hashed (`callSignature` in
+`server/repeats.ts`), so the arguments, which can carry a key, ride on no
+event. Claude Code gives `block.input`, Codex the item's own request
+fields (a command and its folder, a patch's changes, an MCP call's server,
+tool and arguments, a search's query), an ACP agent its `rawInput` when it
+is not empty, and an API model the arguments it wrote. The cloud computer
+names the tool and nothing more, so its calls are not counted.
+
+`RepeatWatch` counts each running turn's calls by signature, from nothing
+at every `startTurn` and forgotten at its end. When a call reaches 5, 10
+or 20 and that is higher than the turn's chip, its activity row gets
+`repeated` and the row that had it loses it (a `message.patch`), so a turn
+shows one chip, "Same call repeated 10 times", on the run of tool calls
+it sits in (`src/components/ToolRun.tsx`). The first call to reach 20 also
+posts one notice saying the turn may be stuck and can be stopped. Nothing
+is stopped for the person. The notice does not name the call, since a
+shared room's members may see only a tool's kind. Memory is bounded: a
+turn keeps 256 distinct calls, forgetting the one used longest ago (never
+the loop, which is the call it keeps making), and 512 turns at most.
+
+## A finished turn, folded
+
+While a turn runs the chat shows everything it does. Once it has ended,
+what it did on the way folds into one line above its result ("Worked 8
+min · 27 commands · 4 files", then the agents it wrote to), and a click
+opens the work in place. Under the fold go its progress messages, tool
+calls, rows for messages to and from other agents, the message that
+started it when that was not the person's (another agent's, a routine's,
+a watcher's, a webhook's, a goal's note), cards already answered, the
+screen it ended on and the changes card. Left out are the person's own
+words, the turn's last reply, cards that still wait for them, artifacts,
+components and every notice. Quiet check-ins and messages taken back
+keep the rows they have. `src/lib/turnFold.ts` decides all of it from
+the transcript, and no fold is stored.
+
+A turn begins at a message with `role: "user"` and ends where the next
+one begins; the last has ended when its lane is no longer working
+(`turnRunning`, which takes a lane paused on a live approval as still
+going). Its result is the last thing the agent said in its own chat.
+The one thing the transcript could not say afterwards is that a message
+went into a running turn instead of starting one, so `steerOne` marks
+those `midTurn`. The person's words in the middle of a turn stay on the
+page and split its work into a fold on either side. A transcript from
+before the mark takes each such message as the start of a turn, which
+leaves one more progress message showing and never hides a reply.
+
+The line names who asked when it was not the person, and another
+agent's name there opens the exchange, as the "After a message from"
+link above the reply does while the turn runs. A turn that only wrote
+back to the agent that asked is the line alone, ending in "replied".
+The count is of commands when every call was one (`kindOf` in
+`src/lib/tool-summary.ts`) and of steps otherwise, and of files only
+the turn's own.
+
+A room's transcript does not say where an agent's turn began, so there
+a turn is what one agent did until somebody else spoke (`foldRoom`), and
+`RoomView` remembers where a turn it saw start began, so nothing of it
+folds while it runs. When a fold closes over a reader who is not at the
+end, `useHoldPlace` keeps the reply where it was on screen; a find hit
+or a forum link into folded work opens the fold.
+
+Codex narration in a turn another agent started is work from the moment
+it is said. Codex marks each finished message `commentary` or
+`final_answer`; the server stamps a bot's text with `codexText` (shaped
+in `shared/codex-text.d.ts`, stamped by `server/codex-text.ts`, feature
+`codex-progress`) and the stamp says `display: "progress"` only for
+commentary in a turn an agent started (`codexOrigins`: another agent's
+message, a room handoff, never the person, a routine, a watcher, a
+webhook or a recovery) that asks the person nothing. Codex 0.145 does not
+say whether an item asks anything, so when it is silent the server reads
+the text, and reads it one way: no question mark, nobody addressed, no
+word a request or a blocker is made of, in a script it can read.
+Anything else is `unknown` and shows as usual; Codex's own `questions`,
+should it ever send one, wins. Progress makes no unread, wake, preview,
+banner or speech. The client (`src/lib/codexProgress.ts`) folds it into
+the work row while the turn runs and gives it back once more is known: a
+person whose words joined the turn (`joinedTurnId`, set by `steerOne`
+only when Codex accepted them into that turn) sees all of it, and a turn
+that ended without an answer keeps its last commentary on the page. None
+of that rewrites history or alerts again. A client that does not know
+the field, or a newer version of it, shows the text as before.
+
+## Desktop banners
+
+What raises a banner is one pure function, `noticeFor` in
+`src/lib/notify.ts`. An unanswered card, a blocked goal and an engine
+that is out ("could not answer") interrupt as soon as their message
+lands. A reply does not: a turn can save several, some of them running
+commentary, and only its end says which one is the answer and whether
+anything is to be said at all. So the server says it once
+(`server/reply-notifications.ts`): each attempt keeps its last saved
+reply, an explicit final answer before later commentary, and when the
+turn is over, whether it ended well or not, a `reply.settled` frame
+carries that reply, clipped to what a banner shows. Nothing is said for
+an attempt that is asked again or handed to a backup (the next attempt
+speaks for itself), a quiet check-in folded away, a Stop, an engine
+command, or a turn on the way to a goal. The frame inserts nothing into
+the transcript and is read against it first, so words deleted while the
+turn ran are not said. `NoticeDelivery` keeps a replay or a reconnect
+from saying the same thing twice.
+
+The desktop in remote mode can be newer than the computer it works with.
+On every hello it reads that server's features (`/api/health`), and one
+without `reply-settled` has its replies announced as they land, at most
+one every four seconds in a conversation, as before.
+
+## Chat platforms
+
+A shared room can be carried into Slack, Discord, or a WhatsApp or Signal
+group (`server/chat-bridge.ts` holds the rules, one transport file each
+moves the bytes; Signal's rides the same stream as its agents, see
+Signal). Slack and Discord are connections this machine opens. WhatsApp
+can only call a public address, so OwlBot Cloud gives each workspace one
+and hands every call over the relay line as an ask; the call arrives
+readable, because Meta sends it that way, and is believed only if Meta's
+signature checks out against the app secret, which stays here.
+
+## Signal
+
+The same shape as Telegram, on an account rather than a bot. Signal has
+no bots, so an agent answers on a real Signal account, and OwlBot never
+holds its keys: signal-cli, running on this computer as a JSON-RPC daemon
+(`signal-cli daemon --http 127.0.0.1:8080`, multi-account), is linked to
+the account as a secondary device and keeps everything in its own data
+folder. OwlBot talks to it over loopback only (`cleanDaemonUrl` refuses
+anything else, since the daemon has no password): `POST /api/v1/rpc` for
+`listAccounts`, `startLink`/`finishLink`, `send`, `sendTyping`,
+`remoteDelete`, `getAttachment` and `listGroups`, and one Server-Sent
+Events stream, `GET /api/v1/events`, for every account it has linked.
+`server/signal.ts` holds the parse and the rules (`decide`),
+`server/signal-people.ts` the people rules, and the Signal section of
+`server/index.ts` the plumbing.
+
+Linking is a code to scan: `POST /api/bots/:id/signal {link: true}` asks
+for a `sgnl://linkdevice` URI, the settings screen draws it as a QR code,
+and `finishLink` waits in the background for the phone. An account already
+linked can be chosen instead. One account answers for one agent. The
+owner pairs with a single-use word, as on Telegram, and where it arrives
+decides the shape: from another account, that account is the owner and
+the linked account is the agent's own number; in Note to Self, the linked
+account is the owner's own, and from then on only Note to Self is read.
+On the owner's own account every other conversation, and every message
+the owner sends to anyone else from the phone, is dropped by `decide`
+before anything reads it, and nobody can knock.
+
+The owner's words become a turn in the agent's ordinary conversation,
+marked `fromSignal`, and the answer comes back with what the turn saved
+(five files at most, as data URIs). Cards the turn raises are said in the
+chat and answered by typing a number or yes / no; an approval needs one of
+its own answers, and voice never answers one. Photos arrive as the
+composer's images, voice notes are transcribed with the speech key, and
+long turns get a note that is taken back (`remoteDelete`) when the answer
+comes. Everything sent is remembered by timestamp, so an echo is never
+heard, and everything handled is kept in `signal-seen.json`, since the
+daemon replays what it still holds to a stream that starts over.
+
+People follow Telegram's rules: a stranger knocks once, the owner gets a
+card in the app and in their own chat, answered there only by a reply
+that quotes it, the waiting list and the closed records are bounded by
+the same limits, names are cleaned and namesakes flagged, and every change
+to a person's access is a new grant. A person's words land in a
+conversation of their own (`TaskRecord.signalPerson`), never in the
+owner's, framed as theirs. Without full access their requester is
+`signal:<hash of agent, connection, person, grant>`, which `startTurn`
+treats as an outsider, like an email from anyone: no tools, no notes, no
+memory, a fresh engine session with their own conversation replayed, and
+only on an engine whose tools can be switched off. With full access their
+turns run with the agent's own trust and their files come back to them.
+Either way the cards their turns raise go to the owner, never to them.
+
+A room can be carried into a Signal group through any linked account
+(`chat.signal` in config.json, `server/chat-bridge.ts` for the rules). A
+group message on that account goes to the room; the account's own
+messages arrive as sync messages, which never reach the bridge, so the
+room cannot wake itself.
+
+## Home Assistant
+
+`server/home-assistant.ts` holds the rules; the Home Assistant section of
+`server/index.ts` meets them. One connection for the workspace: an
+address and a long-lived access token, checked with `GET /api/` and kept
+in config.json (`home.token` is in `SECRET_PATHS`). The token never comes
+back out of `/api/home`, never enters a turn, and every request is made by
+OwlBot with redirects refused.
+
+What an agent reaches is the owner's choice: entities and whole domains
+on a list, and the agents allowed to use the home at all. An agent uses
+it through its own command line (`owlbot home entities | history | call |
+wait`, routes under `/api/bots/:me/home/`), only in the owner's own turns:
+not in a shared room, not for a person on Telegram or Signal, full access
+or not, and not for mail from anyone. Reading is free. A service call
+names entities on the list, in their own domain or Home Assistant's
+generic on, off and toggle, with any `entity_id`, `area_id`, `device_id`,
+`floor_id` or `label_id` in its data taken out, so it cannot reach past
+what it names. It runs at once only when the owner marked every entity to
+change without asking; otherwise it is an approval card in the lane
+(`home:<id>`, answered through `/api/bots/:id/respond`, and on the owner's
+Signal chat when the turn began there). Locks, alarms, and covers classed
+or named as garage doors or gates ask every time, whatever was marked. The
+route waits 90 seconds for an answer, then says it is still waiting; a yes
+counts only while the turn that asked is still running.
+
+What comes back is the device's words, not the owner's: names, states and
+attributes are cleaned of control characters and reordering marks,
+bounded in length and depth, stripped of pictures and tokens, and sent
+with a note that they are data. The owner's picker reads areas from Home
+Assistant's WebSocket registries, and shows names cleaned the same way.
+
+The other direction needs nothing new: Home Assistant posts to an agent's
+webhook. `POST /api/home/automation` makes (or reuses) a webhook named
+"Home Assistant" for the agent and returns a `rest_command`, a state
+automation and a voice automation (a `conversation` trigger with
+`set_conversation_response`), with the address this computer is reachable
+at. Home Assistant's own conversation agent integrations are not
+supported: none in Home Assistant calls an arbitrary HTTP endpoint, and
+standing in for one would be a new model endpoint on this computer.
+
+The OwlBot MCP server reads the list too (`home_entities`, `home_history`)
+once the owner lets other AI apps in, and `home_call` changes only what
+needs no asking: there is no turn there to put a card in.
+
+## Telegram
+
+The person can reach an agent from a Telegram bot that is that agent's
+own (`server/telegram.ts` holds the rules, `server/telegram-bots.ts` the
+saved shape, the Telegram parts of `server/index.ts` the plumbing). A
+bot is a BotFather token in the agent's settings
+(`GET`/`POST /api/bots/:id/telegram`, never with an agent's credential,
+and the token never comes back out). An agent without one is not on
+Telegram, and one Telegram bot cannot be given to two agents: the token
+is checked with `getMe` and its bot id compared with every other
+agent's. Each bot that is switched on has its own long-polling loop
+(`TelegramRuntime`), so nothing listens on a port.
+
+An agent that made a bot for itself with BotFather asks for it to be
+connected: `request_secret` with `telegram_bot`, or `owlbot telegram
+connect @name` (GitHub 329). The secure card names the agent and the bot,
+and the owner's paste is the approval (`connectTelegramBot`): the same
+`getMe` and one-bot-per-agent checks as the settings field, and the token
+must belong to the bot the card named. It goes to that agent's Telegram
+settings, never into its environment or the conversation, and the agent
+never sees it. Only the agent's own conversation with the owner can plant
+one, only while it has no bot, and its credential can neither save the
+card nor ask for another agent's bot. Pairing stays the owner's: the word
+waits in the agent's settings, as after pasting the token there.
+
+Everything hangs on the pairing. The owner is the Telegram account that
+sends the single-use pairing word to the bot in a private chat, kept by
+its user id (`ownerUserId`), since a chat id or a display name says
+where a message came from and not who wrote it. The word is made with
+the system's random source and is good once. Another person's first private
+or addressed group message creates one owner-only admission card and one waiting notice. Group notices reply to the captured addressing message and topic; the first admitted message keeps that destination. A private chat is learned only from a private message. Let
+in, Not now and Take out are per person and per bot. The card names them
+beyond the first name they chose: their Telegram user id, their @username
+when they have one, what they wrote, and anyone else on the bot with the
+same name; marks that reorder or hide text are stripped from the name. The
+first message is bounded and media is not downloaded before admission.
+Declining tells a private sender once; a group decline causes no later group
+notice or invented DM. Later messages do not create another knock. Guest mail and
+shared rooms keep their own paths.
+
+An admitted person's message is labelled with their name, Telegram and its
+group when present,
+and runs in the agent's first conversation with its own requester. It waits
+behind an owner or another person's turn; only the same requester and audience
+can steer its running turn. The audience includes the group and topic, or
+private. Each queued segment retains that requester, audience and grant.
+The owner's app words, private DM and another agent's say cannot join an
+owner group turn. Queues, fallback, retry, Continue and restart retain their
+server-created group provenance; a stale return never becomes private owner
+input. A merged segment replies to its last addressing message, and later
+steers keep that anchor.
+Taking someone out or retiring a bot transport revokes pending words,
+approvals and reply capabilities before interrupting that person's turn.
+An owner's turn is left alone. Admission is bounded to 100 waiting or let-in
+people and 20 waiting; a full inbox holds new people visibly. Declined and
+removed people do not count toward it, and past 100 of them the longest
+closed is forgotten and may knock again.
+
+Full access (GitHub 320) is a separate grant the owner gives one let-in
+person on one agent's bot, in that agent's Telegram settings (`full` on the
+person; actions `full` and `restricted` on the Telegram route, never with an
+agent's credential). Nothing gives it automatically: letting someone in, or
+back in, is restricted, and the default for everyone else is unchanged.
+Their words carry their sender (`telegramDelegate`) and run as the agent's
+ordinary turns, with its own tools, engine and permissions, Codex included;
+the agent is told they are not the owner, and recall and the summary keep
+them as theirs. The running turn's sender (`laneTelegramDelegate`) keeps it
+theirs: only they add to it, their words join no other turn, and waiting
+words from different senders are separate turns (`queuedSegment`). A retry,
+a backup or a pickup reads the sender back from the conversation. Its
+answer, notes, files and cards go only to their chat (`fullAccessInbox`),
+where only they answer those cards; admission cards stay the owner's, and
+the owner sees, answers and can stop everything in the app. Every change to
+the grant makes a new one, so their waiting words are dropped, their cards
+denied, their turn stopped and its credential revoked, and nothing more of
+it reaches them; what is done stays done. The conversation and memory are
+still one, shared with the owner, which the settings say before the grant
+is given. During a drain they are asked to send again rather than held.
+
+Groups are off for each agent until the owner turns them on in its
+Telegram settings (`groups` on the bot's record, set only on the owner's
+Telegram route, and only once the owner is paired so their messages can be
+told from anyone else's). Until then every group update, the owner's
+included, only advances the polling offset: no knock, notice, download or
+transcript entry, whoever added the bot to the group. Turning groups off is
+saved first, so every group sender stops passing its check; then waiting
+group words are kept as unsent, an album still being gathered is dropped,
+and a let-in person's group turn stops as if they were taken out. The
+owner's own group turn runs on in the app, but its reply no longer reaches
+the group. Unpairing turns groups off too. Requests from let-in people
+across all of one agent's groups are bounded to 30 an hour
+(`MAX_TELEGRAM_GROUP_REQUESTS_PER_HOUR`); past it a request is dropped before
+any download, each group is told once and the owner once, and the owner's own
+requests are not counted.
+
+Groups accept only an outer mention entity whose whole UTF16 slice matches
+this bot's username (case-insensitive), a text mention of its numeric bot id,
+or a reply to an ordinary message from this bot in the same chat.
+`/cmd@this_bot`, external replies, quotes and forwarded entities do not
+address it. Bots, anonymous sender chats and automatic forwards are ignored.
+An unaddressed update advances the polling offset without a transcript entry,
+knock, file fetch or logged message text. Replied-to context is bounded and
+labelled with its actual author; media there is described, not fetched or
+transcribed. The owner's quote of an unadmitted member remains owner trust;
+that member's own addressed message only knocks.
+
+Albums are decided as a whole by sender, chat and media-group id before any
+download, so a caption addressing the bot does not lose the other photos.
+Pending group albums are bounded to 128 and 32 parts each. A let-in member
+keeps the same person guards in a group. Its unasked file reads can reach
+every member through an explicit reply, including people never let in.
+
+Full access applies only to the private delegate route. Non-owner group
+turns stay restricted even for a privately full-granted person. Their
+history matches both the sender and private/group/topic audience; stored
+explicit replies without an audience are legacy private replies.
+
+An owner group turn keeps the owner's normal context, cursor, settings and
+permissions. Its normal agent token does not gain a group reply route.
+A separate reply-only `blr_` token binds the verified owner id, bot,
+generation, lane, turn, group, topic and addressing message. Claude and Codex
+mount the native `reply_to_sender` tool, and a tool-capable API engine uses
+the same bound function. Codex keeps the owner's home and mounts only the
+new reply server in approve mode through its per-turn overrides, with a
+fresh 0700 socket folder removed on close. Its Unix path must fit the
+platform byte limit, and an actual connection verifies listener readiness
+before the tool is advertised. Unavailable endpoints fail visibly before
+engine input, including Windows where this private-filesystem endpoint is
+not supported. Other process engines can use the
+targetless `owlbot reply` command with the separate reply credential. An
+engine with neither tools nor a process holds visibly in the app. A bound
+callback does not make an active owner turn a person turn. Current terminal
+sealing and owned-process cleanup still refuse new asks, replies or other
+turn effects after completion.
+
+Only an explicit reply reaches a group; chat text, cards, progress and files
+do not. Every group member sees it. The owner's context and permissions may
+therefore inform what it sends. The outgoing `reply_parameters` has only
+the anchor's `message_id`; `message_thread_id` carries its topic. A deleted
+anchor fails visibly, without retrying as a plain group post or a DM.
+
+[Telegram privacy mode](https://core.telegram.org/bots/features#privacy-mode)
+does not deliver mentions: it delivers commands meant for the bot, general
+commands when it was the last bot to post, inline messages through it and
+replies to messages meant for it. Privacy mode off, or admin status, is
+needed for mentions; Telegram then supplies every group message, which OwlBot
+drops when unaddressed.
+
+A person turn uses the existing untrusted approval path, including on a
+full-access agent, and runs only on Claude Code. Claude starts a fresh
+default-permission session, with empty setting sources and hooks disabled,
+and checks the reported permissions and mounted tools before input, holding
+on a mismatch. Every read and write of OwlBot's own folder is refused to it
+outright (`personClaudeDenials`): saved keys, every agent's bot token, the
+agent's memory and the default working folder all live there. Codex holds a
+person's turn, in the harness and again in its driver: its read-only
+sandbox still reads every file the account can, and the reply sends without
+a card. API engines hold it too, since they cannot wait on the owner's
+approvals. A held turn says why in the owner's chat and tells the person
+once, neutrally. Plain owner answers do not save session permissions.
+
+A person's session is told as little of the owner as a stranger's mail:
+no profile notes, no "About the person you work for", no agent memory and
+no note tools. Its fresh session hears that person's own exchange only,
+their messages and the replies sent to them, without the lane's summary or
+the owner's side of the conversation; notes meant for the owner's next turn
+(undone files, a stall, a failure, a backup's handover) wait for it. A
+person's words keep their sender wherever they are retold: in the lane's
+summary, in recall (`by: "telegram"`), and they are left out of skill review.
+
+Claude person turns load the text of the working folder's `CLAUDE.md` and
+`.claude/CLAUDE.md`, following symlinks, into the private system prompt each
+turn. They are labelled as the owner's project instructions: "the user"
+means the owner, not the Telegram sender. The combined text is limited to
+100,000 bytes; an unreadable, non-file or oversized instruction file holds
+the turn visibly. No global or local instruction files, settings, hooks,
+permission rules, MCP configuration or `@` imports are loaded by this reader.
+
+The native `reply_to_sender` tool takes one text field, with no target or
+formatting controls. Its broker callback is bound to the sender, turn and
+transport; its shell credential is reply-only too. Every other OwlBot route
+refuses it, including a say to another agent. Replies over 4096 UTF16 units
+are refused, not truncated. The owner chat records sent, failed or uncertain
+delivery. A turn cannot repeat the same attempted text automatically, and
+its final chat text sends nothing without a tool call. The person's native
+session never replaces the owner's cursor; the next owner turn starts from
+the bounded conversation, including the person's exchange.
+
+This tier permits reads inside the agent's working folder, outside OwlBot's
+own folder, and those reads can reach the person through the card-free
+reply; a read elsewhere, a command or an edit asks the owner. Owner account
+MCP servers are not inherited. An owner-approved shell that removes its
+Authorization header can still use the existing loopback-owner API
+fallback. The approval card names the person so the owner can decide.
+
+A connection has a `generation`, renewed whenever its token, its switch
+or its pairing changes. A poll, a card's buttons, the rest of a long
+reply and a message waiting for a turn each carry the generation they
+began under, and stop when it is no longer the agent's
+(`currentTelegram`, `telegramConnectionCurrent`): a bot taken off an
+agent, or another put on it, never finishes the old one's business.
+Words that were waiting stay in the conversation as unsent, with a
+notice. Putting a new token on the same bot keeps its owner and its
+place in the queue of updates; a different bot starts with no one
+paired. Deleting an agent removes its bot and token.
+
+The workspace bot from before 2.8.0 moves to the agent it was set to
+answer as (`migrateTelegram`), with its place and its paired chats, and
+asks for the pairing word once more so it learns its owner's user id.
+The people upgrade drops every old chat grant, retains the polling offset
+and a verified owner, and persists one notice job for each previous chat.
+The app also says the pairing word is needed again. A send interrupted by
+a restart is uncertain and is never replayed automatically. When the agent
+it named is gone, or already
+has a bot, nothing is assigned by guesswork: the old bot waits, stopped,
+for the person to choose an agent in Settings. A revoked pending bot can
+also be removed there. Bot tokens are left out
+of an unsealed backup like every other key (`SECRET_PATHS`), and a
+restore without them keeps this computer's own.
+
+A card a Telegram turn raises goes only to the verified owner's private
+chat (`ownerChatId`, `telegramCards`, `server/telegram-cards.ts`), including
+a card raised by an admitted person, except that a turn a person with full
+access asked for asks them in their own chat instead. That person's next message never
+answers it. For their questions, ordinary owner messages remain the owner's
+messages: a typed answer must reply to that physical card, or the owner can
+answer in the app. Such a card waits in a slot of its own (`personAsks`), so
+it never takes the place of the owner's own waiting card. An approval comes with
+Allow and Deny to tap, a question with one button per choice; a question
+with no choices, or more than eight, is answered by typing, and typing a
+number or yes / no still works on any card. A button carries a short
+random token and the choice's place, never the request id: Telegram
+allows it 64 bytes, and a token that means nothing outside this process
+cannot be replayed. Tokens live in memory for a day at most, so a button
+from before a restart answers that its card has closed. A press counts
+only from a paired chat, under the message the card became, from the
+person it is paired with (`decide`); anyone else's is ignored without a
+reply. The press is answered (`answerCallbackQuery`), the ask is
+resolved like a typed answer, and the card's message is rewritten to say
+how ("Allowed", "Denied", "Answered: ...") with its buttons gone. A card
+answered anywhere else (the app, the phone typing, an engine giving up)
+is rewritten the same way from `request.resolved`, and the chat's next
+line is a message again rather than an answer to it.
+
+What a Telegram turn leaves behind follows its answer to the chat
+(`deliverablesIn`, `telegramFiles`): files it saved to its deliverables
+folder (see `sweepArtifacts`) and the last look at its screen. Images go
+as photos (`sendPhoto`) so they show in the chat, anything else as a file
+(`sendDocument`), each a multipart upload read from disk only as it goes.
+Five at most come with one answer, and Telegram takes 50 MB from a bot,
+so the rest and anything bigger are named in one line saying they are in
+the app. A request held through a restart gets its files after its answer
+the same way (`TelegramReturns`), and only once that answer has arrived.
+Files go only with an answer that goes to the chat: a turn started in
+the app, a routine or a mail sends nothing there on its own. An agent
+sends one there itself, whatever started its turn, with `owlbot telegram
+send <file> [--caption "..."]` (`POST /api/bots/:me/telegram/send`,
+GitHub 367): only to the owner's chat with its own bot, only while that
+pairing holds (asked again before the upload), a file of up to 50 MB in
+its own files, its own workspace or the folder its turns work in, judged
+as the open file (`openUnder`: links followed and judged inside, nothing
+hidden on the way), with a caption of up to 1024 characters, and at most
+`MAX_TELEGRAM_SENDS_PER_HOUR` an hour. The answer says whether it went,
+and why not in the words a turn's files use. With `--text "..."` (or
+`--text -` for stdin) it sends words instead of a file (GitHub 420), to
+the same chat under the same checks and the same hourly count: up to
+`MAX_TELEGRAM_SEND_TEXT_CHARS`, secrets hidden as in an answer, and sent
+the way an answer is (`telegram.send` with Markdown, so `<code>` and
+`<pre>` stay tap-to-copy and a long text is split), each message only
+while the pairing holds. An answer that stopped partway says how many
+messages went, so the agent does not send it all again. `--silent` sends
+either without a sound (`disable_notification`), for a batch. A paired
+agent is told the command alongside `owlbot share`.
+
+While a Telegram turn runs the chat shows "typing" (`keepTyping`).
+Completed visible notes from its consuming turn go out as new silent messages
+in order, starting after twenty seconds (`telegram.Progress`, fed from stored
+bot text through request-scoped `TurnProgress`). Notes in the first twenty
+seconds or within the four-second throttle are batched; a batch over 4,000
+UTF-16 units splits at whole-note boundaries. Only an individually oversized
+note is cut with an ellipsis. The latest text stays pending until a following
+tool or another visible text confirms it as a note, so a delayed turn-end
+event cannot send the final-only reply as progress. Reasoning items and tool
+names do not feed the messages; without a note there is nothing extra. Notes are never edited.
+Cleanup cancels pending notes, awaits the post in flight, and deletes every
+known message before the new notifying answer or notice. A failed deletion
+does not prevent the answer. While a card waits on the person neither typing
+nor notes post, since the agent is waiting then. An uncertain post suppresses
+further notes in that turn because its message may have arrived without an id.
+The tool line is deliberately removed. Normal answers take the last eligible
+text after the request in its consuming turn, with waiting rows excluded;
+completion captures that span before a later turn starts. The request keeps
+its chat until that logical turn settles, with no deadline: a card answered
+later on the phone, a retry, a handover to the backup or a fold of the
+conversation keeps it waiting, and a later turn or another lane neither
+delays nor supplies its answer. Files come from the same span. An end seen
+while a steer is still being asked counts only when it was the turn the
+words joined. A turn that ends without running (refused before its engine,
+a pickup or a queued start that could not begin, an engine removed under
+it, a fold that failed) answers with why. Retiring the connection or taking
+the words back ends the wait. Drain returns keep
+their existing `after` span and have no notes messages. With no reply, a plain
+redacted notice is sent; only a turn with neither keeps the empty-answer line.
+
+## Teams as files
+
+`server/team-file.ts` reads and writes a team as one Markdown file: a
+heading per member, a few `key: value` lines, and the brief as the body.
+A member may name library skills it uses (`uses:`), and the top block or
+a member's section may carry `routine:` lines (`weekdays 09:00 | name |
+what to say`). Rooms export to it, imports go through it, and the gallery
+at owlbot.dev/teams is checked with the same parser before anything
+reaches the hire dialog.
+
+## The catalogue
+
+`catalog/` in this repository holds ready teams (`teams/<id>.md`) and
+skills (`skills/<id>/SKILL.md`, the open format: `name` and `description`
+on top, a `metadata` block for a title, version, author and tags).
+`scripts/build-catalog.mjs` writes `catalog/index.json` from them with
+each item's id, kind, title, summary, tags, author, version, path, size
+and sha256, and `test/catalog.test.ts` fails when the checked-in index is
+not what the build writes or an item breaks the house rules.
+
+`server/catalog.ts` is the pure part: reading an index, building one,
+SKILL.md in and out, links, the review (`teamPlan`, `skillPlan`), the
+update (`teamChanges`) and cleaning a file for sharing.
+`server/catalog-source.ts` fetches the index from `catalogUrl()` (the
+environment's `OWLBOT_CATALOG_URL`, then `catalog.url` in config.json,
+then this repository's raw main branch), holds it for half an hour, and
+keeps it with every item under the workspace's `catalog/`, items named
+by their sha256 and hashed again when read. A failed fetch answers from
+that copy with `offline: true`. It also keeps `catalog-installs.json`:
+each team installed from the catalogue or a link, with its room, the
+agents it made and what each was given, which is what an update is
+measured against.
+
+Routes, all the owner's (an agent token gets 403, members never reach
+them):
+
+| Route | What it does |
+| --- | --- |
+| `GET /api/catalog` | The index, each item with where it stands here (`standing`), and `offline` |
+| `GET /api/catalog/:kind/:id` | One item's file, checked, and read |
+| `POST /api/catalog/review` | `{ kind, id }`, `{ url }` or `{ text, filename }`: the plan an install would carry out, and a token for it. Creates nothing |
+| `POST /api/catalog/install` | `{ token, names?, mode? }`: installs what that review showed, once |
+| `GET`, `PUT /api/catalog/source` | Where the index is read from |
+| `GET /api/owlbot/:id/team.md` | A room as a catalogue team file, cleaned |
+| `GET /api/skills/:id/skill.md` | A skill as a catalogue SKILL.md, cleaned |
+
+An install of a team creates new agents with `composio: false`,
+`browser: false` and no MCP servers, a room around them, the catalogue
+skills they use that the library does not have yet, and their routines
+with `enabled: false`. An update (`mode: "update"`) matches members by
+role: an agent whose description or skills changed here since the
+install keeps them, new members join the room, new routines are filed
+paused, and nothing is removed. `owlbot://install?url=` (electron/links.mjs)
+opens the same review for an https link.
+
+`owlbot-server team apply` reads the same file into a workspace that may
+have the team already (`POST /api/teams/apply`, `server/team-apply.ts`).
+The room is found by its name, a member by the name the file gives it or,
+unnamed, by its role among the room's members; what matches is updated
+in place, what is missing is hired with the workspace's defaults for a
+new agent, and what is the same is left alone, so a second apply changes
+nothing. The lead the file ranks highest is crowned on that room alone.
+A member's look is applied only where the file states one, since the
+parser fills one in otherwise. Nothing is archived or deleted; `prune`
+takes the members the file no longer lists out of the room, and the
+agents stay. The plan is a plain function of the file and the workspace,
+so a dry run and the real apply cannot disagree.
+
+## Runs from a script
+
+`POST /api/runs` sends the owner's words to an agent, as typing them in
+the app does, and returns a run (`server/runs.ts`) that `GET
+/api/runs/:id` long polls. A run is the set of conversations the task
+reached: the one it went to, and every conversation an agent in the run
+hands work to (`sendUserMessage`, from the sender's lane in its chain)
+or a room it speaks into. It reads what happens off the same message
+frames the app folds (`broadcast`), its spend off the turn log, and how
+each lane's turn really ended off `settleOwners`, after retries and
+backups. It is done when every one of its conversations has been quiet
+(`laneQuiet`: not busy, not claimed, nothing queued, no changes card
+being made, no goal running) for a moment and a half on end, which is
+past the gap between a turn ending and the turn its handoff starts. An
+open card makes it `needs-you`; nothing in a run answers one.
+`POST /api/runs/:id/stop` stops every conversation in it. The owner's
+alone, from this computer or one of their devices; runs are in memory
+and a restart ends them. `owlbot-server run` and `owlbot-server chat`
+(`server/scripting-cli.ts`) are the two clients, described in
+[SCRIPTING.md](SCRIPTING.md).
+
+## The morning brief
+
+`server/brief.ts` composes a brief from what is already stored: each
+agent's lanes since the last brief (the last reply's first sentences and
+how many files its change cards touched), the live questions and
+approvals (`waitingOnYou`), the day's usage buckets, and counts of things
+ready for a look. No model call. A minute timer makes one when the chosen
+time has passed and today's has not been made (`briefDue`), and a
+`brief.ready` frame wakes the owner's phone with a sealed preview.
+Rule suggestions (see Rule suggestions) are one of those counts.
+`/api/briefs/:id/parts/:n/audio` speaks one part in that agent's voice,
+or a Mac voice picked per agent. Quiet check-ins (see Routines) are left
+out of what an agent worked on and said as one count at the end of its
+part ("12 quiet check-ins, nothing needed you"); they are not things in
+the headline, and a night of nothing but them is still a quiet night,
+which wakes no phone.
+
+It leads with outcomes (GitHub 378). Every agent's repeating routine
+that is on, and every watcher that is on, is a card (`BriefResult`):
+what it last reported, as its agent wrote it and cut at a line
+(`excerpt`), with when, and whether that was within the brief's stretch
+of time (`fresh`). A gap is a card too: a run due and not run is
+`late`, a failed run or look is `failed`, and a run that went fine is
+only `reported` or `quiet`, never healthy. With cards, the headline is
+what came in, what is missing and what waits on the person; the turns
+routines and watchers started are left out of the agents' parts, since
+their cards say them. `GET /api/briefs` adds `live`, every card as it
+stands now (a report that comes in after the brief updates its card,
+without a notification), and `sections`, every section in the person's
+order: a card per source and the brief's own `waiting`, `failed`,
+`agents` and `memory`. The person pins, orders and hides them
+(`cfg.brief.layout`, read by `briefSettings`, arranged by
+`arrangeSections`, which puts a source made since beside its
+neighbours). A hidden source does not feed the brief.
+
+The brief is the one notification of the morning (`briefNotice`): on
+unless `notify` is off, never on a quiet morning unless `allClear` is
+on. Its `brief.ready` frame names the brief (`id`), so a tap opens that
+morning's: the phone's sealed preview carries `briefId`, a background
+workspace's server gives the desktop app a `brief:<id>` banner target
+at the "activity" level (so a workspace's mute and level apply), and
+the window on screen says it itself unless Overview is in front. A
+routine with `briefOnly` sends no `reply.settled` for its runs while
+the brief is on (`briefOnlyTurn`), unless the person joined the turn;
+its turn is told its answer opens a card (`BRIEF_ASK`).
+
+### The person's list
+
+A report that finds something only the person can do (a disk to
+replace, a reply they owe) is counted, not read out of the report:
+the agent puts it on the person's list (`server/todos.ts`, GitHub 378
+and 430), kept in `todos.json`. A line is a title of what to do (140
+characters), an optional detail (500), the conversation it was said in
+(the turn's lane), and the routine whose run said it when one did
+(`openRuns`). Each agent keys its own lines: `POST /api/bots/:me/todos`
+with a key it already used refreshes that line (newest words, `times`
+counted) instead of adding one, so a daily report of the same disk is
+one line however many mornings say it. The person closes a line with
+`POST /api/todos/:id/done` or `/dismiss`; the agent clears its own with
+`DELETE /api/bots/:me/todos/:key` once it no longer needs doing, which
+is how a recovered failure leaves the count. A dismissed line stays
+dismissed when it is reported again, until its agent clears it; a line
+marked done and reported again is a new line, since it did not hold.
+An agent has at most 20 open lines; a closed line goes thirty days
+after it was last said, and an agent forgotten for good takes its lines
+with it, while an archived one's wait with it.
+
+`waitingOnYou` lists the open lines after the live cards, as
+`BriefWaiting` with kind `todo` (`messageId` is the todo's id and
+`threadId` its conversation, so a client that knows only questions and
+approvals opens the conversation), so the brief's headline, its
+`quiet`, its notification and `/api/waiting` count them with the rest:
+two reports and two lines read "2 reports in, 2 things waiting on you."
+`GET /api/briefs` adds `todos`, the list as it stands (open, then
+closed in the last week), which the newest brief shows live and an
+older one reads to say how each of its lines ended. A routine's run
+with the agent's own credential is told about the list in its origin
+line (`todoAsk`); the agent's command line has `todo`, `todos` and
+`untodo`. `/api/todos` is on the agent guard's never list, and the
+routes under `/api/bots/:me/todos` refuse anything but that agent's own
+turn credential.
+
+## Routines and check-ins
+
+`server/routines.ts` keeps routines in `routines.json` and a thirty
+second timer (`runDueRoutines` in `server/index.ts`) fires whatever is
+due. A routine runs at a time of day on chosen days, once on a date, or,
+for an agent, as a check-in: `every` so many minutes (15 to 1440),
+within `activeHours` (`from` and `to`, local, on one day, both ends
+included) on chosen days. A check-in's slots start where its hours do
+and step by its interval, so they fall at the same times every day
+(`checkInsOn`); its `time` is its first slot, for clients that read only
+that. A missed slot fires once, within the grace window (two hours, or
+half the interval for a check-in, since by then the next one is nearly
+due), and never for a slot from before its schedule was set
+(`scheduledAt`, moved by a change of time, days, date, interval or
+hours). An interval or hours that cannot run, a check-in that is also
+once, and a check-in or quiet routine for a room are refused with the
+reason (`scheduleProblem`); a room's routine keeps to a time of day,
+since several agents answer it and a channel may be reading. The agent
+command line files one with `owlbot routine --every 30m --between
+09:00-18:00`, and `--quiet` for a time of day.
+
+A check-in is always quiet, and a time-of-day routine can be (`quiet`).
+Its prompt is marked `routine.quiet`, and the turn is told, in its own
+words after the line saying where it came from and never in the system
+prompt, which a resumed session keeps byte for byte, that if nothing
+needs the person it answers with exactly QUIET (`QUIET_ASK`). While it
+runs the lane is in `checkInTurns`: its start leaves the lane's unread
+as it was, its message frames carry `checkIn` so the app holds their
+speech (`CheckInHold` in `src/lib/notify.ts`), and an answer of QUIET
+(trimmed, any case, with a full stop or exclamation) is written with
+`quiet: true` at once. When the turn ends well with QUIET as its last
+words, nothing but words, tool calls, a screen or a compaction marker
+after the prompt, and none of the person's words joined it,
+`foldQuietRun` marks the prompt and everything after it `quiet`: no
+unread, nothing for a banner, a linked chat or the phone, the run is recorded
+`quiet` in its history (an "ok" run with the flag) and left out of the
+record, whose recent view a check-in every quarter of an hour would
+flood. A check-in that fails, reports anything else, raises a card or
+saves a file is shown like any turn, and its reply is said once when it
+ends (`reply.settled`, see Desktop banners). The chat folds a run of quiet messages into one muted line ("3
+quiet check-ins, last at 10:30", `quietRunAt`), which opens to show
+them; the sidebar's line and a lane's `lastAt` read past them.
+
+A turn that holds the agent's own credential is told to say the same
+thing with `owlbot quiet` (`QUIET_COMMAND_ASK`, and the "command" wording
+of `fromAgentPrompt`), keeping the bare word for when the command is
+unavailable. That is `POST /api/bots/:me/tasks/:id/quiet`, accepted only
+from the turn's own credential (`seq`, the lane's turn count when it was
+minted), only for a check-in or a turn nobody waits on (`unaskedTurn`),
+and only while nothing of the turn has reached the person: no text
+previewed or saved, no card, file or open question, none of their words
+in it or on their way in (`SteerHolds`). A question an earlier turn left
+open is not this turn's (`heldByRequest`, by the lane turn it was asked
+in): it stays open, on its card and waiting, and a turn finished quietly
+past it gives back the conversation's dot it took on starting, unless the
+person has opened it since. An approval, a question asked since the work
+began, one nobody knows the turn of, or any question in a retry, the
+backup or a pickup (whose work may be older than the conversation's
+latest turn) still refuses. A refusal is a 409 with a
+reason, and tells the agent to answer substantively. Once accepted
+(`QuietGate` in `server/quiet-finish.ts`), what the turn says is saved
+`quiet` and not previewed; a card, a file, a team proposal or a question
+from the same turn (`belongs`: the same runtime turn, or a request made
+with the same turn's credential) cancels it and gives back what it held,
+and so does a failure, a stop or a handover. Words that arrive after it
+wait for a turn of their own. A check-in finished this way folds like
+one that answered QUIET (`foldFinished`), and an agent's turn ends as
+one that said nothing.
+
+Each routine keeps what its last run that was not quiet said
+(`lastReport`, apart from the twenty `runs`, which quiet runs would
+otherwise push it out of), and its next turn carries it as a note before
+the prompt ("Last time this routine reported: ...", one line, about 600
+characters at most), so a run that lands in a fresh or summarised
+session still knows what it said. The note is said only as the turn
+goes; a replayed transcript has the answer in it already.
+
+The routine editor (`src/components/RoutinesDialog.tsx`) chooses At a
+time or Every, in minutes or hours, with hours and days, and the quiet
+switch for a time of day (`src/lib/checkIns.ts` holds its checks). The
+calendar in Automations draws a check-in as one thin band over its hours
+with a tick per run, rather than a card per run that would bury the
+week, as one chip a day in the month, and as a row in words in a
+Check-ins strip under the grid; its history folds a stretch of quiet
+runs into one row.
+
+## Webhooks
+
+`server/webhooks.ts` keeps each hook in `webhooks.json`: its target (an
+agent, a room or a workflow), the token in its URL, and its recent
+deliveries. `POST /hook/<token>` is the ingress, and by default the
+token is the whole credential.
+
+A hook can also be signed the Standard Webhooks way, which Svix, Clerk,
+Resend, Composio and others use. `POST /api/webhooks/:id/signing` with
+`{ generate: true }` makes a `whsec_` secret of 32 random bytes and
+answers with it that once; with `{ secret }` it takes the sender's own,
+`whsec_` and base64 or a raw string of at least 16 characters, and does
+not echo it. `DELETE` turns signing off. The secret is kept with the
+other saved keys in `config.json` (`webhookSecrets`, by hook id), so an
+unsealed backup leaves it out and a move names it to be entered again;
+the hook itself records only `signed: true`, and a signed hook with no
+secret on this computer refuses everything rather than taking the URL
+alone again (`secretLost` in the list). No route returns a secret after
+that first answer, and `storedSecrets` keeps it out of any message.
+
+A signed hook reads the body as bytes, within the same 2 MB limit, and
+checks it before it is parsed: `webhook-id`, `webhook-timestamp` and
+`webhook-signature` (or the same three `svix-` headers), an HMAC-SHA256
+over `${id}.${timestamp}.${body}`, base64, compared in constant time with
+every `v1,` entry. A timestamp more than five minutes off, or a
+`webhook-id` this hook accepted in the last ten minutes, is refused. An
+id is noted only once its event is accepted, so a sender told 503 can
+send it again; the ids are held in memory. A refusal is a 401 (413 for a
+body too large to check) with a short reason, reaches no agent, keeps
+nothing of the body, and is a row in the hook's recent deliveries
+("Refused: signature did not match"), the same refusal again counted on
+one row. Only the owner reaches these routes: members, admins and agents
+are refused (`server/member-access.ts`, `server/agent-cli.ts`).
+
+## Watchers
+
+`server/watchers.ts` looks at a folder (a snapshot of names, sizes and
+times, compared), a page (its readable text, hashed, with the new lines
+as the change, optionally only when it mentions something) or a feed
+(RSS or Atom entries not seen before). Folders are watched with
+`fs.watch` and settle for twenty seconds; everything is also looked at on
+its `every`. A check (`kind: "check"`) runs a command on its `every`:
+exit 0 is a finding, passed on with what it printed, and exit 1 is
+nothing (`checkOutcome`). A first look is a baseline, and a check counts
+only a new finding, so one that always exits 0 the same way never acts;
+filing or changing a check to an obvious no-op (`true`, `:`, `exit 0`)
+answers with a note saying so and pointing at a check-in routine
+(`constantCheck`), since a watcher is not a timer. A change becomes a turn in the
+agent's first conversation or the one the watcher names (see Lanes), or a
+rehearsal (`openRehearsals`), with the message marked `via: "watcher"`.
+A look is skipped while the agent is busy, so its own edits are not news
+to it, and `mayFire` caps a watcher at its `perHour` turns an hour: 1 to
+30, kept within those bounds as `every` is, six unless set, and six for
+a watcher saved before it could be set. Through an agent's credential it
+is at most six on a watcher the agent files and no higher than it is on
+one it changes (`agentPerHourCeiling`), with a note saying so; the page
+shows the control only where the limit can bind (a folder, a place, more
+than one look an hour, or a finding held now). `fires` keeps the newest thirty,
+enough to count the highest limit. A look the cap holds back does not
+take what it saw as seen: the watcher is marked `held`, the minute tick
+looks again as soon as the hour allows (`nextAllowedAt`, also a sleeping
+machine's next wake), and the finding is still news then (GitHub 496).
+A place crossing held that way counts as fresh from when it was first
+held. A limit raised past what the hour started gives a held finding its
+turn at once.
+
+Each watcher keeps its last fifty looks (`server/watcher-looks.ts`):
+when, the outcome (`fired`, `quiet`, `held` with `nextAt`, `busy` for a
+look skipped while the agent worked or was held, or because other checks
+were running, and `failed`) and one line of at most 200 characters (the
+first line of the finding, the redacted error, or why it skipped). Looks
+that run alike in a row (quiet, busy, held, with the same line) are one
+entry with a `count` and `from`, so a long turn's skipped looks cannot
+push a held one out. Holds the watcher already shows as a standing state
+(its engine paused, waiting for approval, past the chain limit) are not
+looks, and an app watcher's history stays its `app.runs`. Because
+watchers.json is written whole at every look, the looks go to a file of
+their own, `watcher-looks.jsonl` (0600), one appended line per look,
+rewritten with only what is kept once it holds four times the most fifty
+watchers keep, and at once when a watcher is removed, so nothing it found
+stays on disk after it. `GET /api/watchers/:id/looks` answers them newest
+first, followed by turns in `fires` older than the oldest look, so a
+watcher from before this, or one that rarely acts, still shows when it
+did; an agent may read only its own (`owlbot watch-history`). They are
+not in the list, which every look redraws.
+
+A workspace keeps fifty watchers (`MAX_WATCHERS`), finished ones
+included, so the list doubles as a history of what ran. At the limit,
+every way of filing one (the person, an agent, an admin's app watcher)
+lets the watcher that finished longest ago go to make room
+(`roomForWatcher`). A paused watcher is never taken, nor a finished one
+whose look or turn is still going, nor an app watcher whose trigger is
+still at Composio, which only Remove takes down. With none of those to
+spare, the new one is refused.
+
+A place watcher (`kind: "place"`) waits for the owner to arrive at a
+place or leave it, by a name as the phone gives it ("Toronto", "Paris,
+France": every part has to be one of the reading's names) or by
+coordinates and a radius (100 m to 50 km, 500 unless said). It has no
+schedule: it is asked as a reading arrives (`lookAtPlaces`), and on the
+minute tick only while a crossing waits, so a reading that changes
+nothing writes nothing. Its `seen` is the side it last saw and since when,
+by the phone's clock (`placeStep` in `server/location.ts`). The first
+side is a baseline, taken only from a reading under six hours old. A
+crossing fires only if the reading is under thirty minutes old and the
+side it left had held ten minutes, or was the baseline; one that does not
+fire still moves the side, so a late or wobbling crossing is never acted
+on afterwards. A point needs a reading with coordinates accurate enough
+to tell (better than twice the radius, or a kilometre), and counts as
+gone only past the radius and a margin of half of it (at least 150 m);
+while readings carry no coordinates the watcher says so as its last
+error. `once` finishes it after one turn and `until` at a time, both as
+`done` with the watcher switched off; switching it on again clears that.
+Sharing turned off, Forget, or the last phone unpaired clears every
+place watcher's side. Only the owner's own agents may keep one, it speaks
+only in the owner's own lanes, and it is not counted for a hosted
+machine's next wake.
+
+### App watchers
+
+An app watcher (`kind: "app"`, `server/app-watch.ts`) acts on an event
+in an app connected through Composio. Its `app` holds the toolkit and
+trigger type by Composio's names, the config the type declares (checked
+against the type's JSON schema by `checkConfig`), the connected account,
+an optional filter of plain words, `perHour` (6 unless set, at most 30)
+and `perDay` (30, at most 200), the trigger instance id once there is
+one, and `runs`, newest first, what each event became: `started`,
+`queued`, `filtered`, `held`, `failed` or `missed`, with the lane and
+message of the turn it started. Its target only reads `toolkit/TRIGGER`.
+
+Composio's trigger side is its project REST API, v3.1, with the project
+key (`ak_`, `composio.apiKey`), in `server/composio-triggers.ts`: trigger
+types per toolkit, active connected accounts, `trigger_instances/{slug}/
+upsert` with the account and the config, `manage/{id}` to switch one on
+or off or remove it. The Connect key that opens connections is not taken
+there. A desktop app has no public address, and Composio delivers to a
+webhook URL, so events arrive the way Composio's own SDK subscribes: its
+realtime channel, a private Pusher channel per project
+(`private-{project}_triggers`) authorised through Composio with the
+project key, spoken directly over the WebSocket Node has, whole events
+and chunked ones. One connection serves every app watcher and exists only
+while one listens (`syncAppDelivery`); it reconnects on its own with a
+growing wait, stops on a refused key, and pings a quiet line. It sits
+behind `TriggerDelivery`, whose `catchesUp` says whether events sent
+while it was down arrive later: false for the realtime channel, which
+does not replay, true for a webhook through the relay should one be
+added. Since it does not catch up, the time it was not listening is
+recorded: `app-delivery.json` keeps when it last heard (written each
+minute while live), and coming up after a gap of two minutes or more
+records a `missed` run on each listening watcher, from the later of then
+and when that watcher started listening.
+
+An event (`readEvent`, Composio's V3, V2 and V1 envelopes alike) goes to
+the watchers whose trigger it names; others are dropped unread. Each is
+handled once by its id (`firstHearing`), then the filter (words in the
+event's values, never its keys, as an intent matches), then the limits,
+then a turn: the event cut down by `trimPayload` (credentials by name and
+blobs by shape left out, HTML read as words, long text and lists cut),
+fenced between markers carrying a nonce made for the turn, under a line
+that says whose words they are (`appEventTurn`). The turn goes where any
+watcher's goes, or queues behind a busy lane, with `via: "watcher"`.
+
+The owner makes one in Watchers or with `POST /api/watchers`, which makes
+the trigger at Composio first. An agent's `POST` is always a proposal:
+nothing at Composio, the watcher off, and a card in the conversation it
+asked from (`card.appWatch`) answered with `POST /api/watchers/:id/
+confirm` or `/decline`, which no agent rule reaches; an agent may
+withdraw its proposal or stop its own, and may not change one. Switching
+one off switches its trigger off; on again asks Composio whether the
+account is still connected first. A different event, config or account is
+a new trigger instance, the old one removed. Removing a connection in
+OwlBot, a lifecycle event saying an account expired (should Composio send
+one down the channel), or the quarter-hourly look at each listening
+watcher's account finding it gone pauses every watcher on it with
+`paused` and a notice in its conversation. An admin manages their own
+through `/api/member/app-watchers` (`server/member-access.ts`): only for
+an agent whose team conversation they are on, its turns there as the
+admin's own, never rehearsing.
+
+## Location
+
+`server/location.ts`. The owner's iPhone says where it is, once the owner
+turns Location on in the app there: `POST /api/location` with whether it
+is sharing (`on`, `paused` or `off`), whether it shares with the app
+closed, and when on, one reading: when the phone took it, the place in
+words from the phone's own geocoder (city, region, country, time zone,
+and the neighbourhood only with a full accuracy fix), and coordinates
+with their accuracy only when the owner also turned on Exact position.
+Only a paired owner device reaches the route: the guard names the
+device, a member's device is answered by `serveMember` and never gets
+there, an agent's credential is refused (`NEVER`), and a loopback window
+has no phone to speak for. A hosted workspace refuses it
+(`hostedRefusal`): a place goes only to a computer of the person's own.
+Each field is checked; a reading from more than five minutes ahead of
+this clock, or more than a week old, is refused, and a phone may report
+120 times an hour.
+
+The server keeps the newest reading and each phone's choice in
+`location.json`, `0600`, never a history, and leaves it out of backups
+and moves. An older reading than the one kept changes nothing. Off
+forgets that phone's reading; paused keeps it for the owner's own
+Settings but no agent hears it and no watcher acts on it. Revoking the
+phone, or switching pairing off, forgets it all. `GET` and `DELETE` are
+the owner's: the desktop's Location card under Phone and devices shows
+the last place, its age, which phone and how exact, and Forget.
+
+An owner's turn is told one line ahead of its text while sharing is on
+and the reading is under six hours old: "Sam is in Queen West,
+Toronto, Canada, approximately, as of 10 minutes ago, from their
+iPhone." Only the owner's own turns in the owner's own lanes: never a
+member's turn or solo agent, a Telegram person's, a stranger's mail, a
+team lane, a member's lane or a shared room. `owlbot location` (`GET
+/api/agent/location`, under the same refusal) answers the reading with
+its age in minutes, `current` up to fifteen minutes, `recent` up to six
+hours and `old` after, how exact it is, and a note on what it is good
+for. `--fresh` puts one private `location-request` frame with a one-time
+id on the owner's own streams and, sealed, to owner devices through the
+relay (as Device settings asks), and waits up to fifteen seconds for a
+reading taken after the ask. A phone answers only while the app is open
+and sharing; otherwise the answer says no reading came and why, and the
+old one is never relabelled as new. Asks within ten seconds share one.
+A report starts no turn and posts nothing; only a place watcher's
+crossing does (see Watchers).
+
+A phone gates all of it on `location` in `/api/health`.
+
+## Standing intents
+
+`server/intents.ts` is the third trigger beside routines (a time) and
+watchers (something outside): words that come up in a conversation. An
+intent is up to twelve phrases, where it listens (everywhere, meaning
+every agent's own conversations and every room not shared with other
+people, or named agents and rooms, a shared room only when named) and
+one action: a note posted in that conversation in the person's words, an
+agent brought in (woken in the room when it is a member, otherwise sent
+the excerpt in its first conversation, and the conversation says so), or
+a short message to an agent. Intents live in `intents.json`.
+
+Every appended message is checked (`checkIntents`, from
+`store.onAppend`): text only, not deleted or quiet, never a machine's
+words (`via` other than a chat platform), a Telegram stranger, the
+sender's copy of an agent message, a stranger's mail lane, a rehearsal or
+a shared room's own lane. Matching is a pattern per phrase, any case, on
+word boundaries, with a trailing `*` open; no model. A fire is recorded
+before it acts, and the action runs after the message's own append has
+gone out. The guardrails are on the intent: once per conversation per
+cooldown (24 hours unless set, 1 to 168), three fires in any 24 hours,
+and 90 days from making, approving or renewing, after which it reads
+expired until renewed. It never hears its own output or another
+intent's: its notes carry `intent`, its messages `via: "intent"`, a bot
+reply in a lane whose turn an intent's message started is skipped
+(`startedByIntent`), and so is what an agent it woke in a room says for
+the length of a room turn (`intentWoken`). An intent that would bring
+an agent in to its own words, or into its own conversation, does not.
+
+The person makes, edits, pauses, renews and deletes intents in
+Automations, Intents (`src/components/IntentsTab.tsx`), and the phone
+through `GET`, `POST`, `PATCH` (`enabled`, `approve`, `renew`, any
+field) and `DELETE /api/intents`. An agent's `POST` (`owlbot intent`) is
+always a proposal, listening only in its own conversations and rooms it
+is in, at most five waiting; it does nothing until approved, the agent
+sees and withdraws only its own proposals, and the brief counts them as
+ready for a look.
+
+## Skill versions
+
+`server/skill-history.ts` keeps every version of every skill of the
+person's, whole, in `skill-history/<id>.json` beside the skill's own
+file: its number (never reused or renumbered), when, who (`person`,
+`agent`, `proposal`, `catalog`, `import`, `file`, `migration`,
+`builtin`), why in one line, and the name, description and body. The
+file under `skills/` stays the truth. Every write goes through
+`installSkill` (`server/skills.ts`), which first brings the record in
+line with the file: a skill with no record becomes version 1 as it
+stands, and a file edited by hand since its last version is kept as a
+version "changed outside OwlBot" before anything is written over it. The
+server does the same for every skill as it starts
+(`migrateSkillHistory`), so a skill from before versions comes in whole.
+Reading the library never writes. A hundred versions are kept, the first
+always among them.
+
+A writer may say which version it read (`from`). When the skill has
+moved on since, nothing is written and the answer is 409 with the
+current version, so two writers that read the same version cannot both
+land. A built-in is version 0 and never changes: the first change to one
+(`POST /api/skills/:id/fork`, or keeping a suggested change to it) makes
+the person's own copy under the same id, whose history starts with the
+text as it ships, and removing the copy brings the built-in back.
+
+The routes: `GET /api/skills/:id?version=n`, `GET
+/api/skills/:id/history` (newest first, each version with its uses and
+corrections), `GET /api/skills/:id/history/:n`, `GET
+/api/skills/:id/diff?from=a&to=b` (by default the last change), and the
+person's own `PUT /api/skills/:id`, `POST /api/skills/:id/restore` (a
+new version that names the one it put back) and `POST
+/api/skills/:id/fork`. Each refuses an agent's credential as well as
+being off its list. The ledger records `skill.changed`.
+
+`server/skill-usage.ts` counts uses in `skill-usage.json`, once a turn
+and against the version current then: a skill the person named with a
+slash, or one an agent read in full in a turn. A use is corrected when
+the person's next words in that conversation read as putting the agent
+right (`looksLikeCorrection` in `server/proposals.ts`). Counting spends
+nothing and happens whatever the suggestion setting.
+
+### Suggestions from a turn
+
+After a turn ends (and not one handed to a backup engine, which is not
+over yet), `settleSkillUses` gathers what the turn used and the turn
+before it used, and `turnSigns` reads the transcript for tool calls,
+failures, a failure worked around, and a correction at the start of the
+turn or during it. `whatToLearn` decides, without a model, whether a
+review is worth a call and of what: a skill used and then corrected, or
+used while a step failed and was worked around, gets a revision of that
+skill (one call, `revisionPrompt`, answered with WHY, LESSON and
+find-and-replace edits); otherwise a new skill is looked for after a
+conversation that went back and forth, many tool calls, a recovery or a
+correction (`reviewPrompt`, and `patchPrompt` when it names a skill that
+exists). The setting is `skills.learn` in `config.json`: `off` (the
+default, and what an unset value reads unless the old `skills.propose`
+switch was on, which reads as `suggest`), `suggest` (clear signs only,
+at most 20 reviews a day) or `more` (weaker signs, and any turn that
+used a skill for real work, at most 60). Shared rooms, members' lanes,
+Telegram people, strangers' mail and engine commands are never read
+back, as before.
+
+Everything a review reads is framed as data (`DATA_NOT_INSTRUCTIONS`),
+and what it writes passes through the secret scrubber before it is
+staged. Nothing is ever applied: a suggestion waits in `proposals.json`
+with its reason, its trigger and the version it was read against, and
+`GET /api/skills/proposals` shows a change as its diff against the skill
+as it is now. Keeping one (`POST /api/skills/proposals/:id`, the
+person's alone) applies edits to the skill as it is then.
+
+An agent asks for a change with `POST /api/skills/:id/revisions` (`owlbot
+skill revise <id> --from <version> --why "..."`, the text from `--file`
+or stdin; the MCP server's `propose_skill_revision`). The whole new text
+is staged with `whole` and `base`: refused at once when `from` is not
+the current version, and refused again when kept if the skill has moved
+on since, because kept on top of a newer version it would quietly undo
+it. The person may still keep their own edit of it.
+
+### A new skill an agent asks for
+
+Asked to make a skill and use it (GitHub 455), an agent sends the whole
+of it with `POST /api/agent/skills` (`owlbot skill create`), and the
+person answers one card in the conversation (`server/skill-requests.ts`,
+`src/components/SkillRequestCard.tsx`). A SKILL.md the agent writes in a
+folder is only a file: no agent reads it as a skill and `owlbot skills`
+does not list it until it is in the library. `--from <folder>` reads the
+folder's SKILL.md the way the catalogue reads one (its `name` is the id
+it keeps, its `metadata.title` or first heading the name people see) and
+every other plain text file beside it, skipping hidden files and tool
+folders; `--file` takes a single SKILL.md; flags win over the file. The
+request is checked whole before any card: a name and a one line
+description, instructions within the 16,000 character limit, the files
+within theirs, and an id said exactly (lowercase, digits and dashes).
+
+An id already in the library is never written over. The answer is 409
+with that skill's name, version and source, and the two ways on:
+`owlbot skill revise` it, or choose another `--id`. The one exception is
+the very same skill, words and files, which is a retry of a request the
+person already answered: the answer is `added` with `already`, and the
+skill is given to the agent if it asked, which it may do with any
+library skill through its own settings anyway. The same request sent
+again while its card waits finds that card (matched by a fingerprint of
+the whole request); a different version of the agent's own waiting
+request replaces it, and the older card says so. Another agent's
+waiting request for the same id is refused. At most 50 wait at once.
+
+The card carries what the person decides on (name, id, description,
+length, files by name and size, whether the agent wants it, why); the
+words themselves wait in `skill-requests/<id>.json` until the answer
+and are fetched when the card is opened (`GET
+/api/skill-requests/:lane/:message`). Add (`POST .../add`) judges the id
+again, writes the files, installs the skill as version 1 credited to
+the agent with `from: 0` (so a skill that appeared meanwhile is refused,
+not replaced), appends it to that agent's skills without touching the
+rest, and records `skill.installed`. Not now (`.../decline`) changes
+nothing. Both routes are the person's: on NEVER for an agent, and
+refused to a member. The command waits a while for the answer
+(`OWLBOT_SETTINGS_WAIT_MS`, as for a proposed setting), and otherwise
+answers `waiting` with the request id; `owlbot skill request <id>` waits
+again, and the agent's next turn in that conversation is told the
+outcome once. Statuses are `waiting`, `added`, `declined`, `failed` and
+`replaced`.
+
+### Supporting files
+
+The 16,000 character limit stays on a skill's instructions, because
+those may be sent whole on every turn. What does not belong in every
+prompt (an API reference, a helper script, a table) goes in supporting
+files beside it (`server/skill-files.ts`), under `skill-files/<id>/`:
+plain UTF-8 text, at most 40 files, 128 KB each and 768 KB in all,
+relative paths at most four folders deep with nothing hidden and never
+a root `SKILL.md`. A set is written to a folder of its own and swapped
+in whole, and removing a skill removes its files; they are not
+versioned with the skill's text. They are read only on demand: `GET
+/api/skills/:id/files` lists them and `?path=` reads one, opened inside
+the skill's folder (`server/open-inside.ts`) so a planted link leads
+nowhere. `owlbot skill <id>` names them, `owlbot skill <id> --file <path>`
+reads one and `--save <path>` writes it where the agent can run it. A
+short skill sent whole in the prompt carries one line naming its files
+and that command. An engine with no command line gets the instructions
+alone, which is why they have to stand on their own. The Skills page
+lists a skill's files under its instructions, each opening in place.
+Importing a skill in the app still takes one markdown file; a skill
+with files arrives through an agent's `--from`.
+
+## The nightly memory tidy
+
+`server/memory-tidy.ts` tidies each agent's memory once a night, between
+01:00 and 05:00 local, one agent per minute tick, skipping an agent that
+is working (it is looked at again next tick), archived or without memory,
+and anything while the shell has said the Mac sleeps (`macAsleep`) or
+OwlBot is draining. `memory.tidy` in config turns the night off; Tidy now
+(`POST /api/bots/:id/memory/tidy`) works either way.
+
+Lines ending `(until YYYY-MM-DD)`, which `memoryPrompt` teaches agents
+to write for temporary facts, are removed the day after their date, in
+MEMORY.md and topic files, with no model. Then, when MEMORY.md has at
+least three notes and has moved since the last tidy, one one-shot call
+(`generateText`, quick) on the agent's own engine, or the workspace's
+drafting engine when that one cannot, answers with line edits only:
+merge, reword (only if shorter), archive with a reason, and move to a
+topic only near the budget. `parsePlan` checks every line it names; any
+line not named stays byte for byte. Archived lines go to
+`memory/archive.md` with the date and why. Nothing is written if the
+agent started working or a file changed while the model thought.
+
+Each file written is one journal entry by `"tidy"` carrying the run's id
+(`MemoryEntry.tidy`), and `POST .../memory/tidy/:runId/undo` undoes the
+night newest first, leaving any file changed since and saying so. The
+run's diary (`diaryOf`) is written from what was done, not by the
+model; the log keeps two weeks per agent (`memory-tidy.json`). The
+Memory place shows the diary under the budget meter with Review and Undo,
+and the morning brief carries one line per agent (`Brief.memory`),
+never in its headline or spoken round.
+
+A watcher that fails three looks in a row (the page will not load, the
+feed is not one, the check broke) stops looking on its own, as a routine
+that fails three runs does (see The incident desk). Holds are not looks
+and never count.
+
+## The incident desk
+
+Failure used to leave a notice where it happened and nothing else, so a
+person found out late or not at all. `server/incidents.ts` makes it a
+thing somebody hears about. Each of these is an incident, with what
+failed, where (agent, conversation, room, routine, watcher, workflow and
+run ids), why (the failure's own words, redacted, one line) and when:
+
+- a solo turn that failed for good: after recoverTurn's own retry and
+  backup, never one that is asked again or handed on (`noteTurnEnd` in
+  `server/index.ts`)
+- a room turn that failed
+- a turn that stopped on a silent tool call (`tool_stalled`)
+- a routine's run, a watcher's look and a workflow's run that failed
+
+Not incidents: a stop, a command, a conversation folded and asked again,
+a rehearsal, a stranger's mail, a Telegram person's turn, a Fast Codex
+refusal, and a routine's or a workflow's own turn, which its run speaks
+for. `incidents.json` keeps the list, two hundred at most, the oldest
+settled ones going first.
+
+It goes to whoever leads (`chooseLead`): in a room, the room's lead
+(`leadOf`); otherwise the agent named in Settings, or the one agent more
+senior than every other (a tie at the top is nobody in particular). Never
+the agent that failed, and never one that cannot act: listed, not
+archived or held, on an engine whose turns get the command line. With no
+such lead it goes straight to the person.
+
+A lead gets one quiet turn: a note from OwlBot (`via: "incident"`, the
+note's `incident: { id, kind: "note" }`) queued into its first
+conversation like any message, told what failed and the three things it
+can do, and asked to answer QUIET, which folds the turn away as a
+check-in's is. With `owlbot incident retry|hand|tell <id>`:
+
+- retry tries the failed thing once more: the turn asked again the same
+  way (in memory, so not after a restart), the routine run now, the
+  watcher looking, the workflow fired with the same trigger. A retry turn
+  is not asked again or handed to a backup on top. One that works settles
+  the incident; one that fails puts it to the person.
+- hand sends a teammate what failed and what to do, as any agent's
+  message (the chain limit applies), and settles the incident.
+- tell puts it to the person with the lead's words.
+
+A lead turn that chooses none, or fails, leaves it with the person, and
+so does one that has not run within half an hour (`LEAD_WAIT_MS`).
+
+The person's card is a notice in the conversation or room where it
+happened, with `incident: { id, kind: "needs-you", state: "open" }` and
+text that says it all, so a client that does not know the field still
+reads it. It marks the lane unread, raises an urgent banner and wakes the
+owner's phone like a blocked goal, and Activity and the brief list it.
+Resolving patches the card to `state: "resolved"` with a `resolution`.
+
+The storm rules are pure and tested in one place. The same thing failing
+while its incident is open is counted on it (`count`), never a new one;
+nothing about an incident, its lead's turn or its retry, ever raises
+another. One automatic retry per thing (`subject`) a day and two per
+conversation (`thread`) a day. Past five incidents in an hour the desk is
+quiet: what fails is listed (`state: "muted"`) and handed to nobody, and
+the person gets one card (`kind: "summary"`) that keeps the count.
+
+`incidents` in `config.json` (`PUT /api/config`): `enabled` (on unless
+off; off raises nothing) and `lead` (`"auto"`, `"person"` or an agent id).
+
+Routines and watchers that keep failing stop. Three failed runs or looks
+in a row (`FAILS_TO_PAUSE`) set `failing: { at, error }` and the schedule
+stops (`isDue`, the watcher tick), while the routine stays on. A notice
+with `failing: { kind, id, name }` says so once, with Fix it, Pause and
+Remove on the desktop. A run or look that works clears `failures` and
+`failing`; so does any PATCH, the person's or the agent's own.
+
+### For a phone (feature `incidents`, `automation-failures`)
+
+- `GET /api/incidents`: `{ incidents, summary, desk, failing }`, newest
+  first. An incident is `{ id, kind (turn|stall|routine|watcher|workflow),
+  subject, thread, title, why, at, lastAt, count, where: { botId,
+  botName, laneId, roomId, routineId, watcherId, workflowId, runId },
+  lead: { kind: "agent", id, name } | { kind: "person" }, state
+  (with-lead|retrying|needs-you|muted|resolved), retriedAt, handedTo,
+  needs, card: { threadId, messageId }, resolvedAt, resolution, open }`.
+  `desk` is `{ enabled, lead }`; `failing` as in Activity.
+- `GET /api/incidents/:id`: `{ incident }`.
+- `POST /api/incidents/:id/resolve`: `{ incident }`, the person's alone.
+- `POST /api/incidents/:id/retry`: `{ ok, note, incident }`. The
+  person's retry is not held to the storm rules; a lead's is.
+- `POST /api/incidents/:id/hand` `{ to, note }` and `/tell` `{ text }`
+  (600 characters at most): the lead's, with its turn credential, only
+  while the incident is `with-lead`.
+- `GET /api/activity` adds `incidents` (open ones) and `failing`:
+  `[{ kind: "routine" | "watcher", id, name, error, since, failures,
+  botId?, targetId? }]`.
+- `GET /api/routines` and `/api/watchers` carry `failures` and
+  `failing`; a stopped routine's `nextRunAt` is null. Pause is
+  `PATCH { enabled: false }`, Remove is `DELETE`, and any PATCH starts it
+  again.
+- A brief may carry `incidents: [{ id, title, why, state, threadId,
+  needs? }]` and `failing: [{ kind, id, name, error, since }]`, and is not
+  quiet when it does.
+- The stream sends `{ kind: "incidents" }` when the list changes.
+
+## Meeting notes
+
+`electron/resources/speech-helper.swift --meeting [--system]` transcribes
+the microphone and, through ScreenCaptureKit (weakly linked, macOS 13+),
+the Mac's own sound, closing a recognition request at each pause so every
+stretch of speech is a segment. The renderer posts segments to
+`/api/meetings/:id/segments`; ending the meeting gives the chosen agent a
+turn in its Meetings lane with `notesPrompt`, and `actionItems` reads
+"- Owner: task" lines back out of the reply for one-press handoff.
+
+The helper is macOS only, while the preload offers `meetingStart` on
+every platform, so the window asks `meetingNotesHere` in
+`src/lib/thisComputer.ts`: the desktop app, on a Mac, not onto a hosted
+workspace. Anywhere else the chat header has no meeting button and the
+panel says meeting notes need the OwlBot app on a Mac.
+
+## The OwlBot browser
+
+A browser beside the chat that agents drive and the person watches and
+takes over: the desktop app's own when it runs the workspace, the
+server's when nothing does. The rules and the agent's commands are one
+file, `server/browser-core.mjs`, plain JavaScript that the app loads from
+its bundle and the server's build copies beside the compiled server.
+Four parts, each in its own place:
+
+- **The app** (`electron/app-browser.mjs`, wired in `electron/main.mjs`).
+  Each workspace has one `AppBrowser`: its tabs, who drives each (the
+  person or an agent, by id and name), who has the wheel (`idle`,
+  `agent`, `person`, with whom the person took it from and who waits),
+  and its downloads. A tab is a `WebContentsView` in the session
+  `persist:owlbot-browser-<workspace>`, sandboxed, with no preload, and
+  with its `webContents.debugger` attached. An agent's command is a
+  short run of Chrome DevTools Protocol calls on that debugger
+  (`runOnTab`): `Accessibility.getFullAXTree` for a snapshot, whose refs
+  (`e1`, `e2`) name `backendDOMNodeId`s and last until the next
+  navigation; `DOM.getBoxModel` and `Input.dispatchMouseEvent` for a
+  click, after `Runtime.callFunctionOn` asks what is really at the
+  element's middle; `DOM.focus` and `Input.insertText` for typing;
+  `DOM.setFileInputFiles` for an upload; `Page.captureScreenshot` for a
+  picture. Every call is bounded at twenty seconds. `refusedNavigation`
+  and the server's navigation policy are applied on `will-navigate`,
+  `will-redirect` and `setWindowOpenHandler`, and loopback requests to
+  any OwlBot port are cancelled in the session's `webRequest`. The panel
+  in the page tells the app where its page box is (`browser:bounds`, null
+  while a dialog or menu is over it, so the native view never covers
+  one) and what the person does (`browser:do`, a fixed list of actions);
+  the app tells the page its state (`browser:state`) and asks for the
+  panel when an agent starts browsing (`browser:reveal`). The state
+  carries the last close (`closed`: who, `person`, `agent` or `page`, and
+  whether no tab is left), so the panel closes with the person's own last
+  tab, from any screen of theirs, and stays open on the empty page when an
+  agent closed it (`closesPanel` in `src/lib/appBrowser.ts`). Downloads go to
+  `<workspace data>/browser-downloads`. A page's dialogs are held rather
+  than drawn (`holdDialogs`): OwlBot replaces Electron's own listener on
+  the webContents' internal `-run-dialog` event, so an alert, a confirm
+  or a prompt becomes `AppBrowser.dialogOpened` with the callback that
+  answers it, and `-cancel-dialogs` closes it. Electron puts a "leave
+  this page?" to `will-prevent-unload` to be answered at once, so the
+  app stays (it never calls `preventDefault` by itself) and records a
+  dialog that is not `held`; a yes sets `tab.leaving` for twenty seconds,
+  and the next `will-prevent-unload` lets the page go. The agent's step
+  that ran into it, or the person's own panel step (`tab.redo`, kept two
+  seconds by `browser:do`), is made again on that yes.
+- **Dialogs, in both** (`server/browser-core.mjs`). Each browser reports
+  a dialog to `dialogOpened(tabId, { type, message, defaultPrompt,
+  answer, held, redo })`; `readDialog` keeps one of four kinds and the
+  words cut to 1,000 characters without control or bidi characters. The
+  agent's command is raced against a dialog on its tab (`#race`): the
+  dialog wins at once, the answer is `{ dialog }`, and the cut-short work
+  finishes by itself once the page is answered, its late snapshot
+  leaving the refs alone (`tab.run`). Anything but the `dialog` command
+  on a tab with a held dialog answers the question again without calling
+  the page, whose every call would only wait. `dialog accept|dismiss`
+  (with `text` for a prompt, else the text it suggests) calls `answer`,
+  then waits for the page to load and settle and snapshots it. A clock
+  of 30 seconds dismisses an unanswered dialog; the person taking over
+  stops it, giving back starts it again. What became of a dialog the
+  agent was told of (timed out, answered by the person, closed by the
+  page) is said with its next answer (`dialogNotes`). `state()` carries
+  each open dialog (`id`, `type`, `message`, `defaultPrompt`, and
+  `again` when a yes only lets the next try through), and the person
+  answers with `answerDialog`, by id.
+- **The server** (`server/app-browser.ts`, routes in `server/index.ts`).
+  `POST /api/agent/browser` takes an agent's command, checks it
+  (`validateCommand`), decides the site (`siteVerdict`: refused, denied,
+  go, or ask), asks the app over the desktop line (`desktopLine.ask("browser")`),
+  and frames what comes back (`frameUntrusted`); a dialog the step ran
+  into is said by `dialogWords`, the page's words framed, and the notes
+  by `dialogNoteWords`. A site to ask about, and
+  a password, payment or upload field the app reports as `needs`, become
+  an approval card in the agent's conversation with request id
+  `browser:<random>`; `/api/bots/:id/respond` hands the answer to the
+  `BrowserGate`, and the waiting action goes on, or is refused, or after
+  about two minutes answers `202 pending`, so the agent tries again and
+  finds the answer. While the person has the wheel, the app answers
+  `held`, and the server waits for its next `browser.state` before
+  trying again, up to a minute and a half. The settings are
+  `app-browser.json` in the workspace's folder (`GET`/`PUT
+  /api/browser/settings`); `GET /api/browser` and `/api/browser/frame` are
+  the person's other devices' view; `POST /api/browser/command` is the MCP
+  server's way in, local only, with no cards. A turn's site grants end
+  with the turn, and so does an agent's hold on the browser.
+- **A server's own** (`server/server-browser.ts`). Where there is no
+  desktop line (and the server is not hosted), `ServerBrowser` keeps an
+  `AppBrowser` whose tabs are pages of a headless Chrome (`launch` with
+  `headless`, profile `<data>/browser-session`, binary from
+  `OWLBOT_BROWSER` or `chromePath`), all on one browser socket with
+  flattened page sessions (`Target.setAutoAttach`, `waitForDebuggerOnStart`).
+  Each page gets `Fetch.enable` for documents and loopback requests, the
+  panel's size (`Emulation.setDeviceMetricsOverride`) and Chrome's own
+  user agent without "Headless", and only then runs. `Fetch.requestPaused`
+  applies `refusedNavigation` and, for an agent's tab, `allowedForAgent`,
+  failing a main-frame document with `Aborted` so the page stays where it
+  was. `Page.javascriptDialogOpening` becomes `dialogOpened`, answered
+  with `Page.handleJavaScriptDialog`, and `Page.javascriptDialogClosed`
+  closes it; a headless Chrome shows a dialog to nobody, and a
+  `Page.navigate` the page asks about leaving waits on it too. The
+  person's input stops at a dialog rather than waiting on it. A popup is
+  adopted as a tab driven by whoever drove its opener.
+  Downloads use `Browser.setDownloadBehavior` and are renamed with
+  `downloadName` when they finish. The agent's commands reach it through
+  the same `runBrowserCommand` as the app's (`askBrowser` in index.ts).
+  The person's side: `POST /api/browser/viewport` (the panel's size),
+  `GET /api/browser/screen?after=N` (a long poll for the next
+  `Page.startScreencast` picture of the shown tab, eight seconds and
+  spaced through OwlBot Cloud, twenty otherwise; asking keeps the pictures
+  running for fifteen seconds), `POST /api/browser/input` (mouse, wheel,
+  key and text events, bounded by `readInput`; a press or a key while an
+  agent drives takes over, a move or a wheel is dropped), `POST
+  /api/browser/do` (the app's `browser:do` list, less the computer's own
+  actions) and `GET /api/browser/downloads/:id`. `GET /api/browser` says
+  `where` the browser is, and `missing` when Chrome is not there or
+  `OWLBOT_BROWSER=off`. Chrome closes after ten minutes with no tabs and
+  with the server.
+- **The page** (`src/components/browser/BrowserPanel.tsx`,
+  `src/lib/appBrowser.ts`, `src/components/settings/BrowserPage.tsx`).
+  The dock on the chat's right, resizable and over the chat when the
+  window is too narrow, opened from the header's globe; tabs with the
+  driving agent's face, the address bar, back, forward, reload, the line
+  saying who has the browser with Take over and Give back, the bar for a
+  page's dialog under it (`DialogBar`, from `dialogBar`: the page's host
+  asking, its words, OK and Cancel or Leave and Stay, a field for a
+  prompt; while an agent drives, only that it waits on the agent), and
+  the downloads shelf. The page learns where the browser is
+  (`useBrowserHome`): "own" when the app answers `browser:state` for this
+  workspace, else the server's `where`. For a server's browser the same
+  panel draws the page itself (`Screen`: the pictures, the pointer, a
+  hidden field for keys, paste and composition, a tap and a swipe on a
+  touch screen, `screenInput.ts` batching it all), and the server's
+  `browser.reveal` frame opens it where it fits beside the chat. Where
+  the app runs the workspace on another computer, the agent's
+  conversation shows "Browsing in the desktop app" from the server's
+  `browser.app` frames, with the picture from `/api/browser/frame` every
+  two seconds while visible.
+
+### Chrome extensions in the OwlBot browser
+
+The owner may add unpacked Chrome extensions to a workspace's browser in
+the desktop app (Settings, Browser, Chrome extensions;
+`electron/browser-extensions.mjs`, `src/components/settings/BrowserExtensions.tsx`,
+GitHub 510). Only into that workspace's session,
+`persist:owlbot-browser-<workspace>`: never the session the app's window
+runs in and never another workspace's. Adding starts at the system's own
+folder window (`browser-extensions:pick`), and `add` takes only a folder
+picked that way in this run, so no page and no agent names a path for
+it. `inspectFolder` refuses a folder with a link, more than 5,000 files
+or 100 MB, and reads `manifest.json` (a `__MSG_` name from its default
+locale) into what the owner sees first: name, version, manifest version,
+the sites it reads and changes, its permissions, and `compatibility`,
+what works here and what does not. The folder is copied to
+`<data>/browser-extensions/<slug>/` and walked again before Electron
+reads it, kept in `browser-extensions.json`, and loaded with
+`allowFileAccess: false` each time the workspace's browser is made
+(Electron forgets extensions at quit). Switching off removes it from the
+session; Remove also deletes the copy, and only ever a path under the
+copies folder.
+
+What works, as Electron supports it: content scripts, a background page
+or service worker, `chrome.storage`, `runtime` messaging, `scripting`,
+`tabs` in part, `webRequest`, `management` and `i18n`. What does not, and
+is said before adding: devtools panels, keyboard shortcuts, side panels,
+`activeTab`, native messaging (a password manager's link to its desktop
+app; Electron has no `connectNative` or `sendNativeMessage` at all),
+context menus, notifications, identity, cookies, alarms,
+declarativeNetRequest, downloads, history and bookmarks, and anything
+Electron does not list.
+
+An extension's toolbar popup and options page are the owner's to open,
+from the extensions button in the OwlBot browser's toolbar
+(`src/components/browser/ExtensionsMenu.tsx`), so a password manager can
+be unlocked and set up. `pagesOf` reads `action.default_popup` (or
+version 2's `browser_action`/`page_action`) and `options_ui.page` (or
+`options_page`) from the copy, as paths inside it that are there, never a
+link, another scheme or a path that climbs out; `pageUrl` makes the
+`chrome-extension://<id>/` address only for an id Chrome gave. The bridge
+call `browser-extensions:open` (the app's page only, a workspace this app
+runs, an extension the owner switched on and Electron has loaded) opens
+the page with `electron/extension-windows.mjs`: a window of its own in
+the workspace's browser session, sandboxed, with no preload of ours, no
+debugger, and no place among the tabs, so no agent's tab list, tab
+picture or command reaches it. Its picture is kept from the screen's own
+capture (`setContentProtection`), so an agent working the computer
+cannot read a vault off the screen either. A popup is frameless, sits
+under the button, sizes itself to its page within Chrome's 25 to 800 by
+600 pixels (`enablePreferredSizeMode`), and closes when the focus goes
+elsewhere; an options page is an ordinary window. Either goes only to
+its own extension's pages (`isPageOf`): a link out of them is opened as
+the person's tab in the OwlBot browser under `refusedNavigation`, and a
+window it tries to open is refused. Switching the extension off,
+removing it or forgetting the workspace closes its windows, and the app
+never takes one for a window of its own (`isWorkspaceWindow`,
+`pointWindows`).
+
+Being a page of its own rather than a bubble over a tab, a popup cannot
+tell which tab is the person's (`chrome.tabs.query({ active: true })`
+answers the popup itself, since it has the focus), so a password
+manager's "fill" button in its popup does not reach the page; its fill
+on the page itself does, and the compatibility list says so.
+
+Agents never install, open or switch one. `chrome-extension:` addresses
+are refused in every tab (`refusedNavigation`). An extension moving a tab
+to its own page itself (`chrome.tabs.update`) starts no `will-navigate`,
+so a tab also stops such a navigation a tick after `did-start-navigation`
+(stopping inside that event crashes Electron) and blanks one that commits
+all the same; while one is shown, every agent command on that tab is
+refused and a mention does not read it (`isExtensionPage` in
+`server/browser-core.mjs`). An agent's commands are the fixed CDP list and
+never run in an extension's isolated world, and a password or payment
+field is still an approval card; after a fill, a password reads as dots
+in a snapshot and is absent from `read`. What an extension draws into a
+page itself (a badge, an inline fill menu) is part of that page, and so
+of an agent's picture of it.
+
+The rules for reading, judging, copying and keeping an extension live in
+`server/browser-extensions.mjs`, which the app loads through
+`electron/browser-extensions.mjs` as it does `browser-core.mjs`, so both
+browsers treat a manifest the same way. `compatibility(info, { host })`
+judges it against the browser it is for: `"app"` (Electron's part of
+Chrome's support) or `"server"`.
+
+#### In a server's own browser
+
+A server with no app behind it (`server/server-browser.ts`) runs a
+headless Chrome, which has nearly all of Chrome's extension support. Its
+extensions are kept the same way, in the workspace's data folder, and
+loaded each time that Chrome starts, before any page is made, over its
+debugging line (`Extensions.loadUnpacked`, which a current Google Chrome
+or Chromium takes over the websocket; branded Chrome ignores
+`--load-extension` now). Chrome does not keep one loaded that way across
+a restart, so switching one off or removing it is `Extensions.uninstall`
+and the list. A Chrome that refuses the method has the reason said on
+each extension (`extensionLoadProblem`). What is said to be missing
+there: native messaging (no password manager's desktop app on a server),
+`activeTab`, context menus, notifications, side panels, devtools panels
+and keyboard shortcuts.
+
+The owner adds one from Settings, Browser, Chrome extensions, in the
+desktop app or the server's own page alike
+(`server/browser-extension-routes.ts`, `/api/browser/extensions`): the
+folder is chosen on their device (a directory input) and sent file by
+file into `<data>/browser-extensions/.staging/<id>/`, each path plain
+parts that stay inside it (`stagedPath`), at most 5,000 files, 25 MB a
+file and 100 MB in all, refused when sent twice. Nothing staged runs;
+`look` judges it for the same review screen, and only the owner's yes
+copies it in (`addFromFolder`, as the app's) and loads it; a staging
+nobody added is swept within the hour. Every route refuses an agent's
+credential, and members never reach `/api/browser/*`.
+
+An extension's own page is never a tab there either. A page target that
+attaches at a `chrome-extension:` address (an extension's
+`chrome.tabs.create`, or a run before this one) is closed; a tab an
+extension moves to its own page (which the Fetch guard does not hear) is
+sent to `about:blank` on `Page.frameNavigated`; and agent commands are
+refused on one meanwhile, as in the app. The owner's popup or options
+page is the extension view: a target of its own made at the page's
+address (a blank page sent there would change process and lose its
+session), in a window of its own (the shown tab is kept in front of its
+window for its pictures, and a page behind it paints nothing and takes
+no input), claimed before anything could close it, paused until its
+guard is on, held to its own extension's pages (a link out opens as the
+person's tab under the tab rules), sized 400 by 600 for a popup and to
+the panel for an options page, and pictured and driven through
+`/view/screen`, `/view/input` and `/view/close`, never through the tab
+routes, the tab list, `state()` or a thumbnail. One is open at a time, a
+dialog in it is answered no, a popup that closes itself closes the view,
+and a browser with a view open is not shut for being idle. The panel
+shows it over the page (`ExtensionView` in `BrowserPanel.tsx`), with
+"Only you see this" on it.
+
+A worker that auto-attach starts paused (an extension's background, a
+site's service worker) is now told to run before it is let go:
+detaching first left it paused for good, so an extension's background
+never answered.
+
+## Terminals
+
+`server/terminal.ts` keeps up to eight shells per agent, each in the
+agent's folder, each with an id, a name ("Terminal 2" until renamed) and
+its own scrollback, in the order they were opened. They outlive the panel
+and are ended when the tab is closed, when the agent is archived, or
+after eight hours with nobody watching. The pty comes from `expect`,
+`python3` or `script`; a resize sets the pty's size from outside with
+`stty -f` on its device, and falls back to typing `stty` into the shell
+only where the device cannot be found.
+
+The routes are local only. `/api/bots/:id/terminals` lists and opens;
+`/terminals/:sid` reads, renames (PATCH) and closes (DELETE);
+`/terminals/:sid/input`, `/restart`, `/clear` and `/busy` do what they say,
+`busy` reading the pty's foreground process group so a tab can ask before
+it ends a running program. `/terminals/stream` is one event stream for
+every shell an agent has, frames tagged with the shell's id, so tabs never
+cost a connection each. The older `/api/bots/:id/terminal` routes act on
+the first shell.
+
+In the app (`src/components/Terminal.tsx` and `src/components/terminal/`)
+every tab keeps its xterm alive while hidden. The panel is drawn once into
+a detached element that moves between slots on each side of the chat, a
+full-window overlay, or, in the desktop app, a window of its own
+(`?terminal=<agent>`, `electron/terminal-window.mjs`), so moving it never
+rebuilds a screen. Where it sits and how it draws are kept in
+localStorage (`src/lib/terminalLayout.ts`, `src/lib/terminalPrefs.ts`).
+
+### An agent's own tabs
+
+An agent's ordinary commands run in its turn, never in these shells. For
+a command that keeps running (a dev server, a watcher, tests the person
+wants to watch) it can start a tab of its own: `owlbot terminal run
+"<cmd>" [--title]` (`POST /api/agent/terminals`), which opens a shell in
+the conversation's folder on this computer and types the command into it
+once the shell has printed its prompt. The tab carries `agent` (name,
+conversation, command) in what the routes and the stream say, and the
+app draws it with the agent's badge and a line above the screen saying
+the agent started it and reads what it prints. The person can type in
+it, close it, or restart it (a restart keeps the label and types
+nothing). At most four of an agent's eight tabs are its own.
+
+Starting one is decided like any command the agent runs
+(`agentTerminalRun` in `server/index.ts`): someone at the wheel refuses
+it, a deny rule refuses it, an allow rule or the agent's `auto` or
+`full` mode lets it go, and anything else is a card in the conversation
+(the browser's gate, `BrowserGate`, so an answer that comes late is kept
+for the agent's next try). A turn a member asked for, a member's own
+agent and a room are held to the owner's yes. An agent whose commands run
+in another place (Where an agent works) is refused: a tab would not be
+its folder. Each start is written to the record as an approval.
+
+`owlbot terminal read <tab> [--lines]` answers the tab's recent output as
+plain text (`plainText`: escape sequences out, carriage returns and
+backspaces applied; 80 lines, at most 400), marked as data. `list` and
+`stop` do what they say. These routes find only tabs the agent started:
+the person's tabs are never listed, read, stopped or shown by an agent,
+the person's own `/api/bots/:id/terminals` routes refuse an agent's
+credential, and no route lets an agent type into any tab.
+
+## The side dock
+
+One column on a conversation's right holds the agent's files, what the
+conversation changed, the OwlBot browser, a terminal on the right, the
+agent's computer, a turn's timeline, a room's topic and extension panels
+(`src/lib/dock.ts`, `src/components/dock/SideDock.tsx`). It is open or
+not, on which panel, and with which panels open as tabs, per
+conversation; its width is per device.
+
+**Panes on every side.** The right pane is the dock as it was; a tab can
+move to the left, the top or the bottom from its pane's ⋯ menu ("Move this
+tab to", `moveTab`), which opens a pane on that side with a strip, a +, a
+⋯ and expand of its own, so a bottom pane can sit alongside the right
+one. Which side each panel sits on, and each side's pane, are remembered
+per conversation (`sides`, `panes`); the left pane's width and the top
+and bottom panes' heights per device (`owlbot-dock-sizes`), as the right
+pane's width is. A panel is drawn by the pane on its side only. Expand
+(the button, the ⋯ menu, or ⇧⌘\ for the pane the keyboard is in or the
+first one open) lays a pane over the conversation until it is put back.
+A room keeps its one pane on the right. In the desktop app the ⋯ menu
+also opens Files, Changes or Background tasks in a window of its own
+(`dock:window`, `electron/dock-window.mjs`, which takes only those three
+names and ids that are ids; the page is `DockWindow.tsx`, read back by
+`src/lib/dockWindow.ts`), and a terminal in the terminal's own window;
+the browser and the computer draw over the window they belong to.
+
+**Strips past their room.** A pane's tabs and the conversation's tabs
+scroll sideways when they run past their room, with no scrollbar drawn;
+the side with more to see fades out (`fadeMask`, `src/lib/fadeScroll.ts`,
+a mask that is there only while that side overflows), a mouse wheel
+turned up or down scrolls them sideways, and the tab in front is kept in
+view.
+
+**Tabs and the +.** The panels open in a conversation are tabs along the
+dock's top, in the order they were opened, each with its own close
+(`closeTab`): closing the one in front brings its neighbour forward, and
+closing the last hides the dock. A panel that holds several things shows
+each as a tab of its own, flat in the strip: every shell of a terminal in
+the dock (an agent's own with its badge; `useTerminalTabs`, the terminal
+panel then drawing no strip of its own and its menu floating in the
+screen's corner) and every page of the browser (in the chat's scope). Its
+× closes that shell or page, + on it opens another, and the panel keeps
+them all drawn while hidden, so a shell's screen and a page stay as they
+were. Such a panel's tabs move together, since one terminal and one
+browser surface are drawn per window. What a panel keeps (open files, shells)
+outlives its tab. The + lists every kind the conversation offers, with
+what each holds (Changes says `+12 −3`, Files how many are open) and its
+key: Shift+Cmd+F Files, Shift+Cmd+D Changes, Shift+Cmd+B the browser and
+Cmd+J the terminal, heard in the desktop app only (`panelChord`,
+`src/lib/dockKeys.ts`). A panel with nothing to show is not a tab until
+something opens it. A place stored before tabs comes back with the panel
+it showed as its one tab. On a wide window the tabs sit in the window's
+top row, right over the dock (below); where the dock covers the chat, or
+there is no top row, they sit at the dock's own top.
+
+**Files** (the panel's id is still `docs`) is the agent's shared files
+folder as a tree with a filter box (`src/lib/fileTree.ts`, from `GET
+/api/bots/:id/artifacts`, asked again every eight seconds while shown),
+beside the files opened from it, from a card or from a path in the
+conversation. It is the same boundary as Shared files: never the folder
+the agent works in. Closing the last file leaves the tree. A text file
+opens at a line when asked (`NumberedText`). A room has no tree.
+
+**Changes** (`src/components/dock/ChangesPanel.tsx`) lists what the
+conversation's turns changed, from the photographs around each turn
+(`Checkpoints.laneChanges`): one difference per file from before the
+first turn that touched it to after the last, with lines added and
+removed, the turn's own files only, leaving out undone turns and
+rehearsals not applied, and a file made and gone again. `GET
+/api/threads/:id/changes`, `/changes/diff?path=` and `/changes/file?path=`
+answer the list, a file's diff with each line numbered on both sides,
+and the file as the conversation left it, from the kept copy, never the
+folder; picking a line number in the diff opens it there. Where the
+conversation's folder is a git repository a second view, Uncommitted,
+lists what git says is not committed there, whoever wrote it, with the
+branch and how far it is from its upstream (`server/git-changes.ts`, `GET
+/changes/git` and `/changes/git-diff?path=`): git only when it is really
+there (`realGit`), with no prompts, optional locks, fsmonitor or hooks,
+no external diff or textconv, literal paths, only paths git reported, and
+untracked files read only when plain and inside the folder. These routes
+are the owner's, like the turn diffs; an agent's credential and a
+member's device reach neither. Undo stays on each turn's card.
+
+**Background tasks** (`tasks`, `src/components/dock/TasksPanel.tsx`,
+`src/lib/backgroundTasks.ts`) lists what the conversation's agent has
+running beside the chat: its own terminal tabs, with what each runs,
+whether it still runs and the addresses it printed, to show, open in the
+browser or stop, and the jobs it took from the job board and has not
+finished, to open where the work is. The + says how many are running.
+Asked again every six seconds while the window is seen.
+
+**The browser's empty tab.** A tab with nothing in it (`blank`, the app's
+page view kept off it) shows what OwlBot knows can be previewed
+(`src/lib/previews.ts`): the addresses on this computer the agent's own
+running terminal tabs printed (`localUrls` in `server/terminal.ts` keeps
+the last three a tab printed, http or https on localhost, 127.0.0.1,
+[::1] or 0.0.0.0 with a port, in what the terminal routes say), then the
+pages this window showed lately (`owlbot-browser-recent`, six, web pages
+only), each with Open, under "Run a server to preview your app, or enter
+a URL." Nothing scans a port or starts a server.
+
+**In the window's top row.** On a wide window the conversation's header
+is the window's top row (`src/components/TitleBar.tsx`,
+`src/lib/titlebarSlot.ts`): after the workspace switcher, a hairline, then
+who the conversation is with (avatar, name and what the agent does, or
+where it works and how long it has been working), its buttons on the
+right, and over the dock the dock's tabs, + and hide, in a slot the dock
+sizes to its own width. The conversation's own tabs then sit where its
+header was, in the conversation's column only: the dock is a column of
+its own that starts right under the top row, its edge running up
+unbroken. A room does the same with its icon, its name and who answers
+in it. On a narrow window there is no top row and the header stays in
+the conversation, as before.
+
+**Opened by an agent's work.** An agent starting to use its browser or
+its computer in a chat opens that panel, by one rule (`mayReveal`): only
+in a chat, never a room; only when the window has room for the chat
+beside it; never while the keyboard is in a field of the dock; and never
+again in a conversation where the person put away a panel an agent's
+work had opened, until they open it there by hand (kept for the window,
+not stored). Browsing is heard from the browser (`browser:reveal` from
+the app, `browser.reveal` from the server); the computer is read off the
+turn's tool rows (`src/lib/dockActivity.ts`): a call on the computer's
+MCP server (or `computer_exec`), at most once a turn and only for calls
+made while the chat is on screen. The terminal is not opened by an
+agent's ordinary commands, which do not run in its shells.
+
+**Shown by an agent on purpose.** `owlbot dock show <files|changes|
+browser|terminal|timeline|computer> [target] [--line]` (`POST
+/api/agent/dock`, and `dock_show` for the MCP server inside a turn) brings
+a panel forward in the conversation the agent is answering: one of its
+shared files at a line, the changes at a file it changed and a line, the
+browser on an http(s) page, one of its own terminal tabs, the timeline or
+the computer. The server checks the target is the agent's (its file, its
+tab, a file its conversation changed) and sends `dock.show` with the
+agent and conversation; owners' windows only. The window decides
+(`mayShow`, `dock.ask`): only that conversation's key; a chat, with room;
+never while the person types in the dock; and a panel the person closed
+stays closed for the rest of the turn it was closed in, where a turn is
+the person's message that started it (`currentTurn`), so the agent
+asking on a later turn brings it back. An ask for a conversation not on
+screen waits there for ten minutes. Asking for the panel already in
+front still goes ahead, for what it names inside it. Neither this nor the
+browser counts against the turn's twelve changes.
+
+Each tab carries one dot: orange while its panel waits on the person (an
+unanswered approval for a computer action, the browser taken over while
+an agent waits, a page dialog), purple while another person is at it
+(typing in a shared room), blue while an agent works in it (not drawn on
+the panel in front); a dot on a panel not open marks the + instead. In a
+chat the browser's tab strip can be narrowed to the tabs the chat's agent
+opened; tabs know their agent, not their conversation, and shells and the
+computer are the agent's whole, so the agent is the narrowest view the
+dock can give.
+
+## Recall and notes about the person
+
+`server/recall.ts` searches an agent's own lanes, the rooms it is in and
+its memory files (MEMORY.md and `memory/*.md`, each cut into pieces under
+their headings and named by file), words in any order, with the message
+before each hit. From a lane of a shared room it reaches only that room,
+and no memory; the lane that answers mail from anyone reaches nothing,
+and no other lane reaches it. In a workspace with other people in it,
+the rest is `mayRecall` in `server/access.ts` (People in a workspace):
+a member's private conversation reaches itself, the team conversation
+they are on and their own memory with the agent; the team conversation
+reaches itself; the owner's own lanes never reach a member's private
+one. Agents reach it with the CLI's `recall` and chat engines with the
+`search_history` tool.
+
+Ranking is BM25 in plain TypeScript (`server/recall-index.ts`): a word
+counts for more the rarer it is in this agent's own past (its lanes,
+rooms and memory together are the corpus), saying it again counts for
+less each time, and a long message does not win by length. A gentle
+recency edge (at most 15%, halving every 30 days) and a bonus for words in
+the order asked or within eight words of each other come on top. Words
+are folded before they meet (plurals, -ing and -ed, a silent e), small
+words are left out, and a file name or a hyphenated word is matched whole
+and by its parts. An agent's own search wants most of the words, as
+before, and a hit's text is cut around where they sit.
+
+Each conversation has an index in memory, built the first time it is
+searched and kept in step by two hooks on the store: `onAppend` adds a
+message to an index already built, and `onRewrite` hears every patch, move
+and dropped transcript. The same words at another time (a reaction, a
+queued message going) keep the index, and an edit, a deletion or a closed
+lane drops it to be built again. A memory file's index is rebuilt when its
+size or time moves, and a link is never read through. `IndexCache` holds
+them all to a budget of three million postings, a few bytes each: once a
+search is done, the least recently searched go until what is left fits,
+and are built again if asked for. A test indexes 30,000 messages and
+answers in well under a second.
+
+The person's own search, the command palette and the MCP server's
+`search` (`GET /api/search`), reads the same indexes over every
+conversation of every agent still in the list and every room (a member's
+private conversation only while the owner reads those, and a member's
+solo agent never), ranked the
+same way and wanting most of the words, so the message that answers comes
+before the one that happens to be newest. Nothing taken back, rewound or
+still waiting is in an index. A query of nothing but small words ("to be
+or not") has nothing to rank on and is matched as typed, newest first, as
+it always was.
+
+Recall also runs before the person's own turn in one of an agent's
+conversations (`recallAhead` in `server/index.ts`): never in a room,
+shared or not, nor for a stranger's mail, another agent, a routine, a
+watcher, a native command, a rehearsal, or a turn going on with an earlier
+one (a pickup, a backup engine, a retry). It searches the agent's other
+conversations and its memory topic files with the person's words; not
+MEMORY.md, which the standing prompt carries, and not the conversation it
+is in. A hit has to share at least two of the words, hold at least 45% of
+what makes them particular (their words, each weighted by how rare it is)
+and score at least 4.5, which is about two telling words in a history of
+a few hundred messages (a very short history scores nothing that high,
+which is the point); a message of fewer than two words worth matching is
+not looked up at all. Up to three excerpts of about 500 characters each, each with
+where and when it was said and by whom, go ahead of the person's words in
+the turn's text, in a block that says they were found by matching words
+and may be ignored. Never in the system prompt, so a resumed Claude Code
+session keeps reading its cache (see Compactions). Nothing the
+conversation's last forty messages were already given, or already say, is
+given again. The person's message keeps what was added as `recalled`
+(where, when, who, the excerpt), which the chat shows as "Recalled 2
+notes" under it (`src/components/RecalledNotes.tsx`), opening to each
+excerpt with where and when it was said, and a link to the conversation
+or room it came from; GET `/api/bots` leaves it out for an agent's credential,
+since it came from the agent's other conversations. Words that waited for
+a turn are looked up together and the last of them keeps the notes. An
+engine that is told the transcript each turn hears the notes once, with
+the message they came with, since the transcript replays what was said.
+It is on unless turned off, for one agent (`recallBeforeTurn`, in its
+settings under Memory) or for the workspace (`recall.beforeTurn`, Settings,
+General).
+`server/profile-notes.ts` holds suggested and kept notes about the
+person; agents suggest with `note` or `note_about_person` (three a turn),
+only kept notes reach the prompt, and never in a shared room.
+
+## Mentions of a conversation or a tab
+
+In an agent's conversation the composer's @ list offers the person's
+other conversations (this agent's first, newest first, each with its
+agent's face) and the tabs open in the OwlBot browser
+(`src/lib/mentions.ts`, `src/components/composer/MentionMenu.tsx`). A
+pick puts a chip in the words: in the box it is `@label`, marked behind
+the text the way a skill is, with a small table beside the draft saying
+what each label points at; Backspace after one, or Delete before one,
+takes it whole. On the way out each chip becomes a Markdown link,
+`[@Launch plan](owlbot://agent/<agent>?lane=<lane>)` or
+`[@Pricing](https://example.com/pricing)`. Nothing about a mention lives
+outside the words, so a draft, a failed send handed back, a rewind's
+words, an edit, a Redo, a waiting message and an export all keep it, and
+the iPhone app, which draws inline Markdown, shows the label (a
+conversation's link is the `owlbot://agent/<id>?lane=` shape it already
+opens). The chat draws each link in a person's message as a chip that
+opens the conversation, or the tab (a new one at the address once it has
+closed); copying, quoting and forwarding say it as `@label`.
+
+The server reads the links in the person's own words on
+`POST /api/bots/:id/messages`, never in an agent's (`mentionedIn` in
+`server/index.ts`, `server/mentions.ts`). A conversation is read when
+`access.laneAccess` lets the sender open it: its title, its running
+summary (at most 1,500 characters) and then its latest messages, newest
+kept, each cut to 600, within 4,000 in all, in a frame whose ends carry a
+random tag and which says it is a record. A tab is the open one at that
+address, never on the workspace's never list, read in place with
+`AppBrowser.peek` (the app's over the desktop line's `browser.read`, or
+the server's own): no command, no wheel, nothing on a tab waiting on a
+dialog, four seconds at most. Its text, within 6,000, goes in
+`frameUntrusted`, named outside the frame by host only. Five mentions a
+message, 16,000 characters in all; the conversation the words are in is
+skipped. The blocks go ahead of the words (and of a reply's quote) at
+whichever boundary they reach: a new turn, a running turn, or a wait,
+where the waiting message keeps them as `mentionContext` for the turn
+that takes them; a retry asks with them again, editing waiting words
+reads them again, and a Redo reads them again from the words it sends.
+The message keeps a note per mention (`mentions`: kind, label, link and
+why one was left out: unreadable, closed, unavailable, denied, limit),
+and the chat says each one left out under the bubble.
+`mentionContext` is stripped for a member (`memberMessage`) and for an
+agent's credential reading messages, and a branch does not copy it.
+
+## Bringing a setup over
+
+`server/setup-import.ts` reads what a person already taught other agent
+tools, from a short list of known places under their home, and from a
+transfer file they pick. Nothing is searched for and nothing there is
+written.
+
+- Claude Code: `~/.claude/CLAUDE.md` (its `@path` imports are named, not
+  followed), `rules/**/*.md`, subagents in `agents/*.md`, skills in
+  `skills/*/SKILL.md`, commands in `commands/**/*.md` (a folder is a
+  `folder:name` namespace), the top level `mcpServers` of
+  `~/.claude.json`, and from `settings.json` the allow and deny rules,
+  the default `model`, and any `mcpServers` kept there although Claude
+  Code does not document them.
+- Codex: `AGENTS.override.md` in place of `AGENTS.md` when it has
+  anything in it, as Codex reads them; `[mcp_servers.*]`, `model` and
+  `model_reasoning_effort` from `config.toml` (a small TOML reader of
+  its own); `prompts/*.md` at the top of that folder; skills in
+  `~/.agents/skills` and the older `~/.codex/skills`.
+- Cursor: `~/.cursor/mcp.json` (with `${userHome}` filled in and
+  `${env:NAME}` read as a variable), subagents in `agents/*.md`, skills,
+  commands, and `.mdc` rules in `~/.cursor/rules`, a folder Cursor
+  documents only for projects, so each file is read on its own and a
+  broken one is named. Cursor keeps its user rules in its settings, not
+  a file, and the review says so.
+- OpenClaw: `~/.openclaw/openclaw.json` read as JSON5 (`server/json5.ts`)
+  for the workspace folder (only inside the home folder), the default
+  model, and the Telegram, Slack and Discord channels; then `SOUL.md`,
+  `IDENTITY.md`, `AGENTS.md`, `MEMORY.md`, `memory/*.md`, `USER.md` and
+  skills in the workspace, and the managed skills in `~/.openclaw/skills`.
+  WhatsApp, Signal and the rest are named as left out.
+- Hermes: `SOUL.md`, the memories folder and skills a few folders down
+  in `~/.hermes`, each looked for rather than assumed.
+- OpenBot: several agents, each with its own parts. Found when its app
+  data folder (`~/Library/Application Support/OpenBot`,
+  `%APPDATA%\OpenBot` as `~/AppData/Roaming/OpenBot`, or
+  `~/.config/OpenBot`) or `~/OpenBot/Agents` exists, or when the owner
+  has picked a transfer file. Each folder under `~/OpenBot/Agents` is an
+  agent: its instruction file (`AGENTS.md`, else `CLAUDE.md`), its skills
+  in `.agents/skills` and `.claude/skills` (those carrying
+  `.openbot-managed.json` are OpenBot's own and left out), and its other
+  regular files. Names and settings come first from a transfer file,
+  then from `agent_json` in the `projection_agents` table of
+  `openbot.db`, opened read only with `node:sqlite` (loaded only when
+  there is a database, through `process.getBuiltinModule`, so a Node
+  without it loses only this step; Node 22.13 and newer and Electron's
+  own have it) and never waited on, then from the folder: the
+  instruction file's first heading, else "OpenBot agent" and a number.
+  Undocumented JSON is read tolerantly: a field is taken only when its
+  name and type are unambiguous (a string `name`, `title`,
+  `instructions`, `provider`, `model`; an effort; arrays of memories and
+  routines; `mcpServers`), the rest is passed over.
+
+A transfer file is a `.zip` read by `server/zip-read.ts`, a small reader
+of its own: the central directory is judged whole before any entry is
+read, and an absolute name, a `..`, a link, an encrypted entry, a name
+given twice, more than 5,000 entries, more than 512 MB unpacked or one
+entry over 64 MB refuses the whole file. An entry is inflated to exactly
+its declared size and its CRC checked. Only `openbot-transfer.json`
+(whose format value and version 1 are checked), `agents/<key>/` (a
+picture checked by its bytes as PNG, JPEG or WebP, up to 2 MB;
+`skills/<slug>/SKILL.md`; `workspace/`) and `shared/` are read; anything
+else is named as not read.
+
+An OpenBot agent's provider maps to the engine of the same family here
+(`ENGINE_DRIVERS` in `server/setup-import.ts`): Codex to `codex`, Claude
+Code to `claudeAgent`, Grok to `grokCli` then `grok`, OpenCode to
+`opencode`, Gemini to `geminiCli` then `gemini`, Cursor, Cline, Devin and
+Pi to their own drivers, Kimi, OpenRouter and DeepSeek to their API
+providers. GitHub Copilot, Hermes, Muse, custom endpoints and custom ACP
+agents have no family here: the agent comes on the default engine and
+says so, naming it. A model id carries over only within the family.
+Essential memories become a block in the agent's `MEMORY.md`, searchable
+ones (and any that say neither) the topic file `memory/From OpenBot.md`.
+Workspace files (unticked) are copied into the agent's workspace, never
+over a file already there: regular files only, no links, nothing hidden,
+nothing named like a credential, not its instruction file or a top
+level `MEMORY.md` or `memory/`, at most 20 MB each, 500 files and 100 MB
+an agent. Routines (unticked) are filed paused, their schedule read from
+a `time` and `days` or a plain weekly cron line, else set to 09:00 every
+day and said. MCP servers go through the same rules as every other
+server and are attached to nothing. Each part carries `owner`, the agent
+item it came with; the review suggests `botId: "owner"`, which the
+import resolves to the agent that item became in the same import or an
+earlier one still here, so agents are applied before the parts that go
+to them. Chat history, channels, saved logins and the vault, connectors
+and browser profiles stay in OpenBot, which the review says under the
+source.
+
+What each becomes: a subagent is an agent, its prompt the instructions
+(or, past 4,000 characters, the opening plus the whole in `MEMORY.md`),
+its model mapped where an engine here runs it, its colour and effort
+kept, the skills and servers it names attached when OwlBot has them by
+that name (including ones the same import just added, since skills and
+servers are applied first), and its tool limits as deny rules for that
+agent alone: a `tools` list refuses the acting tools it leaves out,
+`disallowedTools` go through the same translation as settings rules,
+and Cursor's `readonly` refuses the editing ones. Commands and prompts
+are skills with one line on top saying what `$ARGUMENTS` and `$1` were.
+A Cursor rule that always applies is instructions; any other kind is a
+skill. A default model is offered to the agent made for that tool, and
+refused with a reason when that engine is not set up. A chat app is
+connected through the same checks Settings makes (the app's own `getMe`
+or `auth.test`), saved switched off because the other tool may still be
+answering on that bot.
+
+No credential file is opened. A file named like one (`auth.json`,
+`.credentials.json`, `.env`, tokens, keys, keychains) is never read,
+and a link is followed only to see where it goes, so a `SKILL.md` that
+points at a credentials file is named as left out. Every file is capped
+by size. Text is scrubbed of anything key-shaped (provider key prefixes,
+bearer tokens, `name = value` pairs whose value looks generated,
+passwords in addresses, private key blocks) and the item says how many
+were taken out. An MCP server's environment and header values, and a
+chat app's tokens, are slots: the item carries their names, the review
+shows a field for each, and a value is either typed by the person or
+copied from the other tool's config because the person ticked that one
+slot. The literal values are held in a `WeakMap` beside the scan, so no
+serialized scan, review, log or dry run can carry one; a value written
+as a variable (`${NAME}`, `$NAME`, `${env:NAME}`, Codex's `env_vars` and
+`bearer_token_env_var`) is named as one and never resolved. Names that
+change how programs start (`PATH`, `NODE_OPTIONS` and the rest of
+`server/env-names.ts`) are not carried, and a name left empty is never
+handed to an engine.
+
+`GET /api/setup-import` is the review: every item with a preview, where
+it would go, whether it was brought over before, anything here by the
+same name (`conflict`: a person's skill or an agent may be replaced, a
+skill that ships with OwlBot or a server never is), the slots it needs,
+and `sameAs` when another tool's folder held the same thing (Cursor
+reads Claude Code's skills), which waits unticked. The window groups it
+by what each becomes (`src/lib/setupReview.ts`). `POST` imports the
+items the window names, and only those. It reads the files again and
+takes from the window only which items, where, how a clash is settled
+and the slot answers, so an item whose digest no longer matches the
+review is refused. Instructions become an agent's instructions (if they
+fit) or a block in its `MEMORY.md`, written through the memory journal;
+`memory/*.md` files become topic files. A new agent is made once per
+source per import. Skills go to the library under a free id unless the
+person said to replace theirs. Servers go to the registry on no agent.
+Rules wait for the person to tick them: a translation may be broader
+than the original only when it denies, an allowed command prefix
+becomes a `runs` rule (one plain command, nothing chained), an allowed
+`Read` of an absolute path names the `Read` tool, and an allow that
+would let agents do more is left out with the reason. `USER.md` lines
+become suggestions in About you. `setup-import.json` keeps each item's
+digest, destination and the exact text it added, so importing again
+replaces that text in place rather than adding a second copy.
+
+Every import that changed something is kept in `setup-import-runs.json`
+(`server/setup-undo.ts`, the newest 20) as steps: an agent made or
+changed (with its settings before), instructions and memory before and
+after, a skill added or replaced (with the one it replaced), a server
+added or updated (its earlier shape with values blanked), a rule or a
+suggestion added, a chat app connected (by a hash of its token), a
+picture set on an agent that had none, files copied (each by a hash of
+its bytes) and a routine filed. `POST
+/api/setup-import/undo` walks them back newest first, each only if what
+is there is still what the import left; anything changed since, a
+suggestion the person kept, or an agent they have talked with stays and
+says why. Agents it made are archived, not deleted. The record goes back
+to what it said before for each item that went back whole. The look
+returns `lastRun` so the offer outlives the window.
+
+A transfer file is picked in the window and sent in parts, as an
+attachment is, to `/api/setup-import/transfer/uploads` (begun with its
+name and size, up to 256 MB, each part `PUT` by number, then finished),
+so it reaches the workspace's computer from the desktop app, a window
+paired to another computer through OwlBot Cloud, or a browser on
+`owlbot-server`. It is judged whole as it lands and kept, as
+`setup-transfer/openbot-transfer.zip` beside the name it was picked
+under, only if it reads; a backup leaves that folder out. `GET` and
+`DELETE /api/setup-import/transfer` say which file is being read and
+stop reading it; the look carries `transfer` too. The look and the
+import both read the file again, so a file replaced between them
+changes the digests and the items are refused.
+
+All of these routes answer only the owner at this computer or on their
+own paired devices, never an agent's credential or a member. The first
+run offers the review as an optional step when something new was found,
+and Settings has it as a page. `owlbot-server import [tool] --dry-run
+[--json] [--transfer FILE]` prints the same scan from a terminal, with
+no server needed and nothing written; the import itself is only in the
+app, where the slots are answered.
+
+## Bringing past sessions over
+
+`server/session-import.ts` is the sibling of bringing a setup over, for
+conversations: Claude Code's transcripts under
+`~/.claude/projects/<folder>/*.jsonl` and Codex's under
+`~/.codex/sessions/**/rollout-*.jsonl`. Nothing in either is read until
+the import screen asks (Settings, Past conversations, and an optional
+step of the first run, offered when `GET /api/session-import/places`
+says either folder is there, which it answers without listing them).
+Files are only opened for reading; a link is never followed to one, a
+helper's transcript (`agent-*.jsonl`) is part of a session rather than
+one, and a file past 256 MB is named as left alone. Each line is read for
+the few fields that matter and anything else, a line that is not JSON
+included, is skipped and counted. Codex writes what the person typed
+twice, as an event and as an item among the instructions it injects, so
+the events are read and the items only for a file old enough to have
+none; Claude Code's own lines (a slash command's echo, its caveat, a
+reminder, a helper's sidechain, an API error it stands in for) are not
+the person's or the model's words and stay out.
+
+`GET /api/session-import` lists every session by its folder, newest
+first, with a title (the first thing the person said), its dates, how
+many messages and which engine, and whether it is a conversation here
+already. Sessions OwlBot ran itself are left out: every session id an
+engine reports is noted in `engine-sessions.json`, the Claude Code
+sessions whose costs were kept before that count too, as does every
+lane's cursor, and a Codex session whose originator is OwlBot's own client.
+`POST /api/session-import/review` with `{ picks, to }` reads each picked
+session whole and returns it exactly as it will land, with a digest, how
+it will carry on, and what stays behind. `POST /api/session-import` with
+the same shape and the digests imports, reading the files again and
+refusing one whose digest moved. `to` is `{ botId }` or `{ hire: true }`,
+which makes one agent per project folder through `server/scout.ts`
+(the team's lead, named for the project, working in the folder, on the
+engine most of its sessions ran on). All three answer only OwlBot on this
+computer, never an agent's credential, a paired phone or a remote window.
+
+Each session becomes a lane (`Store.importLane`, its messages written in
+one go): the person's and the engine's words as text messages and each
+tool call as an activity row with one readable line, all at the times
+they were said and marked `imported` with the engine, then one notice
+saying where it came from and how it carries on. A lane keeps the latest
+3,000 rows. Every line of every message goes through setup-import's
+scrub and the person's own stored keys through the inspection redactor;
+a line either finds anything in is left out whole, with a marker.
+`TaskRecord.imported` keeps the engine, the session id, the file (as ~)
+and whether it resumes; `clientBot` ships `imported: { engine, at,
+resumes }` on the lane, never the path or the id.
+
+A lane carries on the engine's own session when the agent's engine is
+that engine, the folder is still there (pinned as the lane's `cwd`,
+since Claude Code finds a session by it) and the agent is not on a cloud
+computer: the session id is the lane's cursor, and its first turn is
+sent with `forkFrom`, so Claude Code resumes it with `--fork-session`
+(2.0 and later; an older or unknown CLI starts a new session told the
+story instead) and Codex with `thread/fork` (one that cannot fork starts
+a new thread with the handoff). The person's own file is never written,
+and only a cursor that is still the imported id is ever forked; from the
+first turn the fork is the cursor, and is noted as OwlBot's own. That
+first turn is told once that the conversation was brought over. Anywhere
+else the lane has no cursor and an empty `lastInstanceId`, so its first
+turn is a new session told the bounded story, opening with where the
+conversation was had. Recall reaches imported lanes like any other; a
+hit says the conversation was had in that engine before OwlBot, and its
+replies are said by the engine's name.
+
+## Training export
+
+`server/run-export.ts` writes agents' runs to one JSONL file, on the
+owner's say, to fine-tune a model on. A run lives in three places and
+none holds all of it: the transcript (`messages-<lane>.json`) has the
+person's words, who said them and what they thought of the answer; the
+events file (`events/<lane>.ndjson`) has the turn as it ran, timed, with
+the engine, model, tokens and price; and the native log
+(`native/<lane>.ndjson`) is the only place a tool's full input and
+output exist, for the engines that send them. A record is the
+transcript's turn (read the way Redo reads one, `transcriptTurns`),
+ordered by its events, with each call filled in from the native log
+where it can be. Every record says which of its calls are whole, so a
+file never claims results an engine never sent.
+
+Three shapes: OpenAI's chat format with `tools` and `tool_calls`,
+ShareGPT with calls and results as `<tool_call>` and `<tool_response>`
+blocks, and `owlbot.trajectory`, every step with its timing. The first two
+carry a `metadata` key (source, engine, model, cost, how the record was
+shortened) unless the choice says `metadata: false`, for trainers that
+refuse a key they do not know. One record per turn or per conversation.
+
+What is chosen is an `ExportChoice` (`readChoice` checks a request body
+or the command line's flags against it; anything left out keeps the safe
+default). Turns can be held to agents, conversations, dates and engines,
+and to ones that finished well, that the owner did not correct (stop,
+steer, edit, Redo, thumbs down) or gave a thumbs up. Other people's words
+stay out unless asked for: a member's, a Telegram stranger's or
+delegate's, a person on Signal's (`fromSignal.personId`), and mail and
+chat apps; a guest's mail lane and the lane a Signal person is answered
+in count as theirs whole. Members' private conversations are not even
+counted unless reading them is on in Members. Cleaning comes before
+shortening, so a key is never cut in two: anything shaped like a key
+always (setup-import's scrubber, with every value this workspace has
+saved), and by default email addresses, phone numbers, the home folder
+and the names the workspace knows (its people, the Telegram and Signal
+people, the owner). Long tool results keep their head and tail with the
+gap marked, a repeated identical result points back at the first, and a
+cap shortens further, then drops a conversation's earliest turns.
+
+The module only reads, so the same code runs in the server
+(`GET /api/training-export` lists what can be exported, `POST
+/api/training-export/preview` runs it dry and returns the counts and the
+first record, `POST /api/training-export` writes it, one at a time) and
+from `owlbot-server export-runs` with the app stopped
+(`server/run-export-cli.ts`, see [SCRIPTING.md](SCRIPTING.md)). Files go
+in the exports folder beside the data folder (`~/.owlbot-exports` for
+Personal), named `owlbot-training-<format>-<unit>-<time>.jsonl`, and are
+served, revealed and deleted only by that name. Every route answers OwlBot
+on this computer alone: never an agent's credential, a member, or a
+paired device. A written export is recorded in the ledger as
+`runs.exported`.
+
+## Engine scout
+
+`server/engine-report.ts` logs every finished turn with the engine and
+model that ran it, and reads its outcome later from existing records:
+undone (the checkpoint was reverted), rewound, discarded (a rehearsal),
+failed, or out (the engine ran out). A lighter model in the same family
+with at least eight judged turns and a kept rate within five points is
+suggested for that agent.
+
+## Email your agent
+
+Mail to `<agent>.<id>@agents.owlbot.dev` is received by OwlBot Cloud and
+arrives as a `hook:` ask with `platform: "email"`, like WhatsApp.
+`onEmailHook` routes it by the name before the dot, checks `allowFrom`,
+dedupes by Message-ID, and queues it into the agent's Email lane (or
+"Unlisted email", below); the reply is the agent's last message, sent
+back through OwlBot Cloud, which only sends to an address that wrote in.
+
+With `allowFrom` empty anyone may write, so a mail's turn runs on none
+of the owner's standing trust: its requester is `MAIL_FROM_ANYONE`, and
+it is answered the way a guest in a shared room is (`guestMail` in
+`startClaimedTurn`). Only an engine whose tools can be switched off
+(`sharedSafe`) answers it; on Codex, an ACP engine or the computer the
+lane says why and nobody is emailed, since a shell that asks before
+acting still reads the whole disk without asking, the owner's keys
+included. The driver gets `shared: { tools: "conversation" }` and
+`untrusted`: no tools, none of the owner's connectors, MCP servers,
+computer, browser or extra folders, no CLAUDE.md or auto memory, no saved
+secret and no agent credential. The persona leaves out the owner's
+profile, notes, memory, attached skills, project brief, folders and the
+team protocol, and no team plan is read from its answer. Each mail
+starts a session of its own with no transcript and nothing compacted
+first, and its session is dropped when it ends, unfolded and unread for
+skills, so one stranger never reads another's mail and no turn of the
+owner's resumes one. The reply is what was said after the mail, and any
+other turn starting in the lane ends the wait for it, so nobody is
+emailed words that were not their answer. A pickup after a cut off takes
+none of the words queued in the lane, and a context error is not folded
+and retried. `search_history`, `read_message`, `note_about_person`,
+`request_secret` and `request_connection` are refused: a secret saved or
+an app connected from such a card would resume the turn as the owner's.
+A question it asks the owner says whose mail it is for and is never
+sent to the owner's phone. It is answered in a lane of its own, made as "Unlisted email" and
+marked (`TaskRecord.guestMail`) rather than known by its title, so it
+keeps all of this when the person renames it; nothing names it, and a
+lane 2.5.36 made under that title is marked on the next start. Never in
+"Email", and at the lane cap it waits rather than borrow another lane;
+no other work falls back into that lane either, and work that names no
+lane (a phone message, a room's turn) goes to the first conversation
+when that lane is the one open (`activeLaneOf`). A backup engine or a
+retry after a fold goes on for the same requester, read when the error
+arrives, and a pickup after a restart reads it from the turn's record.
+During a drain it waits in the mail line rather than as a note in a
+lane, since a note runs as the owner's. Mail from an address or @domain
+in `allowFrom`, checked when its turn starts, runs as the owner's own,
+in "Email".
+Webhooks are not affected: their address is a secret the owner handed
+out.
+
+## MCP server
+
+`bin/owlbot-mcp.mjs` is a dependency-free stdio MCP server that finds the
+local OwlBot on its known ports and offers twenty eight tools: thirteen of
+its own (list agents and rooms, ask an agent and wait for the reply, post
+in a room, read a conversation or one message, search, the latest brief,
+what is waiting, and the skills: list them, read one at a version, its
+history, and propose a revision, which only ever stages it), the OwlBot
+browser's twelve (`browser_open` and the rest, through
+`POST /api/browser/command`), and three for Home Assistant once the owner
+allows it (see Home Assistant). It has no tool that approves, deletes or
+configures. `/api/mcp-config` gives the command to paste, using the
+runtime the server itself runs on. Run inside an agent's turn, with the
+turn's credential in `OWLBOT_TOKEN`, it also offers the side dock's tools
+for that agent and conversation: `dock_show` and `terminal_run`,
+`terminal_read`, `terminal_list` and `terminal_stop`, by the same routes
+and rules as `owlbot dock` and `owlbot terminal` (see The side dock and An
+agent's own tabs). Another app has no conversation, and no such tools.
+
+## Lanes, unread and the sidebar
+
+An agent keeps up to twenty lanes (`MAX_TASKS` in `server/store.ts`), each
+its own transcript, engine cursors and busy flag. Closing the last lane
+opens a fresh General in its place, because the active lane is what
+`threadId` names everywhere and an agent without one would be a special
+case in every route.
+
+One conversation per agent is the default. A routine, a watcher or an
+agent's webhook speaks in the agent's first lane, General, where the
+person talks to it, unless it names another with `thread` (the routine
+editor's Conversation, `--thread`, the webhook's Conversation), so two
+routines can still run side by side with their own context. `namedLane`
+reads a name as a lane's id first and its title second; a title nobody
+has is made when the work first needs it, and an id never is: one that
+is not this agent's lane is refused when filed and, once its lane has
+closed, sends the work to the first lane. A turn there shares the lane
+with the person, so what they say meanwhile queues behind it or joins it
+as steering. Everything filed before this kept going where it went: on
+the first start after the update, each one that named no lane was given
+the one it used ("Routines", "Webhooks", a watcher's "Watching: <name>"
+by its title then), once, marked by `oneConversationAt` in
+`config.json`. A watcher's own lane is one it made under that name, and
+closes with it.
+
+The chat's tab strip shows only while an agent has more than one lane;
+New conversation is on the agent's row in the sidebar (its menu, and the
+`+` of the conversations view), as Clear is. An agent opens one only by
+saying its first message there (`owlbot tab`, see Agents writing to
+agents).
+
+Unread is per lane: a turn that ends in a lane marks that lane
+(`store.markLane`), except a quiet check-in (see Routines and check-ins),
+which leaves it as it was, and the agent's own `unread` is kept as "any lane
+unread" so the iPhone app and the Dock badge read it unchanged. Opening a
+lane (`POST .../tasks/:id/activate`) reads it; `PATCH /api/bots/:id` with
+`unread` reads or marks the lane on screen. The client's `select` goes to
+the lane that pinged (`pingedLane` in `src/state/reducer.ts`) unless it is
+given one, so a dot on an agent always leads somewhere. `clientBot` ships
+each lane's `unread` and `lastAt` for the sidebar.
+
+Inside each list of the sidebar (a section, or the unfiled Rooms and
+Agents at the top) the order is one rule, `compareRows` in
+`src/lib/sections.ts`: pinned rows first by `pinOrder`, then the rest by
+`activeWithYouAt`, most recent first, with `createdAt` and the id settling
+ties. All of those fields live on the agent and room records, so every
+device draws the same list; `sidebarLayout` gives the whole sidebar in
+that order for anything that walks it. `activeWithYouAt` moves when the
+person writes, when a turn they started replies, and when anything asks
+them something (`towardYou` in `server/activity.ts`), never for one
+agent messaging another or a routine waking one. Pins and places are set
+through `PATCH /api/bots/:id` and `PATCH /api/owlbot/:id` with `section`,
+`pinned` and `position`, which renumber the section's pins; the order of
+the headings is `GET /api/sidebar` and `PUT /api/sidebar/sections`, kept
+in `sidebar.json` and announced as a `sidebar` frame. Each heading (Rooms,
+Agents, a section, folded or not) is `position: sticky` within its own
+group, so it stays at the top while its rows scroll under it and the next
+heading pushes it off; while pinned (`data-stuck`, measured by
+`src/lib/pinnedHeads.ts`, since not every browser at the web door can ask
+CSS) the sidebar's surface carries on below it under a mask
+(`.sidebar-pin` in `src/styles.css`), so rows fade as they pass under it.
+
+Transcript width is also a per-device reading choice, kept in `localStorage`.
+`src/lib/transcriptWidth.ts` normalizes it to Narrow (760 px), Medium (800 px)
+or Wide (960 px); the thin DOM adapter applies the cap before React renders.
+The conversation, room lenses and composer share that cap, with a 760 px
+fallback. Agent text can use the column while the person's bubble and screen
+previews keep their existing percentage caps.
+
+The sidebar's conversations view (`src/components/SidebarParts.tsx`) is a
+per-device choice in `localStorage`. Settings is a page beside the
+sidebar, like Automations, with its pages listed once in
+`SETTINGS_PAGE_LIST` (`src/lib/settingsPages.ts`), in groups: Account,
+Workspace (pages whose id starts `workspace:`, headed with which
+workspace beside the word), Agents, Integrations, Connections, Data and
+OwlBot. Anything that links into Settings passes a `page`; an id that
+moved is sent on by `SETTINGS_REDIRECTS` (`cloud` is `plan` now), so an
+old link always lands somewhere real. The list's search and the command
+palette read the same list, rows included, and every page is built from
+the pieces in `src/components/SettingsLayout.tsx`. Escape is handled
+once (`src/lib/useEscape.ts`): the most
+recently opened surface that asked for it closes, and Radix menus and
+dialogs keep their own.
+
+### Settings inspection
+
+`owlbot settings` lists the available categories. `--category` reads one,
+with `--id` for an opaque record reference and `--cursor` for its next
+page. Its single `GET /api/agent/settings` returns safe saved values,
+effective values or unresolved policies, and the existing owner control.
+It uses already-loaded owner metadata, not a config reread, provider
+health or authentication probe. Credentials, commands, connection URLs
+and opaque maps are configured status only. Unknown fields stay excluded.
+Owner writes and the agents' existing never list remain closed.
+
+The route sits behind the server's ordinary guard, not a guard of its
+own: an agent's credential works only on this machine and only because
+the route is on its list, members and invite holders are sent to their
+own surface first, and a network caller needs a paired owner device. On
+this machine the guard takes a valid member credential as the owner at
+the keyboard; these two routes take such a credential at its word and
+refuse it. Room visibility applies before totals, references and
+pagination.
+
+Free text that is shown passes through a redactor built from
+`SECRET_PATHS` in `server/backup.ts`, the list the backups strip, plus a
+short list of things a backup keeps that can carry a key (connection
+URLs, an MCP server's command, arguments and environment, chat pairing
+codes). A key added to the backup list is redacted here the same day.
+
+Pages have at most twenty rows and 32 KiB; permitted text has a 256
+codepoint bound and oversized values are omitted whole. Continuations
+are caller/category/selection bound within one server boot. Collections
+are live: membership is checked again on each page, deletion removes a
+record, and an insertion before the cursor may be missed. There is no
+persistent inspection snapshot store.
+
+### Device settings
+
+Some settings live only on a device: a window's theme and layout, the
+desktop's native state, a phone's own preferences and what its operating
+system decided (notifications, camera, microphone). The server keeps what
+those devices say in memory (`server/settings-devices.ts`), and it costs
+nothing until someone asks.
+
+Reading `device.browser`, `device.native` or `device.phone` sends one
+private `settings-request` frame, with a one-time id, to the owner's own
+event streams and, sealed, to owner devices through the relay. Not to
+members, not into the replay ring, not mirrored to a chat, and without a
+wake: a phone asleep is not woken to be asked. A burst of reads within
+five seconds shares one ask. The read waits up to a second and a half for
+answers, less when every owner stream has answered. A desktop window then
+reads its mounted owners, the preferences it stored and the native bridge
+(given half a second) and posts one `POST /api/settings/device-report`.
+Nothing in a window listens, times or sends between asks: mounted
+components register a reader once and keep it current through a ref.
+
+A window's report counts only as the answer to a live ask. A loopback
+caller is the owner to this server whether or not it is a window, so an
+unasked window report is refused rather than trusted, and an answer more
+than ten seconds late is no answer. A phone also reports on its own, when
+its stream connects and when one of its settings changes, because a phone
+in a pocket cannot answer and its last word, dated, is better than none.
+Those reports need a paired owner device's identity, which only the guard
+supplies: through the relay or a token on the network, never a body field.
+
+Each report replaces that device's last one whole. The phone describes
+its own settings: an id, a kind (preference, system, credential or
+lifecycle), the value, the device's own default, the part of the app that
+owns the effective value and where the person changes it. A credential
+can only say whether it is configured; anything else in its place is
+refused. Values are scalars, strings are bounded and redacted, and a
+malformed field reads as unknown rather than vanishing.
+
+Inspection dates every entry against the ask its read waited on:
+`current` means heard since that ask, `last-reported` is an older report
+shown with when it arrived. A window that did not answer is not listed.
+An owner device with nothing on record is listed as `unavailable`, with
+its app build and when it was last heard from, never with a server
+default in place of its values. Storage is bounded to 32 entries and a
+day of age, pruned whenever the store is touched rather than on a clock.
+Revoking a device, or switching pairing off, forgets what it said.
+
+A phone gates its reports on `device-settings` in `/api/health`
+(`server/features.ts`), so an older Mac is never sent one. An older phone
+ignores a frame it does not know and is listed as unavailable.
+
+## Explaining OwlBot, and showing the way
+
+A second built-in skill, `how-owlbot-works` (`OWLBOT_EXPLAINER`,
+`withOwlBotExplainer`), explains each feature in a few lines: what it is,
+how it behaves, where it lives in the app, what an agent can do about it
+and what only the person can. It is written from this file and the
+README, and names every Settings page id, which `test/agent-guide.test.ts`
+holds to `SETTINGS_PAGE_LIST`, so a page added without a line there fails
+the build. Explaining is harmless, so it goes to every turn that can read
+a skill on demand. That is exactly the turn `using-owlbot` goes to:
+reading on demand is `owlbot skill`, on the full credential, and an API
+engine has no tool that reads a skill.
+
+Where things are is data both sides read: `server/settings-index.ts`
+holds the Settings index (pages, groups, words, rows, redirects) and the
+main places (Overview, Automations and its tabs, Memory, Plugins and its
+tabs, Usage, and `agent`, one agent's own settings). The app draws its
+Settings list and search from it (`src/lib/settingsPages.ts`), and holds
+every key in it to the catalogue at typecheck. The server reads the same
+list in English from the catalogue beside it (`server/where.ts`: next to
+it in a checkout, `Resources/locales` when packaged).
+
+- `owlbot where <words>` is `GET /api/agent/where?q=`: the best places for
+  the words, each with its id, the path in words ("Settings, Behaviour"),
+  the rows that hold the words and the `open` command for it. A place
+  that holds every word ranks first, as the app's search keeps only
+  those; one that holds some is kept below it, since an agent's words
+  are looser than a search box's. Reading only.
+- `owlbot open <page-id> [--row <row>]` is `POST /api/agent/open`: a card
+  in the conversation the turn runs in (`Message.card.open`, an
+  `OpenPlan`) with one button. In the desktop window it dispatches what
+  the app's own links do (`toggleAppSettings` with the page and, new, a
+  `row`, which `AppSettingsPanel` scrolls to and lights the way a search
+  result is; `toggleRoutines` with a tab; `openCustomize`; `openMemory`;
+  `openPage`; an agent's settings), and changes nothing. A workspace's
+  own page in a window with no workspaces, and a client that does not
+  know the card, show the way in words: the card's title and subtitle
+  carry it for the iPhone.
+
+### Settings an agent proposes
+
+`owlbot settings propose` with nothing after it lists what may be
+proposed, with each value now (`GET /api/agent/settings/proposals`).
+`owlbot settings propose <setting> <value> --why "<reason>"` is the POST:
+`server/settings-proposals.ts` decides, and a refusal changes nothing.
+The list (`PROPOSABLE`) is everyday preferences only: Behaviour's
+recall, nightly tidy, summarise as you go, other changed files and skill
+suggestions; the morning brief's switch, time, notifications and
+sections; the proposing agent's own notifications, effort and model (a
+model of the engine it is on); and the effort new agents start on.
+Everything about approvals and rules, keys, secrets and sign-ins,
+engines, members, invites and roles, phones and pairing, remote access
+and OwlBot Cloud, the plan, billing and spending limits, the chain limit
+and the task budget, backups, moving and exporting, deleting, the OwlBot
+browser's sites, Home Assistant and security is refused by subject
+(`REFUSED`) with `owlbot open <page>` for where to send the person; any
+other name is refused with the list and `owlbot where`.
+
+An accepted proposal is a card (`Message.card.settingsProposal`, a
+`ProposalCard`) carrying the setting, its name, the way there, the
+value now, the value proposed and the reason, and the command waits up
+to a minute (`OWLBOT_SETTINGS_WAIT_MS`) for an answer; `owlbot settings
+proposal <id>` waits again. The card holds everything the change needs,
+so a Change pressed after a restart still applies. Change and Keep are
+`POST /api/settings-proposals/:lane/:message/(change|keep)`, the
+owner's alone (on `NEVER`, and refused to a member's credential). Change
+reads the setting again as things stand, builds the request the Settings
+page itself sends (`PUT /api/config`, `PATCH /api/briefs/settings`,
+`PATCH /api/bots/:id`) and makes it as the person at this computer, on
+loopback with no credential, so its checks, its save and its broadcast
+are the page's own. It is recorded as `settings.changed` with actor
+`you`. The agent hears how it went from the command still waiting, or
+at the start of its next turn in that conversation, once (`told` on
+the card).
+
+### Models an agent proposes for other agents
+
+An agent's credential reaches another agent's `PATCH /api/bots/:id` for
+its place in the sidebar only, and that stays so. To change other
+agents' models (GitHub 497) it proposes them instead. `owlbot models` is
+`GET /api/agent/models`: the engines, each with its models and whether
+it is switched on, and every agent with the engine and model it is on.
+`owlbot models propose <agent> <engine> <model> [...] --why "<reason>"`
+is `POST /api/agent/models/proposals` with `{ changes: [{ agent, engine,
+model }], why }`, read by `server/model-proposals.ts` against the agents
+and engines there are now: an agent by id or by a name only it has, an
+engine by id or name, a model the engine lists (or its default), up to
+`MAX_TARGETS` agents, each once. An engine whose catalog
+`acceptsAnyId` (Claude Code, whose list ships with OwlBot) also takes a
+model id it does not list, held to the picker's rule for a typed id
+(GitHub 121: `MAX_MODEL_ID_CHARS`, the model id characters), so a model
+newer than this version of OwlBot can be proposed (GitHub 517); the card
+marks it as the picker does, and `owlbot models` says `anyModelId` for
+such an engine. A model the engine does not list and would not run, an
+engine that is not there or is switched off (unless the agent is on it
+already), an agent that is not there, and an agent already on that
+model are each refused, all of them in one answer, and nothing is
+proposed. A member's own agents are not listed, and a proposal is only
+made in a conversation the owner reads, never on a hosted workspace.
+
+An accepted proposal is a card (`Message.card.modelProposal`, a
+`ModelProposalCard`) listing each agent, the engine and model it is on
+as saved, and the engine and model proposed; the command waits as a
+settings proposal does, and `owlbot models proposal <id>` waits again.
+Apply and Keep are `POST /api/model-proposals/:lane/:message/(apply|keep)`,
+the owner's alone at this computer: on `NEVER`, and refused to a
+member's credential, a paired device and the web door. Apply checks
+every agent again (`blockers`): one whose saved engine and model are no
+longer what the card says, one gone, or an engine or model no longer
+offered fails the whole card, and nothing changes. Otherwise every
+agent is changed in one write (`store.patchBots`), only its
+`modelSelection`, read back, broadcast, and recorded as
+`settings.changed` with actor `you`, one entry per agent. A turn under
+way keeps its engine; the next one uses the new choice. The agent hears
+the result per agent from the command still waiting, or at the start of
+its next turn in that conversation, once.
+
+One proposal waits at a time per agent in a conversation, so a card the
+conversation has moved past would hold the next one up until the owner
+found it. `owlbot models withdraw <id>` is `DELETE
+/api/agent/models/proposals/:id` (GitHub 518): the agent that made the
+card, and only it, closes it while it has no outcome, as `withdrawn`,
+with nothing changed and nothing told at its next turn; the app says it
+was withdrawn and asks nothing. Apply, Keep and a withdrawal each settle
+the card at once, so whichever comes first stands and the others are
+refused. The refusal of a second proposal names the open card's id and
+this command.
+
+### Models changed by the owner's instruction in chat
+
+A proposal waits for Apply at the computer OwlBot runs on, which is in
+the way when the owner has already said exactly what they want from a
+paired Mac or their own private Telegram chat (GitHub 544). `owlbot
+models apply-instruction [--message <id>]` is `POST
+/api/agent/models/instruction` with `{ message }`, and an API engine has
+the same as its `apply_model_instruction` tool. The agent only names the
+owner's message (no id is their newest in the conversation); anything
+else in the body is not read, and the answer lists it as `ignored`.
+The authority is the message, read by the server as stored
+(`server/model-instructions.ts`):
+
+- `notOwners`: the owner's own words, typed in the app, on a paired
+  device, or in the owner's own private Telegram chat. Not a member's
+  or a guest's (`author`), another agent's, a routine's, a goal's, a
+  notice, anything that came in `via` mail, a webhook or a bridge, a
+  Telegram contact, delegate or group, Signal, a message sent on
+  somebody's behalf, brought over from another conversation, queued,
+  taken back or with its delivery unsettled.
+- `instructionMessage`: in the calling agent's own conversation (not a
+  member's, a team's or a room's), at most `INSTRUCTION_MAX_AGE_MS` (30
+  minutes) since it was written, not edited after it was heard, and the
+  newest of the owner's messages there or the last one before the turn
+  started. The turn has to be running, the credential's own (`seq`), and
+  the owner's (`runsAsOwner`); a reply or messenger credential is
+  refused.
+- Once: the answer is kept on the message (`Message.modelInstruction`,
+  server written), so a second call for it changes nothing and answers
+  the first result again, with `again`.
+
+`parseInstruction` reads the words with fixed rules, in English and
+Ukrainian, typed or dictated: "change/update/switch/move/set [all |
+named agents | all except X] [from | on] A to B", "all A agents to B",
+"to B for everyone", and "upgrade/update [...] to the new/latest
+version" (or "upgrade all"). Courtesy around it and "and tell me what
+changed" are dropped. A question, a negation, a condition, reported
+speech, a quoted command, more than one instruction, an exception that
+cannot be read, or a message over `MAX_INSTRUCTION_CHARS` is no
+instruction. `planInstruction` reads it against the owner's agents
+(`modelWorld`, as for proposals): agents by name (a Ukrainian case
+ending allowed when it still names one), an exception that names nobody
+stops everything rather than becoming "all", and each agent stays on the
+engine it is on. Both models are resolved on that engine as its picker
+would (`modelNamed`: an id, a label, either without the maker's name, or
+on an engine that `acceptsAnyId` an id `pickerTakes` that is no prefix
+of a listed one); a model that could be two, or that no engine of the
+agents asked about has, plans nothing and the agent is told to ask which
+model the owner means. A model only another engine lists is skipped and
+pointed at a proposal. "The new version" follows `successor` in the
+engine's `ModelCatalog` to its newest (`newestOf`): Codex's own
+`upgrade` field where `model/list` gives one that names another model it
+shows, or a pair kept with Claude Code's built in list. An alias is no
+lineage, and a model with none is skipped with "ask"; when nothing in
+scope has one, the agent asks.
+
+The plan is checked again against what is saved (`blockers`, as for a
+proposal), then written in one `store.patchBots`: only `modelSelection.model`,
+on the same `instanceId`, with nothing awaited between the check and the
+write. A set that no longer matches writes nothing over a later edit.
+Effort, backups, accounts, permissions and defaults are not in the
+patch; a turn under way finishes on its model. Each agent is read back
+as saved: `changed` (agent, engine, from, to), `skipped` with why,
+`unverified` where the read back differs, or `nothingMatched`; each
+change is `settings.changed` with actor `you`. The agent tells the owner
+from that answer. Proposals stay for engine switches, other people's
+agents and anything unclear.
+
+## Rule suggestions
+
+When the owner keeps answering the same approval the same way, OwlBot
+offers to make it a rule (`server/rule-suggestions.ts`). Each answer the
+owner gives to an approval card for the owner's own request (not a
+shared room member's, an email's or a Telegram contact's, and not one a
+rule or a mode answered) is noted with its tool and the one target it
+named, in `~/.owlbot/approval-habits.json` (a month, at most 2,000).
+Five approvals of the same tool and target pattern within 14 days, and
+no refusal of it in that window, make a suggestion. The pattern is the
+narrowest thing the approvals share: the exact command, or the words a
+family of plain commands starts with (`runs`), the folder the files were
+directly in (`in-folder`), the site the pages were on (`on-site`), or the
+tool alone. Commands that run whatever they are given (a shell, an
+interpreter, curl and so on) are only ever offered word for word. Each
+narrow operator reads its one field rather than comparing text (`runs`
+refuses anything chained, piped, redirected or substituted), a rule can
+be held to one tool (`Rule.tool`), and a build that does not know an
+operator never lets it allow. It is offered for the agent that asked,
+when that agent alone reached the count, and for every agent only when
+more than one did. Nothing on the safety floor (`server/safety-floor.ts`:
+deleting, money, credentials and the places they live, OwlBot's own
+folder) is offered, an allow rule that is narrow or tool-held never
+covers anything on the floor later either, and nothing a rule already
+decides (allowed, or refused) is offered. `GET /api/rules/suggestions`
+lists them; `POST /api/rules/suggestions/:id/accept` with
+`{ "scope": "agent" | "everyone" }` writes an ordinary rule through
+`cleanRule`, recorded as `policy.changed`; `.../dismiss` keeps one quiet
+for 30 days. The desktop shows the first for an agent in its composer's
+tray and all of them above the rules in Settings, and the morning brief
+counts them as ready for a look. None of these routes is reachable with
+an agent's credential.
+
+## Approval modes
+
+An agent's `approvals` is `ask`, `edits`, `auto` or `full`, and new agents
+start on `cfg.agentDefaults.approvals` (`GET`/`PUT /api/approvals`, which
+can also move every agent; never reachable with an agent's credential).
+The first three are OwlBot's own gate: deny rules first, then the mode
+decides whether a request becomes a card. `full` also sets `fullAccess`
+on the turn, and each driver takes its engine's own guard off: Claude
+Code runs with `bypassPermissions` and no approval bridge, Codex with
+`danger-full-access` and `approvalPolicy: never` (stated on resume too),
+ACP engines in their `yolo` mode (Antigravity with
+`--dangerously-skip-permissions`). Nothing asks, so rules cannot refuse
+anything in that mode. A shared room never gets `fullAccess`, and nor
+does an email from anyone (see Email your agent): a turn somebody other
+than the owner asked for is held to the owner's yes, whatever the mode.
+
+The agent's command line (`bin/owlbot.mjs`) reaches the workspace over
+this computer's own address, so it needs network access even though
+nothing leaves the machine. Outside `full`, Codex runs commands in its
+`workspace-write` sandbox, which has no network access unless Codex asks
+for it and the person allows it, and a `owlbot` command run inside it
+cannot connect. The command line says so (`network access required`,
+with the address and "run the same command again with network access
+allowed") rather than `fetch failed`, and `owlbot help` carries the same
+note, so the agent asks for the access instead of reading it as OwlBot
+being down (GitHub 251). A workspace that is not running answers
+`nothing is answering at <address>` instead.
+
+## Questions of several
+
+An engine can put several questions in one ask: Claude Code's own
+AskUserQuestion takes up to four (each with a short header, options with
+descriptions, and `multiSelect`), and Codex's `requestUserInput` a list
+whose questions each say whether words are an answer (`isOther`) and
+whether they are secret. `server/harness/ask-questions.ts` reads either,
+and OwlBot's own `ask_user`, into one shape, and the drivers put it on
+`request.opened` as `questions`. The card keeps it beside the fields it
+always had: `subtitle` is still the first question with "(+N more)" and
+`options` its choices, because the iPhone app and older windows read only
+those. It also carries `agentSaid`, the agent's own last words in that
+turn before it asked (never an earlier turn's, never another speaker's
+in a room, and none when it said nothing first), with `agentSaidId`, the
+message they came from. The card shows them only while that message is
+out of view in the transcript, since on screen just above, a copy is
+only in the way; a change waits while the card is being pressed.
+
+The app steps through the questions on one card (`OptionCard.tsx`,
+`src/lib/askSteps.ts`) and answers with `answers` on
+`POST /api/bots/:id/respond`, one list of strings per question.
+The server checks them against the ask (no more lists than questions,
+one answer for a single choice, every string bounded) and hands them to
+the engine in its own structure: Claude Code's `answers` keyed by
+question text, several picks joined with commas; Codex's answers keyed by
+question id. A client that sends only `message` answers the first
+question, and the others go unanswered: Claude Code reads a note in
+`annotations` saying they were not shown, Codex reads the same note as
+their answer. Timeouts, a put aside card and the turn ending still say
+the same thing to every question. Once the engine has them the card keeps
+the answers (`answers`), for its answered line to open to; a secret
+question's answer is never kept there, nor said in a conversation, and
+Codex's native log redacts it. Feature `question-steps` says a server
+takes `answers`.
+
+## Reasoning effort
+
+An agent's `effort` is `off`, `low`, `medium`, `high`, `xhigh` or `max`
+(Off, Low, Medium, High, Extra high and Max on screen), or unset for the engine's
+own. Each driver lists the levels it passes on as
+`capabilities.efforts`, and `GET /api/instances` reports them per engine
+as `efforts`: Claude Code `low` to `max`, as `--effort <level>` on every turn
+(from 2.1.252, the oldest CLI checked; an older one is sent none);
+Codex `low` to `max` as `turn/start.effort`, narrowed per model by the
+`supportedReasoningEfforts` in its own `model/list` (reported as each
+model option's `efforts`); Grok CLI `low`, `medium` and `high`, as
+`--reasoning-effort`. Command Code (its `effort` option) and Devin (its
+`thought_level` option) take their levels per model over ACP, one config
+option path for both (`effortOption` in `ACP_SPECS`): the catalog probe
+reads each model's choices in an empty session, and every turn, fresh or
+resumed, selects its model first and then the bot's level, nearest
+first, and stops before the prompt when either is not confirmed. Devin
+spells Off `none` (`effortValues`). Use engine setting on a resumed
+session restores the native default the probe read, rather than keep an
+override a turn left; Command Code's provider default (`default`) cannot
+be selected again once a level was, so there OwlBot opens a new native
+session told the conversation, and without that handoff it refuses rather
+than lose the conversation. Devin's model names carry the lead's effort
+words, which the picker leaves out, since the separate selector decides;
+a Fusion sidekick keeps its level. The other engines have no dial and
+are sent no effort setting.
+
+A level being chosen (`PATCH /api/bots/:id`, `POST /api/bots`, which is
+`owlbot hire --effort <level>`, or New agents with a model picked) has to
+be one the agent's engine and model take; anything else is refused with
+the levels that engine has. A level already saved stays when the agent
+moves to an engine without it, so moving back brings it back, and an
+engine with no dial keeps whatever it is given. Dispatch sends the
+nearest level the engine running the turn has, the lower of two equally
+near, so a saved `max` on Grok CLI runs at `high`, and the pickers show
+that level with a line saying why. `null` on a patch goes back to the
+engine's own. An exported agent carries its level as it was.
+
+## Security checkup
+
+Settings has a Security checkup page (`src/components/SecurityCheckup.tsx`)
+that lists everything letting an agent, a device or a stranger reach
+further than the person may remember choosing, each as "ok", "worth a
+look" or "risky", with one sentence on why it matters and the way to
+narrow it. `securityReport` in `server/index.ts` gathers names and counts
+from what is stored (never a key, a secret's value, a device token or a
+webhook address), and `checkup` in `server/security.ts` decides what to
+say: agents in full access (risky), pairing on and how many devices,
+email open to anyone and which agents' engines would refuse unlisted
+mail, shared rooms opening the owner's tools, agents with a browser or
+the use of this machine, saved secrets by name, the modes of `~/.owlbot`
+and its key files (`config.json`, `webhooks.json`, `pair-links.json`,
+`people.json`, `identities/`; anything but 0700 and 0600 is risky),
+webhooks switched on, engines an agent uses that are signed out, and
+automatic backups when the build has them. Engines are asked through
+the half minute snapshot cache.
+
+Most fixes are links to where the setting already lives. The page does
+three things itself: it moves an agent from full access to Auto (the
+ordinary `PATCH /api/bots/:id`, since narrowing never needs asking
+twice), puts file modes back (`POST /api/security/permissions`, which
+leaves a link inside the folder alone, since changing its mode changes
+whatever it points at), and forgets a saved secret
+(`DELETE /api/security/secrets/:name`). All three routes and
+`GET /api/security` answer only this machine: never a phone, a paired
+browser, a remote window or an agent's credential, and `/api/security`
+is on the agents' never list too. When something is risky, Settings
+wears a red dot in the sidebar and the page a count in its list
+(`src/lib/securityCheckup.ts` holds the one shared report); worth a look
+waits on the page.
+
+## Local CLI plugins
+
+Settings, Plugins has a CLIs list beside Apps, MCPs and Skills: tools on
+this computer that agents use from their own shell (`server/cli-plugins.ts`,
+`src/components/CliPlugins.tsx`, GitHub 387). GitHub is the first, as git
+and gh. An app connected through Composio gives agents tools that call
+GitHub for them; it does not make `git clone` of a private repository,
+`git push` or `gh pr create` work in the agent's shell, which sign in
+however this computer's git and gh are set up.
+
+`checkGitHubCli` finds git and gh with the PATH every turn starts from
+(`server/path.ts` widens it the same way for both) and asks gh
+`auth status --json hosts` (the words of an older gh otherwise) who is
+signed in to github.com, whether that still works, and where gh keeps it:
+the system keychain, a file, or an environment variable. It never runs
+`gh auth token` or asks status to show one. On a Mac without the
+developer tools `/usr/bin/git` is the installer stub, so it is never run
+(the checkpoint rule). Git counts as set up when its global config sends
+github.com credentials to `gh auth git-credential`. What is missing comes
+back as the next step, in order: git (`xcode-select --install`), gh
+(`brew install gh` when Homebrew is here, else cli.github.com), sign in
+(`gh auth login --hostname github.com --git-protocol https --web`, opened
+in Terminal the way an engine's sign-in is, with the command to copy for a
+computer reached over SSH, where gh's device code works from any browser),
+and `gh auth setup-git`, which the app runs with the gh it found.
+
+`GET /api/cli-plugins`, `POST .../github/check`, `PUT .../github`
+(`enabled`, kept as `cliPlugins.github` in config.json), and the
+`install`, `sign-in` and `setup-git` steps answer only a window on this
+computer: never a phone, a member or an agent (`/api/cli-plugins` is on
+the agents' never list). While the plugin is on, the owner's own turns
+on an engine with a shell are told gh is signed in, as whom, and to use
+git and gh as usual (`ghHint`), from the last check, which is redone in
+the background when it is ten minutes old. Turned off, agents are told
+nothing; gh stays signed in.
+
+OwlBot keeps no copy of gh's sign-in, and it cannot keep it from an agent:
+an agent runs as the person, and gh hands its token to whoever runs
+`gh auth token`. The page says so, and points to a protected connection
+for agents that should never hold a token.
+
+## Connections
+
+A connection is a credential an agent uses without ever holding it
+(`server/connections.ts`, GitHub 386). A saved secret is the other kind:
+it is in every owner's turn's environment, so the agent has the value.
+
+The person adds a GitHub token in Settings, Plugins, CLIs, GitHub
+(`POST /api/connections`). OwlBot asks GitHub's `/user` whose it is and
+keeps it in config.json (`connections`, 0600, beside the saved secrets,
+left out of a backup without a passphrase like them, and scrubbed by
+`redactSecrets`). One per service for now. Grants are kept on the
+connection, never on the agent's record, which an agent may partly change
+itself: `PATCH /api/connections/:id` with `grants: { agentId: "read" |
+"write" | null }`. A member's own agent cannot be granted one.
+`POST .../check` asks GitHub again, `GET .../audit` lists recent use and
+`DELETE` forgets the token. All of it is the owner's, from this window or
+a device of theirs; never an agent (never list) or a member, on their
+device or with their credential here.
+
+An owner's own turn, on an engine with a shell, for an agent with a grant,
+gets an address and no value. The address carries a handle minted for
+that turn and bound to the turn's own credential
+(`http://127.0.0.1:<port>/connect/<handle>/<host>/<path>`): it ends when
+the turn does, and it is never given to a shared room, a member's turn,
+a stranger's mail or a Telegram person's. The turn's environment has
+`OWLBOT_GITHUB_API` (the address for api.github.com) and git's own
+environment config, `url.<address>/github.com/.insteadOf https://github.com/`
+and an empty credential helper for the address, so `git clone`, `fetch`
+and `push` over https://github.com go through OwlBot without the agent
+doing anything different. Codex is handed the same names as `set`
+entries, since its default policy drops any name with KEY in it.
+
+Each request to an address is decided in `proxyConnection`, before any
+credential is added: only on this computer (never off the relay line);
+the handle's turn still running; the grant still there; the host one of
+the service's (api.github.com, github.com); and the method and path one
+the access allows. Read is GET and HEAD on the API and clone and fetch
+over git; write adds POST, PUT, PATCH and DELETE and push. On github.com
+only git's smart HTTP requests go, so no web page, no LFS (which hands out
+tokens of its own). Some API calls are never sent whatever the grant,
+because each hands someone or something lasting access that taking the
+grant back would not end: account keys, deploy keys, collaborators,
+organization invitations and memberships, team memberships, and
+webhooks. Then the agent's own authorization, cookies and anything not on
+a short list of headers are dropped, the credential is added (Bearer for
+the API, Basic `x-access-token` for git), and the request goes to that
+host and nowhere else. A redirect to one of the service's hosts comes
+back through the address to be checked again; anywhere else it goes as
+it is, and the client follows it without the credential. A 401 from the
+service is said in words as a 502, so git never asks a credential helper
+for the address. Text responses are asked for uncompressed and held, at
+most 16 MB, so the token (and its git form) can be taken out of headers
+and body should a service ever echo it; a response too large to check is
+not passed on. Every request, sent or refused, is one line in
+`connections-audit.jsonl`, about a megabyte at most, shown as Recent use.
+
+What this protects: the token is never in an agent's environment, prompt,
+files, command line or output, never in a transcript, log or other file
+OwlBot writes, and never sent to another host; a turn's address stops at
+the turn's end, at the next request after a grant is taken back, and
+when the connection is removed. What it does not: an agent can misuse
+what it was granted, reading everything the token can read, or with
+write pushing and opening and closing what the token can, so the token
+should be fine-grained to the repositories and permissions the work
+needs. An agent can use its address for anything that runs during its
+turn. It runs as the person, so it could read config.json with a file
+tool if the person let it read outside its folders, and gh's own sign-in,
+when there is one, is open to any agent with a shell; Settings says this
+beside the grants. Codex in its `workspace-write` sandbox has no network,
+so the address needs the same allowance a `owlbot` command does.
+
+A connection here is the owner's, as the saved secrets and the Composio
+key in Settings are: used in the owner's own turns. A member's own apps
+and keys are kept apart, per person, and used in that member's private
+turns alone (People in a workspace). A member's own GitHub connection
+through this gateway is not built yet: a member's turn holds no
+credential of the agent's, and an address rides on one; giving a
+member's turn a credential that can do nothing but reach its own
+connection comes first.
+
+Not built yet: `gh` itself through a connection (gh will not talk to an
+address over plain HTTP for github.com, and teaching it to would need a
+certificate the system trusts), more than one connection per service,
+other services and custom ones, method and path rules the person writes,
+query and body field rules, response scrubbing rules beyond the
+credential itself, and sessions OwlBot logs in to and out of. A gateway
+such as a self-hosted OneCLI could later stand behind the same address
+and grants, with `upstream` pointed at it rather than at the service; the
+grant and audit stay here either way.
+
+## Workspace extensions
+
+An extension is a folder the owner installs into one workspace: up to
+four panels, a hidden background document, commands, handlers for a few
+workspace events, and settings (`server/extensions.ts` for the rules,
+`server/extension-routes.ts` for the routes and what is kept,
+`src/lib/extensions.ts` and `src/components/extensions/` for the page,
+GitHub 507). The author's side is `docs/EXTENSIONS.md`.
+
+Panels live in the side dock (`src/lib/dock.ts`): while any running
+extension has one, the ribbon offers an Extensions panel (the puzzle
+piece), in chats and rooms alike, which opens, hides and is remembered
+per conversation like the dock's other panels. Inside it each extension
+panel is a tab (`ExtensionDock.tsx`); which is in front, and which have
+been opened since the window loaded, is the page's (`useExtensionPanels`),
+and those stay mounted out of sight so switching keeps their state, as
+the dock keeps the terminal's. A command or `panel.open` brings its panel
+to the front and opens the dock of the conversation on screen on it;
+Open on the extension's page in Settings does the same and goes there.
+
+**The manifest.** `owlbot-extension.json` at the top of the folder:
+`manifestVersion` 1, an `id` (2 to 40 lower case letters, digits and
+dashes), `name`, `version` (`1.0.0`), `description`, `author`, `owlbot`
+(a range: `*`, `>=3.3.0`, `<4`, `^3.3.0`, `~3.3.0`, `3.3.1`, spaces
+meaning and), `permissions`, `panels` (`{ id, title, entry }`),
+`background` (an HTML file), `commands` (`{ id, title, description }`),
+`events` and `settings` (`{ key, label, type: text | boolean | number,
+default }`). `checkManifest` collects every problem rather than the first:
+an unknown permission or event, an event whose permission is not asked
+for, an entry that is not an `.html` file in the folder, a range this
+OwlBot is outside, commands or events with nothing to hear them, a folder
+that adds nothing. Names lose control and reordering characters.
+
+**Permissions**, each with the words the install screen shows
+(`PERMISSIONS`): `agents:read` (names, and whether each works),
+`turns:read` (a turn's start and end, by agent and conversation, never
+what was said), `agents:message` (high: a message to an agent, only
+right after the owner runs one of its commands), `composer:write`
+(words into a message box for the owner to send), `storage` (its own 256
+KB) and `notifications`. There is no permission for a secret, a
+connection, a key, a file, the network, another workspace or an agent's
+credential, because nothing an extension can call reaches one.
+
+**Installing.** `POST /api/extensions/inspect { path }` reads the folder
+once into memory (`snapshotFolder`: hidden files left out, a link
+anywhere refuses it, at most 200 files, 2 MB each, 5 MB in all), hashes
+it (`digestOf`, sha256 over sorted names, sizes and bytes) and answers
+the manifest, its permissions in words, every problem, and for an update
+what it asks for that the installed one was not granted (`installed.added`).
+`POST /api/extensions { path, digest, grant }` reads it again and refuses
+(409) unless the hash is the one looked at and `grant` is exactly the
+manifest's permissions: what was shown is what is installed, and an
+update is where a permission would otherwise slip in. The bytes that were
+hashed are written to `<data>/extensions/<id>/` through a staging folder
+renamed into place (`writeInstalled`); `extensions.json` (0600) keeps the
+manifest, the source, the grant, the hash, `enabled` and the owner's
+setting values. An update keeps `enabled`, settings that still exist and
+its storage. Thirty per workspace. Installing is from a folder on this
+computer, in its own window (`local && !namesMember()`); GitHub release
+URLs are not built yet.
+
+**Who.** `/api/extensions` is the owner's, from this computer's window
+or a device of theirs (`local ? !namesMember() : ownerDevice`), never a
+member and never an agent (on `NEVER` in `server/agent-cli.ts`, and the
+route refuses `asAgent` itself). A member's credential on this computer
+is taken at its word. A phone may list, switch and remove, never install.
+Disabling (`PATCH { enabled }`) makes every running route answer 409;
+`DELETE` removes the files, the storage and the record, and every window
+drops its panels, commands and frames with the next list
+(`{ kind: "extensions" }` on the stream).
+
+**The sandbox.** `GET /api/extensions/:id/frame/:panel|background` serves
+one document, after `readInstalled` finds the files still hash to what
+was approved (otherwise 409, and the list says `intact: false`: an agent
+able to write the data folder cannot change what the owner approved).
+`inlineAssets` folds in its own scripts, stylesheets and images (paths
+by `insidePath`: relative, no climbing, no scheme, nothing hidden);
+anything else is left to fail. `frameExtensionDocument` puts the policy
+again as a meta tag, the app's colours as variables (OwlBot's own and the
+plain `--background`, `--foreground`, `--brand` other hosts use), and the
+SDK (`FRAME_PRELUDE`) ahead of the extension's markup. The header is
+`EXTENSION_CSP`: `sandbox allow-scripts` (an opaque origin wherever it is
+loaded), `default-src 'none'`, inline scripts and styles only, no eval,
+`connect-src`, `frame-src`, `worker-src`, `form-action` and
+`object-src 'none'`, `frame-ancestors 'self'`, with no-store, nosniff, no
+referrer and a permissions policy refusing devices. The page frames it
+with `sandbox="allow-scripts"` and nothing else. The prelude takes WebRTC
+away, which no policy covers. A frame can always navigate itself, and the
+packaged page's own `frame-src 'self'` stops it leaving for another
+origin; the desktop app refuses any navigation away from the document
+(`leavesExtensionFrame` on `will-frame-navigate`, `electron/navigation.mjs`),
+and in any browser a frame that loads a second time is taken down rather
+than talked to (`ExtensionFrame`). A request it somehow made to the API
+would carry Origin null, which `isLocalRequest` refuses.
+
+**Calls.** `window.owlbot.call(method, params)` posts to the page.
+`ExtensionHost` knows a frame by its window, never by what it says, reads
+the message into one of three shapes (`parseFrameMessage`: `ready`,
+`error`, `call` with at most 64 KB of parameters), checks the grant
+(`callVerdict`) and answers the page's own calls itself: `agents.selected`,
+`composer.insert` (into the box the way a failed send comes back, so
+nothing typed is written over), `notify` and `panel.open`. The rest go to
+`POST /api/extensions/:id/call`, which checks the grant again (`mayCall`,
+the same table, held to the page's by a test): `agents.list` (id, name,
+working; the owner's own agents only, `agentsForExtension`),
+`settings.get`, `storage.get|set|remove` (`extension-data/<id>.json`,
+0600) and `agents.message`. A message goes only within thirty seconds of
+the owner running one of that extension's commands, once per run
+(`CommandWindows` on the page), at most twelve an hour (`messageRoom` on
+the server), to the agent's first conversation, queued like any message,
+framed as the extension's words and marked `via: "extension"`; the turn
+runs with the agent's usual approvals. An extension never starts a turn
+from an event or a timer.
+
+**Events and commands.** The page derives the events from what it already
+hears (`eventFromFrame`, `noteExtensionFrame` in the store; replays after
+a reconnect are not news): `turn.started` and `turn.finished` with
+`{ agentId, conversationId }`, `agents.changed` with the list,
+`selection.changed` with the agent on screen, and `theme.changed`, which
+the prelude also applies to the variables. A frame hears an event only
+when its manifest named it and the grant covers it (`hears`). Commands
+are in search as "Extension: command" and on the extension's page; one
+goes to the background document, else a panel, opened first if need be,
+with the agent on screen as context for an extension that may see agents.
+Background documents run while an owner's window is open. An error a
+frame reports is kept beside its name in Settings with Switch it off;
+it never reaches a turn.
+
+**Native sidecars and app watchers (GitHub 524).** A sidecar's interface
+is a panel extension: static HTML from its folder in the side dock's
+Extensions panel, kept mounted across its tabs and while another panel is
+in front, with the plain colour names a sidecar reads. Its event handlers are the extension's. What is not built, and
+why: a sidecar's own process (a supervisor, ports, health checks)
+would run as the owner outside any sandbox; handing it
+`OWLBOT_AUTH_TOKEN` is handing it the owner's credential; writing its tools
+into a project's `.mcp.json` changes other tools' settings; and
+emulating another vendor's host RPC is a protocol of theirs to track. A
+local tool that should start a turn already can, through a signed webhook
+(Webhooks), and one with tools is an MCP server. An extension that needs
+a process has to wait for a runner that sandboxes one per platform and
+a credential that can reach nothing but the extension's own calls.
+
+Not built yet: installing from a GitHub release (a download into the same
+look, hash and grant), extension panels on a paired phone's own app,
+`settings` of a secret kind, per-agent or per-room scoping of a grant,
+more events (an approval waiting, a routine's run) and a way for a
+background document to run with no window open.
+
+## Boundaries worth knowing
+
+- `server/http-guard.ts` checks `Origin` and `Host` on every request.
+  Loopback is not a boundary in a browser.
+- `server/limits.ts` holds every input cap in one place.
+- `redactSecrets` scrubs stored keys and key-shaped strings from anything
+  returned to the client.
+- Approval requests block the turn. The driver holds the provider's
+  request open until `respondToRequest` resolves it.
+
+## Engine setup
+
+`server/engine-setup.ts` installs an engine CLI when the person presses
+Install, and opens Terminal at its sign-in when they press Sign in. Installs
+run through the person's login shell, so they see the same node and PATH
+their Terminal does, and write only under `~/.local`: the native installer
+for Claude Code, `npm install -g --prefix "$HOME/.local"` for the npm ones.
+A failure comes back as the next step (install Node, check the network)
+with the installer's own output behind a disclosure. The routes answer
+only a window on this computer and never an agent. Claude Code and Codex
+report signed in or not (`claude auth status`, `codex login status`), and
+the first-run check counts an engine as ready only when it is both.
+
+What a person runs by hand comes from `server/engine-commands.ts`: one
+line per engine for macOS and Linux and one for Windows, each the line
+its maker documents (the native PowerShell installers for Claude Code,
+Antigravity, the Grok CLI and Cursor, plain `npm install -g` for the npm
+ones, which on Windows install into the person's own folder). The
+settings hint (`keyHint`), the catalog row's `install`, the first-run
+check and a driver's "not installed" error all read it. On Windows the
+install and update scripts, which are POSIX shell, do not run:
+`GET /api/engines/setup` answers `runs: false` with the PowerShell lines
+to install and, where the engine does not update itself, to update, and
+the app shows those to copy in place of the buttons. A workplace is
+reached with `sh`, so its install line is the POSIX one whatever this
+computer is.
+
+## Where an agent works
+
+An agent whose engine runs a program (Claude Code, Codex, Antigravity and
+the ACP agents) can work in a Docker container or on another machine
+over SSH (`bot.workplace`, set with `PUT /api/bots/:id/workplace`, the
+owner's alone on this computer). Three files:
+
+- `server/workplace.ts` is pure: the shape of a place, the checks a saved
+  one passes, and the exact command lines (`docker run`, `docker exec -i`,
+  `ssh -T` with its options and reverse tunnel), the bootstrap and the
+  preamble, the probe a Test runs and the sentences it becomes.
+- `server/workplace-run.ts` runs them. Before a turn it gets the place
+  ready (makes, starts or remakes a container OwlBot made, labelled with
+  the agent and a hash of the settings it was made from; checks a host is
+  there) and asks it one quick question, its home and whether it has
+  Node. `begin` then opens the gate for the turn's tokens and a gate
+  token of its own, sends the person's attachments ahead and rewrites the
+  words to point at them there, and hands the driver a `PlaceRun`
+  (`SendTurnInput.place`). On `turn.completed`, `end` closes the gate,
+  brings the lane's outbox back into the agent's files, which the
+  artifact sweep then cards, and removes the run's folder there.
+- `server/workplace-gate.ts` is the only way back in: a listener of its
+  own that answers a live turn's token and passes `/api/*` to the
+  workspace with only the headers the CLI needs, and serves each MCP
+  server of the turn at `/mcp/<slug>` as streamable HTTP, running a stdio
+  one here per session.
+
+A driver changes in three places when `turn.place` is set: it starts its
+engine with `place.spawn` (the engine as it is named there, with only the
+turn's environment and the driver's own switches), writes files with
+`place.file` (they travel in the preamble), and points the engine at
+every MCP server through `place.mcp`. The protocol is untouched: the
+process there speaks the same stdio JSON lines.
+
+The bootstrap is one line of `sh` that reads its preamble from stdin up to
+a sentinel random per run, evaluates it (files written `0600` in
+`~/.owlbot/run/<id>`, environment exported, the working folder made and
+entered, its pid written down), and `exec`s the engine, which inherits
+stdin from the byte after. When the local `docker`/`ssh` client exits,
+however it exits, a reaper run there ends that pid (and its group, under
+SSH) if `/proc` still says it is this run's.
+
+OwlBot is reached from there through an SSH reverse tunnel bound to the
+far loopback, at `host.docker.internal` (the bridge's address on Linux,
+where the gate also listens), or with a container's network off, through
+`bin/owlbot-line.mjs`: copied in for the turn and run with `docker exec -i`,
+it listens on the container's loopback and carries each connection back
+over its stdio framed as type, id, length (`server/workplace-line.ts`),
+where the OwlBot opening goes to the gate and the proxy opening accepts a
+`CONNECT` only to the engine's own hosts on 443 (`LINE_HOSTS`).
+
+What assumes this computer's files is decided per place: checkpoints and
+undo run on the folder a container mounts and are off otherwise (the
+agent is told, and the settings say so); rehearsals and shared rooms
+refuse with a sentence; memory is kept through `owlbot memory`; a lane
+records the place its session lives in (`task.where`) and starts a new
+one, told the conversation, when its agent moves. A dropped SSH link
+fails the turn with a notice and the place is looked at again until it
+answers, which the header shows (`workplaceStatus`). A container OwlBot
+made is stopped, or removed, after its idle minutes.
+
+A container of OwlBot's own desktop image (it carries the image's
+`dev.owlbot.vm` label, `server/desktop-image.ts`), which a person can run
+by hand and point an agent at, starts as root while its desktop, its home
+and its computer-use driver are `cua`'s, and the driver refuses root. So
+everything OwlBot runs in one runs as `cua` (`docker exec -u cua -e
+HOME=/home/cua`, also in the commands the person is shown), the Test runs
+the driver's `health_report` that way and is not Ready if it does not
+answer, and an agent there whose Computer is the Local VM gets that
+container's desktop as it, through the same bridge as the Local VM,
+instead of OwlBot's own Local VM (GitHub 541).
+
+## Usage and spending limits
+
+Usage is counted from events the drivers already emit
+(`server/usage.ts`): tokens from `thread.token-usage.updated`, cost from
+`turn.completed`. It is kept in `usage.json` as daily buckets by agent,
+engine and, for a member's turn, the person who started it, about a year
+of them, a convenience rather than an accounting record. It never claims
+to know what is left of a subscription or a key: nothing exposes that,
+and inventing the denominator would be worse than leaving it out. What a
+Claude or ChatGPT plan has left comes from the engine itself, as its last
+turn said (`server/plan-usage.ts`), and OwlBot AI's from its service, as
+shares.
+
+A turn its engine never ran is not usage (`turnRan`): the program is not
+there or could not start, or OwlBot refused the turn before the words
+went. It is not counted unless the engine said it used something after
+all, and a day's bucket that holds only turns that failed with nothing
+to show (`carriesUsage`) is left out of the report and its menus. Limits
+shows a Claude Code or Codex plan only for an engine installed here, one
+with a plan reading, or one that answered a turn in the span in view, so
+a computer without either CLI shows neither.
+
+A cost is an engine's own price when it reports one (OpenRouter does, as
+`usage.cost`). Most API engines report tokens and no price, so a turn that
+comes back unpriced carries its model and tokens, cached input included,
+and is priced from OpenRouter's public model list (`server/model-prices.ts`):
+asked at most once a day while an engine on a key of the person's own is
+set up, with no key and nothing about the person in the request, kept in
+`model-prices.json` with its fetch time, and retried an hour after a
+failure. Matching takes a model id as each provider writes it and only
+ever matches an exact listed name once a date, a host's build tag or a
+dashed version is accounted for; a model the list does not name gets no
+estimate, because a wrong price is worse than none. The person's own
+price per million input and output tokens for an engine
+(`config.json`, `spendPrices`) comes ahead of the list. An estimate is
+kept apart from a reported price (`estimated` on the bucket) and always
+written as one, `~$4.20`. OwlBot AI is never priced and never added to a
+dollar total.
+
+`GET /api/usage/report` is the Usage page's: one span (`range` of `7d`,
+`30d`, `90d` or `month`), for one agent or one engine if asked, and the
+span before under the same filters. The page keeps its choices on the
+device.
+
+A spending limit (`server/spend-limits.ts`) is the person's monthly line
+on an engine that runs on a key of their own (`auth` of `key` or
+`oauth`), in `config.json` as `spendLimits` by engine instance, counted
+from reported prices and estimates for the calendar month, local time.
+At the line OwlBot starts no new turn on that engine, with words saying
+so, or hands the turn to the agent's backup engine, until the line is
+raised or the month turns; a turn already running finishes, since
+stopping it would waste what it had spent. `GET /api/spend-limits` lists
+them and `PUT /api/spend-limits/:instance` takes `usd`, `price` or both.
+Neither is reachable with an agent's credential: a line an agent could
+lift would be no line.
+
+`GET /api/usage-notices?thread=` gives the composer, and a paired phone,
+what is near or at a limit for what that conversation runs on, worst
+first: a Claude Code or Codex plan window used up, past its warning or
+going faster than it renews; OwlBot AI's own notice from its balance; and
+a spending limit near (80%), on pace to run out, or reached. Each says
+"Approaching limit" or "Limit reached" and when it resets, and View usage
+opens the Usage page on that conversation's agent, at Limits. Dismissing
+one holds until it says something new. A plan window's notice also
+carries `planWindow` (`id`, `minutes`), and its title names the window
+the way the Usage card does ("5-hour limit: Limit reached", "Weekly
+limit, Opus: Approaching limit"), so a client that does not read
+`planWindow` still says which one. The composer counts its reset down in
+hours and minutes while it is under a day away, and says the day and
+time after that; a reset already past is marked last reported, with the
+status unknown.
+
+## Your plan
+
+Settings, Plan reads the membership on the licence this computer keeps
+(`server/plan-account.ts`). `GET /api/plan` asks owlbot.dev, with the
+licence as the bearer, for the account and the offers on that plan;
+`POST /api/plan/manage` asks for the billing link only when it is
+pressed; `POST /api/plan/hosting/link` asks for a pairing link to the
+hosted workspace on the licence, for the managed hosting that is coming
+(see Hosted mode); and `DELETE /api/plan/licence` forgets the key here
+and takes the workspace offline. None of them answers an agent or a
+member, a member's credential presented on this computer included. The
+plan and the billing link also answer the owner's own paired devices, so
+the owner of a workspace on a server elsewhere can see the plan and open
+billing from a device of theirs; the answer says `sameComputer: false`
+there, and the page leaves out the key, Hosting and the offers, which
+stay with this computer's own window. The key never comes back to the
+page, only masked. What the site sends is read as unknowns and checked
+one field at a time, with strings bounded and stripped of control and
+direction characters, and a price is shown as the site wrote it, never
+worked out here. The last good
+answers are kept in `plan-cache.json` under a fingerprint of the key, so
+a plan still shows, dated, when the site cannot be reached, and a fresh
+look moves the members and room sharing gates with the plan it reports.
+`OWLBOT_SITE_URL` points it somewhere else for tests.
+
+The desktop app opens an offer with the key in the fragment of a
+owlbot.dev link and nowhere else (`electron/plan-link.mjs`), copies the
+key without the page ever holding it, and opens Settings on Plan for a
+`owlbot://plan` link. Without a key, the page says OwlBot is free with the
+person's own keys.
+
+## OwlBot AI
+
+A monthly allowance on the person's OwlBot licence, with top-ups, pays for
+model use, so an agent can run with no sign-in and no API key
+(`server/credits.ts`, `server/owlbot-ai.ts`). It began as prepaid credits,
+which is why the code, the config keys (`credits.*`) and the routes
+(`/api/credits`) still say credits; nothing saved had to move. The
+allowance lives on owlbot.dev; this machine keeps a token. Activating
+Cloud (`POST /api/relay/activate`) keeps the licence in `config.json`
+beside the other keys and trades it for a token at `POST <base>/token`, with
+the licence as the bearer. A 401 from the service trades it again, one
+exchange at a time however many calls were refused together, and a
+different licence forgets the old token. A host started with
+`OWLBOT_CREDITS_TOKEN` uses that token as given; it is read once and taken
+out of the process environment, so no engine inherits it. `OWLBOT_CREDITS_URL`
+moves the whole service (tests, somebody running their own), and the
+checkout page, which Top up opens, is `/credits` on the same site. A
+workspace whose Cloud was activated before credits existed is asked for
+the key once more (`POST /api/credits/connect`, this computer only).
+
+The service picks the model for every call, so the app knows one model,
+`owlbot-ai`, named OwlBot AI. The OwlBot engine (instance and driver kind
+`owlbot`, displayed as OwlBot AI) is the generic OpenAI-compatible driver
+with `fixedModels`: its catalog is that one model whatever `/v1/models`
+lists, every call asks for it whatever an agent saved (an old `owlbot-auto`
+or a model the service once listed), and a saved selection on it reads as
+`owlbot-ai` on the API. It asks for its credential on every call
+(`CompatAccess`): a 401 is answered by one renewal and one more try, and a
+402 ends the turn with the service's own words, marked `credits: "empty"`
+on the `runtime.error`. It is offered while Cloud is active
+(`creditsOffered`) or the host came with a token, and a turn on an agent
+saved on it while it is not says Cloud is what it needs.
+
+OwlBot AI is the OwlBot engine and nothing else. Claude Code always runs on
+the person's own Claude plan or key: its driver is never handed a base URL
+or a token (`turnEnvironment`). An agent an earlier version had running
+Claude Code on OwlBot AI (`engineAccess: "credits"` in `bots.json`) is
+moved at start, before anything listens to new messages
+(`claudeOffOwlBotAi`): its engine becomes the OwlBot engine's one model, a
+backup on Claude Code becomes the OwlBot engine too (or goes, when the agent
+is on it already), the access is dropped, and one notice in its
+conversation says so. Everything else about the agent stays. It is never
+moved onto the person's own Claude sign-in, even when there is one, and
+since the access goes with the move, nothing matches on the next start.
+An agent on any other engine is left as it is.
+
+Every call says what work it is, in `x-owlbot-work`, so the service can
+choose: `automation` for a routine, a workflow step, the incident desk's
+note to a lead, words a watcher, a standing intent, a webhook or a routine
+left in the lane, a quiet compaction, and a one-shot that is OwlBot's own
+bookkeeping (a summary, the memory tidy, skill suggestions); `coding` for
+an agent whose title, description or skills say engineering; `general`
+otherwise, the new agent draft among them (`workTag`, `turnOrigin`). A
+turn a shared room member started also carries `x-owlbot-member`, a hash
+of that person's id here (`memberTag`), never a name or an address; the
+owner's turns, and anything the owner set up, carry none. The OwlBot
+engine sends both as headers (`SendTurnInput.tags`, only on an engine
+with `CompatAccess`).
+
+What ran underneath, and what it was worth, stays with the service. Every
+event from the OwlBot engine is passed through `scrubEvent` by the bus
+before it is logged or heard: its model is `owlbot-ai`, its cost null, its
+raw frame left behind. Usage counts an OwlBot AI turn under `owlbot`, the
+engine report records its model as `owlbot-ai`, and a shared room's spend
+cap does not book it (the service caps a team's members instead). Every
+agent on OwlBot AI has one more line in its system prompt (`IDENTITY_LINE`):
+it runs on OwlBot AI, and says so rather than guess when asked what powers
+it.
+
+A used-up allowance is workspace wide: the refusal stands (`refused` on
+`GET /api/credits`, on `/api/config` and in a `credits` frame) until a read
+finds something left or a run on OwlBot AI answers, and the composer of
+every agent on it says it with Top up, which opens the checkout page in
+the browser. A turn on OwlBot AI never rests its engine (`recoverTurn`):
+topping up should be felt at once. The token and the licence are in
+`SECRET_PATHS`, so backups strip them and `redactSecrets` scrubs them by
+value.
+
+What is left is read from `GET <base>/balance` as shares, never amounts
+(`readAiBalance`): `plan`, `usedPercent`, `leftPercent`,
+`monthlyLeftPercent`, `topUps` (months' worth still to spend), `renewsAt`,
+`low` and, on a team plan, `members` (`member`, `usedPercent`,
+`dailyCapPercent`). A field that is not a share is not read. Settings
+shows a meter ("62% of this month left"), the top-ups and the renewal, and
+on a team each member by name (looked up here from the tag, never sent)
+with a daily cap the owner sets as a share of the monthly allowance,
+posted to `POST <base>/settings` as `{ memberCaps }`. Whether the licence
+is a team's comes from the balance when it says, else from
+`GET /api/hosting/status` beside the service, else the Cloud plan.
+
+Work nobody asked for this minute (the nightly memory tidy, skill
+proposals, quiet compaction of idle conversations) uses OwlBot AI only
+when `credits.background` is on, which it is not unless the person turns
+it on. Tidy now is asked for, so it may. The morning brief makes no model
+call either way.
+
+A hosted workspace (`OWLBOT_HOSTED=1`) on a team licence with an agent on
+somebody's personal Claude or ChatGPT sign-in (Claude Code on its own
+login, or Codex) says so, plainly and dismissibly, in Settings (Engines,
+and the OwlBot AI card) and on that agent's engine choice; nothing is
+refused for it. A hosted workspace reads its balance soon after it
+starts, so it knows whether it is a team before anybody opens Settings.
+
+For a phone: `GET /api/credits` (`offered`, `background`, `refused`,
+`checkoutUrl`, `team`, `needsKey`, `connected`, `plan`, `usedPercent`,
+`leftPercent`, `monthlyLeftPercent`, `topUps`, `renewsAt`, `low`,
+`members` with each `name`, `teamSignInWarning`, `readAt`, `problem`;
+the old `balance`, `currency`, `lowAt` and `autoReload` are gone),
+`PATCH /api/credits` with `{ background }`, `{ memberCaps: { [member]:
+percent or null } }` or both, `team` in the `credits` frame and on
+`/api/config`. An agent no longer carries `engineAccess`, and
+`PATCH /api/bots/:id` takes `"own"` (or null) as said and refuses
+`"credits"` with a sentence the phone can show. Features `credits` and
+`owlbot-ai`.
+
+When an API turns a Claude Code call away, the CLI says so as `API Error:`,
+the status and the body, which an older CLI prints as the JSON it was
+sent. A notice says the service's own sentence instead (`errorWords` in
+`server/failover.ts`), wherever a failed turn is said: the error itself,
+the try again and the backup taking over, and the end of the line. What
+decides whether the engine is out still reads the whole text. A 403 that
+Claude Code marks as a failed sign-in keeps its words too, rather than
+"not signed in": the service turning the person away is not something
+signing in again changes.
+
+## Hosted mode
+
+`server/deployment.ts` asks what kind of machine this is as separate
+questions: where it runs (`runs`: the app, or a `owlbot-server` of its
+own), who looks after it (`managedBy`: the owner, or the provider when
+`OWLBOT_HOSTED=1`), and what the owner's own paired devices may do there
+(`ownerTerminal`). `/api/config` says all of it as `deployment`, with
+`kind` (`app`, `self-hosted` or `managed`) for Settings, and
+`/api/health` says `managedBy` and `runs` beside `hosted`. The terminal
+routes take a paired owner device when `ownerTerminal` is on: always on
+a provider's machine, and on a server of the person's own only with
+`OWLBOT_OWNER_TERMINAL=1`, never in the app. A refused device gets 403
+with code `terminal` and the reason. Everything below stays the
+provider's alone; docs/SELF_HOSTING.md says why for each.
+
+`OWLBOT_HOSTED=1` says this workspace runs on a machine somebody runs for
+the person (`server/hosted.ts`). This is the server's side of managed
+hosting, a private machine that stays on, which is coming soon and not
+yet offered. The machine is the agents' computer, so the computer
+choices are this machine or off (`hosted.computers` on
+`/api/config`), a box or a VM chosen on a Mac becomes this machine, and
+the API refuses the cloud box and the Local VM routes with code `hosted`.
+What needs the person's Mac says so: working the Mac itself (the Electron
+computer-use daemon is never read), Mac voices, and starting meeting notes.
+On a hosted workspace `GET /api/health` answers any request from a loopback
+peer ahead of the other checks (a Telegram reply credential is still
+refused first), whatever Host its proxy chose and whatever credential it
+carries; on a Mac the old rule stands. Either way it says `hosted`.
+
+`OWLBOT_HOSTED_VNC` (a port, or an http address on loopback with an
+optional path) is where the image serves noVNC. The server passes it
+through under `/hosted/desktop/<ticket>/`, pages and the websocket alike,
+so the desktop needs no port of its own. A ticket comes from
+`POST /api/hosted/desktop` (never an agent's), opens requests for ten
+minutes after its last use and twelve hours at most, and nothing of the
+person's (their token, their cookies) is passed to the viewer.
+
+## Moving a workspace
+
+`server/workspace-move.ts` makes a move a backup of kind `move`: the whole
+workspace with the computer it leaves taken out. Folders on that disk
+(an agent's or a lane's working folder, a room's desk, a project's
+folders), engine sessions only that computer's CLIs can resume (every
+lane is told the conversation on its next turn, as after
+`store.dropSession`), the Undo history, rehearsal copies, the Local VM's
+files, turns in flight, pairing links and Live Activity tokens stay
+behind, and so do `config.json`'s machine sections (port, engine
+instances, relay space, paired devices, shortcuts, cloud box). Keys never
+travel, sealed or not; the file's summary names the ones left behind
+(`toEnter`). `POST /api/workspace/move` writes one (this computer only)
+and `GET /api/workspace/move/:name` downloads it. `POST
+/api/workspace/move/import`, with the file as the body (and a passphrase
+in `x-owlbot-passphrase` if it is sealed), takes one into a workspace with
+nothing said in it, no rooms and no standing work, from this computer or
+the owner's paired device, and restarts through the restore path; the
+machine it lands on keeps its own machine sections and keys.
+
+## The interface's words
+
+Every sentence the app shows lives in a catalogue under `src/locales`,
+keyed by what it means: `en.json` is the source, and `es`, `fr`, `de`,
+`pt-BR`, `ja` and `zh-CN` say the same keys (the folder's README is the
+translators' guide). `src/lib/i18n.ts` reads them: `t(key, params)` for
+a sentence, `tr` for one with an element drawn inside it, and a sentence
+with a count is one key per plural form, chosen by `Intl.PluralRules` in
+the reader's language. The keys' type is read from `en.json`, so a
+misspelled or removed key fails the typecheck. A language that lacks a
+word says the English one, never the key. Numbers, dates and lists go
+through `Intl` in the same locale.
+
+The choice is the person's, like the theme: `src/lib/language.ts` keeps
+it in the page's storage and with the desktop app (`prefs:language`),
+which hands it to each workspace's page before it draws. "System", the
+default, is the first of the system's languages OwlBot speaks. Only the
+reader's catalogue is downloaded, and a change re-renders from the root.
+The macOS menu bar reads the same catalogues' `menu.` keys
+(`electron/menu-words.mjs`), so the menus never word a thing differently
+from the window.
+
+`test/i18n.test.ts` holds the catalogues to their rules (no key English
+lacks, no invented placeholder, no forbidden dash, sorted keys, nothing
+unused) and scans every component for English written inline, with
+`test/i18n-allowlist.json` for the few words never translated. Words the
+server writes (notices, errors, the brief, checkups) are still English.

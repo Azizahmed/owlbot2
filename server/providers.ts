@@ -1,0 +1,483 @@
+// The provider catalog: every engine OwlBot knows how to talk to, and how
+// you sign in to each one.
+//
+// Almost every major lab now speaks OpenAI's /chat/completions shape, so
+// these are data, not code. One generic driver (drivers/openai-compat.ts)
+// reads a spec and becomes that provider.
+//
+// `auth` is the honest part. "oauth" means a real browser sign-in that
+// hands back a credential; "key" means paste a key; "cli" means another
+// tool already holds the login and we ride along; "none" means it runs on
+// this machine and asks for nothing.
+import type { ModelCatalog } from "./contracts.ts";
+import { CREDITS_SPEC } from "./credits.ts";
+import { installCommand } from "./engine-commands.ts";
+
+export type AuthKind = "oauth" | "key" | "cli" | "none";
+
+export interface ProviderSpec {
+  /** driverKind, and the default instance id. */
+  kind: string;
+  name: string;
+  /** OpenAI-compatible base, no trailing slash. */
+  url: string;
+  auth: AuthKind;
+  /** Where the key comes from, shown next to the field. */
+  keyHint: string;
+  /** Prefix a valid key starts with, used only as a typo warning. */
+  keyPrefix?: string;
+  docsUrl: string;
+  /** Fallback catalog. The live /models list replaces this when it loads,
+   * so these only have to be plausible, not current. */
+  models: ModelCatalog;
+  /** Model ids worth surfacing first, in order. Everything else is
+   * dropped once the list is longer than `limit`. */
+  prefer?: RegExp[];
+  limit?: number;
+  /** Extra picker slots kept for the provider's free models, on top of
+   * the limit. Without them the preferred paid families fill the list and
+   * the free ones are never offered at all. */
+  freeSlots?: number;
+  /** Extra request headers (attribution, routing). */
+  headers?: Record<string, string>;
+  /** The service picks the model itself: `models` is the whole catalog,
+   * /models is asked only whether the key is good and what it lists is
+   * never shown, and every call names the catalog's one model whatever an
+   * agent has saved. The OwlBot engine (server/credits.ts). */
+  fixedModels?: boolean;
+  /** A cheap model for one-shot calls: names, titles, summaries. */
+  small?: string;
+  /** Whether this provider reliably speaks OpenAI function calling. Flags
+   * the engine as agentic and turns the tool loop on for its turns. Off
+   * for providers where support depends on which model is loaded. */
+  tools?: boolean;
+  /** Tools are the owner's call, one instance at a time: the loop runs
+   * only for an instance whose config says `tools: true`. For a host
+   * whose model is whatever someone loaded there, where only the person
+   * who set it up knows whether it calls tools. */
+  toolsOptIn?: boolean;
+  /** Whether every model this provider serves takes pictures, so a turn's
+   * attached images are sent to it as pictures. Off where it depends on
+   * the model; a custom endpoint is switched on by the person instead
+   * (CustomEndpoint.vision). */
+  vision?: boolean;
+}
+
+const OPENROUTER: ProviderSpec = {
+  kind: "openrouter",
+  tools: true,
+  name: "OpenRouter",
+  url: "https://openrouter.ai/api/v1",
+  auth: "oauth",
+  keyHint: "Sign in and OpenRouter issues a key you control",
+  keyPrefix: "sk-or-",
+  docsUrl: "https://openrouter.ai/docs/use-cases/oauth-pkce",
+  headers: { "HTTP-Referer": "https://owlbot.local", "X-Title": "OwlBot" },
+  models: {
+    default: "google/gemini-3.8-flash",
+    options: [
+      { id: "google/gemini-3.8-flash", label: "Gemini 3.8 Flash" },
+      { id: "anthropic/claude-opus-5.5", label: "Claude Opus 5.5" },
+      { id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5" },
+      { id: "openai/gpt-6-sol", label: "GPT-6 Sol" },
+      { id: "openai/gpt-6-luna", label: "GPT-6 Luna" },
+      { id: "x-ai/grok-4.7", label: "Grok 4.7" },
+      { id: "moonshotai/kimi-k3", label: "Kimi K3" },
+      { id: "meta-llama/llama-4-maverick", label: "Llama 4 Maverick" },
+      { id: "deepseek/deepseek-v4-pro", label: "DeepSeek V4 Pro" },
+    ],
+  },
+  // one sign-in reaches every lab, so the list is long. Keep the families
+  // people actually reach for.
+  prefer: [/^google\//, /^anthropic\//, /^x-ai\//, /^openai\//, /^moonshotai\//, /^meta-llama\//, /^deepseek\//, /^qwen\//, /^mistralai\//],
+  limit: 28,
+  // OpenRouter serves a rotating set of models at no cost, marked by a
+  // ":free" suffix. People ask for them by name; they get their own room.
+  freeSlots: 12,
+  small: "google/gemini-3.5-flash-lite",
+};
+
+const GEMINI: ProviderSpec = {
+  kind: "gemini",
+  tools: true,
+  // every Gemini model reads pictures, and its OpenAI-shaped door takes
+  // them inline as image_url data URLs
+  vision: true,
+  name: "Gemini",
+  url: "https://generativelanguage.googleapis.com/v1beta/openai",
+  auth: "key",
+  keyHint: "API key from Google AI Studio",
+  docsUrl: "https://ai.google.dev/gemini-api/docs/openai",
+  models: {
+    default: "gemini-3.8-flash",
+    options: [
+      { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro" },
+      { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash" },
+      { id: "gemini-3.5-flash-lite", label: "Gemini 3.5 Flash-Lite" },
+    ],
+  },
+  prefer: [/^(models\/)?gemini/],
+  // 2.5 is closed to new projects, so the one-shot model is from 3.x
+  small: "gemini-3.5-flash-lite",
+};
+
+const XAI: ProviderSpec = {
+  // kept as "grok" so instances configured before the catalog existed
+  // keep resolving to a live driver instead of a shadow
+  kind: "grok",
+  tools: true,
+  name: "Grok",
+  url: "https://api.x.ai/v1",
+  auth: "key",
+  keyHint: "API key from console.x.ai",
+  keyPrefix: "xai-",
+  docsUrl: "https://docs.x.ai/docs/api-reference",
+  models: {
+    default: "grok-4.7",
+    options: [
+      { id: "grok-4.7", label: "Grok 4.7" },
+      { id: "grok-4.6", label: "Grok 4.6" },
+      { id: "grok-4.20-0309-non-reasoning", label: "Grok 4.20 (fast)" },
+    ],
+  },
+  prefer: [/^grok/],
+  small: "grok-4.20-0309-non-reasoning",
+};
+
+const MOONSHOT: ProviderSpec = {
+  kind: "kimi",
+  tools: true,
+  name: "Kimi",
+  url: "https://api.moonshot.ai/v1",
+  auth: "key",
+  keyHint: "API key from platform.moonshot.ai",
+  keyPrefix: "sk-",
+  docsUrl: "https://platform.moonshot.ai/docs/guide/migrating-from-openai-to-kimi",
+  models: {
+    default: "kimi-k2-turbo-preview",
+    options: [
+      { id: "kimi-k2-turbo-preview", label: "Kimi K2 Turbo" },
+      { id: "kimi-k2-0905-preview", label: "Kimi K2" },
+      { id: "moonshot-v1-32k", label: "Moonshot v1 32k" },
+    ],
+  },
+  prefer: [/^kimi/, /^moonshot/],
+};
+
+const LLAMA: ProviderSpec = {
+  kind: "llama",
+  name: "Llama",
+  url: "https://api.llama.com/compat/v1",
+  auth: "key",
+  keyHint: "API key from llama.developer.meta.com",
+  keyPrefix: "LLM|",
+  docsUrl: "https://llama.developer.meta.com/docs/features/compatibility/",
+  models: {
+    default: "Llama-4-Maverick-17B-128E-Instruct-FP8",
+    options: [
+      { id: "Llama-4-Maverick-17B-128E-Instruct-FP8", label: "Llama 4 Maverick" },
+      { id: "Llama-4-Scout-17B-16E-Instruct-FP8", label: "Llama 4 Scout" },
+    ],
+  },
+  prefer: [/llama/i],
+};
+
+const DEEPSEEK: ProviderSpec = {
+  kind: "deepseek",
+  tools: true,
+  name: "DeepSeek",
+  url: "https://api.deepseek.com/v1",
+  auth: "key",
+  keyHint: "API key from platform.deepseek.com",
+  keyPrefix: "sk-",
+  docsUrl: "https://api-docs.deepseek.com/",
+  models: {
+    default: "deepseek-chat",
+    options: [
+      { id: "deepseek-chat", label: "DeepSeek Chat" },
+      { id: "deepseek-reasoner", label: "DeepSeek Reasoner" },
+    ],
+  },
+  prefer: [/^deepseek/],
+};
+
+const MISTRAL: ProviderSpec = {
+  kind: "mistral",
+  tools: true,
+  name: "Mistral",
+  url: "https://api.mistral.ai/v1",
+  auth: "key",
+  keyHint: "API key from console.mistral.ai",
+  docsUrl: "https://docs.mistral.ai/api/",
+  models: {
+    default: "mistral-large-latest",
+    options: [
+      { id: "mistral-large-latest", label: "Mistral Large" },
+      { id: "mistral-small-latest", label: "Mistral Small" },
+    ],
+  },
+  prefer: [/^mistral/, /^magistral/, /^codestral/],
+  limit: 16,
+  small: "mistral-small-latest",
+};
+
+const GROQ: ProviderSpec = {
+  kind: "groq",
+  tools: true,
+  name: "Groq",
+  url: "https://api.groq.com/openai/v1",
+  auth: "key",
+  keyHint: "API key from console.groq.com",
+  keyPrefix: "gsk_",
+  docsUrl: "https://console.groq.com/docs/openai",
+  models: {
+    default: "llama-3.3-70b-versatile",
+    options: [
+      { id: "llama-3.3-70b-versatile", label: "Llama 3.3 70B" },
+      { id: "moonshotai/kimi-k2-instruct", label: "Kimi K2" },
+    ],
+  },
+  prefer: [/llama/i, /kimi/i, /qwen/i, /gpt-oss/i],
+  limit: 16,
+};
+
+const OLLAMA: ProviderSpec = {
+  kind: "ollama",
+  name: "Ollama",
+  url: "http://127.0.0.1:11434/v1",
+  auth: "none",
+  keyHint: "Runs on this machine, nothing to sign in to",
+  docsUrl: "https://ollama.com/",
+  // whatever you have pulled; the live list is the real answer here
+  models: { default: "llama3.2", options: [{ id: "llama3.2", label: "llama3.2" }] },
+  limit: 24,
+};
+
+/** Every provider that speaks the OpenAI chat shape. */
+export const PROVIDER_SPECS: readonly ProviderSpec[] = [
+  OPENROUTER,
+  GEMINI,
+  XAI,
+  MOONSHOT,
+  LLAMA,
+  DEEPSEEK,
+  MISTRAL,
+  GROQ,
+  OLLAMA,
+];
+
+/** A user-added OpenAI-compatible host. The URL and keys live in
+ * config.json, not here: this is only the driver shape, so one generic
+ * instance can point at any /v1 that speaks chat completions. Tools are
+ * off until the person says the model behind that URL can use them,
+ * because support depends on whatever is loaded there. */
+export const CUSTOM_SPEC: ProviderSpec = {
+  kind: "custom",
+  toolsOptIn: true,
+  name: "Custom",
+  url: "",
+  auth: "key",
+  keyHint: "API key from your OpenAI-compatible endpoint",
+  docsUrl: "https://platform.openai.com/docs/api-reference/models",
+  models: { default: "", options: [] },
+  limit: 32,
+};
+
+export function specFor(kind: string): ProviderSpec | undefined {
+  if (kind === CUSTOM_SPEC.kind) return CUSTOM_SPEC;
+  if (kind === CREDITS_SPEC.kind) return CREDITS_SPEC;
+  return PROVIDER_SPECS.find((s) => s.kind === kind);
+}
+
+/** The OpenAI-compatible root a person meant. Trailing slashes and a
+ * pasted /chat/completions path are the two ways a working host becomes
+ * a 404 on /models, so both get folded here rather than stored as typed. */
+export function normalizeCompatUrl(url: string): string | undefined {
+  const trimmed = url.trim();
+  if (!/^https?:\/\//i.test(trimmed) || trimmed.length > 400) return undefined;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.username || parsed.password) return undefined;
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+    let path = parsed.pathname.replace(/\/+$/, "");
+    path = path.replace(/\/(chat\/)?completions$/i, "");
+    return `${parsed.protocol}//${parsed.host}${path}`;
+  } catch {
+    return undefined;
+  }
+}
+
+// ── headers a person adds to a custom host ─────────────────────────────
+// Some hosts want one more header than the key: Anthropic's version, a
+// gateway's project or org id, a proxy's own token (GitHub 486). Each is
+// sent on every request to that host, the model list and the chat alike.
+// A value can be a credential, so it is kept and handled like a key:
+// stored beside them, never sent back out, shown only as set.
+
+/** How many headers one host may carry. */
+export const MAX_CUSTOM_HEADERS = 10;
+const MAX_HEADER_NAME = 64;
+const MAX_HEADER_VALUE = 4096;
+
+/** What OwlBot sets itself on every request: the key goes out as
+ * Authorization, and the body's type and length are the request's own.
+ * The rest belong to the connection, and fetch refuses them anyway. */
+const RESERVED_HEADERS = new Map<string, string>([
+  ["authorization", "Authorization is sent from the endpoint's key"],
+  ["content-type", "OwlBot sets Content-Type itself"],
+  ["content-length", "OwlBot sets Content-Length itself"],
+  ["host", "OwlBot sets Host itself"],
+  ...["connection", "keep-alive", "transfer-encoding", "upgrade", "te", "trailer", "expect", "proxy-connection"].map(
+    (name): [string, string] => [name, `${name} belongs to the connection and can't be set`],
+  ),
+]);
+
+/** Why a header cannot be sent as given, or null when it can. The words
+ * are the person's to read, so they name the header and never the value. */
+export function customHeaderProblem(name: string, value: string): string | null {
+  if (!name) return "a header needs a name";
+  if (/[\r\n]/.test(name)) return "a header name can't have a line break";
+  if (name.length > MAX_HEADER_NAME) return "that header name is too long";
+  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) return `${name} is not a header name: use letters, digits and dashes`;
+  const reserved = RESERVED_HEADERS.get(name.toLowerCase());
+  if (reserved) return reserved;
+  if (/[\r\n]/.test(value)) return `the value for ${name} can't have a line break`;
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u0008\u000a-\u001f\u007f]/.test(value)) return `the value for ${name} can't have control characters`;
+  if (!value) return `${name} needs a value`;
+  if (value.length > MAX_HEADER_VALUE) return `the value for ${name} is too long`;
+  return null;
+}
+
+/** The headers out of a saved or decoded record that can be sent, as
+ * they were written. Anything else is dropped rather than sent: a file
+ * edited by hand is not a reason to put a line break into a request. */
+export function sendableHeaders(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, string> = {};
+  const seen = new Set<string>();
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value !== "string" || seen.has(name.toLowerCase())) continue;
+    if (customHeaderProblem(name, value) || Object.keys(out).length >= MAX_CUSTOM_HEADERS) continue;
+    seen.add(name.toLowerCase());
+    out[name] = value;
+  }
+  return out;
+}
+
+/** A CLI engine's install hint. On Windows the app runs no installer, so
+ * there is no button to point at, and the line is PowerShell's, not the
+ * Mac's (server/engine-commands.ts, GitHub 438). */
+const installHint = (kind: string, posix: string, after = ""): string =>
+  process.platform === "win32" ? `Install it by running ${installCommand(kind, "win32")} in PowerShell${after}` : posix;
+
+/** Engines that come from a CLI on this machine. They are not configured
+ * here, only described, so the connections screen can tell you why one is
+ * dark and what to install. */
+// Two hints, not one: telling somebody to install a CLI they already
+// have is the fastest way to look like nothing is listening. `command` is
+// the name looked up on PATH, said where a different copy can be chosen.
+export const CLI_PROVIDERS = [
+  {
+    kind: "claudeAgent",
+    name: "Claude Code",
+    command: "claude",
+    auth: "cli" as const,
+    keyHint: installHint("claudeAgent", "Install it with the button above, or run curl -fsSL https://claude.ai/install.sh | bash"),
+    signInHint: "Run claude once in a terminal to sign in",
+    docsUrl: "https://claude.com/claude-code",
+  },
+  {
+    kind: "codex",
+    name: "Codex",
+    command: "codex",
+    auth: "cli" as const,
+    keyHint: installHint("codex", "Install it with the button above, or run npm i -g --prefix ~/.local @openai/codex"),
+    signInHint: "Run codex login in a terminal",
+    docsUrl: "https://developers.openai.com/codex/cli",
+  },
+  {
+    kind: "grokCli",
+    name: "Grok CLI",
+    command: "grok",
+    auth: "cli" as const,
+    keyHint: installHint("grokCli", "Install with: curl -fsSL https://x.ai/cli/install.sh | bash"),
+    signInHint: "Run grok login to bind your grok.com subscription",
+    docsUrl: "https://x.ai/cli",
+  },
+  {
+    kind: "cursor",
+    name: "Cursor",
+    command: "cursor-agent",
+    auth: "cli" as const,
+    // the CLI, not the editor: having Cursor the app is not enough
+    keyHint: installHint("cursor", "Install the Cursor CLI with the button above, or run curl https://cursor.com/install -fsS | bash"),
+    signInHint: "Run cursor-agent login in a terminal",
+    docsUrl: "https://cursor.com/docs/cli/acp",
+  },
+  {
+    kind: "cline",
+    name: "Cline",
+    command: "cline",
+    auth: "cli" as const,
+    keyHint: installHint("cline", "Install it with the button above, or run npm i -g --prefix ~/.local cline (3.0.68 or newer)", " (3.0.68 or newer)"),
+    signInHint: "Run cline auth in a terminal to connect a provider",
+    docsUrl: "https://docs.cline.bot/usage/acp",
+  },
+  {
+    kind: "antigravity",
+    name: "Antigravity",
+    command: "agy",
+    auth: "cli" as const,
+    keyHint: installHint("antigravity", "Install with: curl -fsSL https://antigravity.google/cli/install.sh | bash (1.5.13 or newer)", " (1.5.13 or newer)"),
+    signInHint: "Run agy once to sign in with Google",
+    docsUrl: "https://github.com/google-antigravity/antigravity-cli",
+  },
+  {
+    kind: "opencode",
+    name: "OpenCode",
+    command: "opencode",
+    auth: "cli" as const,
+    keyHint: installHint("opencode", "Install with npm i -g --prefix ~/.local opencode-ai"),
+    signInHint: "Run opencode auth login to connect a provider",
+    docsUrl: "https://opencode.ai/docs",
+  },
+  {
+    kind: "commandcode",
+    name: "Command Code",
+    command: "command-code",
+    auth: "cli" as const,
+    keyHint: installHint("commandcode", "Install it with the button above, or run npm i -g --prefix ~/.local command-code"),
+    signInHint: "Run command-code login in a terminal to connect your account",
+    docsUrl: "https://commandcode.ai/docs/acp",
+  },
+  {
+    kind: "devin",
+    name: "Devin",
+    command: "devin",
+    auth: "cli" as const,
+    keyHint: installHint("devin", "Install it with the button above, or run curl -fsSL https://cli.devin.ai/install.sh | bash"),
+    signInHint: "Run devin auth login in a terminal to connect your Devin account",
+    docsUrl: "https://docs.devin.ai/cli/reference/commands#devin-acp",
+  },
+  {
+    kind: "geminiCli",
+    name: "Gemini CLI",
+    command: "gemini",
+    auth: "cli" as const,
+    keyHint: installHint("geminiCli", "Install it with the button above, or run npm i -g --prefix ~/.local @google/gemini-cli"),
+    // it reads GEMINI_API_KEY, so connecting Gemini below is enough; a
+    // Google account sign-in through the CLI works too
+    signInHint: "Connect a Gemini key below, or run gemini to sign in with Google",
+    docsUrl: "https://geminicli.com/docs/",
+  },
+  {
+    kind: "pi",
+    name: "Pi",
+    command: "pi-acp",
+    auth: "cli" as const,
+    keyHint: installHint("pi", "Install it with the button above, or run npm i -g --prefix ~/.local --ignore-scripts @earendil-works/pi-coding-agent pi-acp"),
+    signInHint: "Run pi (or pi-acp --terminal-login) and configure providers/login",
+    docsUrl: "https://pi.dev/docs/latest",
+  },
+];

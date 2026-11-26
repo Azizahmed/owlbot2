@@ -1,0 +1,1935 @@
+// A room: several agents and you, in one transcript. Unlike a solo chat,
+// every line is attributed, because who said it is half the meaning.
+import { Notice } from "./chat/Bubble";
+import { useSettingsObservation } from "@/lib/useSettingsObservation";
+import { linksOpenInDock, useChatLinksIn } from "@/lib/chatLinks";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { AnimatePresence, motion, useInView, useReducedMotion } from "motion/react";
+import { AlertTriangle } from "@/components/icons";
+import { MessageGuard } from "./chat/MessageGuard";
+import { BookmarkPlus } from "@/components/icons";
+import { FolderOpen } from "@/components/icons";
+import { CalendarClock } from "@/components/icons";
+import { Check } from "@/components/icons";
+import { ChevronDown } from "@/components/icons";
+import { Crown } from "@/components/icons";
+import { Sparkles } from "@/components/icons";
+import { Rows3 } from "@/components/icons";
+import { MessagesSquare } from "@/components/icons";
+import { Loader2 } from "@/components/icons";
+import { Download } from "@/components/icons";
+import { Trash2 } from "@/components/icons";
+import { Users } from "@/components/icons";
+import { UserPlus } from "@/components/icons";
+import { Pencil } from "@/components/icons";
+import { Plus } from "@/components/icons";
+import type { RoomPerson } from "@/state/reducer";
+import { SharePanel } from "./SharePanel";
+import { api, useStore, workingInRoom, type OwlBot, type Bot, type Message } from "@/state/store";
+import { IncidentNotice } from "@/components/chat/IncidentCard";
+import { CarryOn } from "@/components/CarryOn";
+import { AgentAvatar } from "./Avatar";
+import { RoutinesDialog } from "./RoutinesDialog";
+import { GroupCallOverlay } from "./Voice";
+import { splitWaiting } from "@/lib/transcript";
+import { useHistoryPaging } from "@/lib/useHistoryPaging";
+import { ArtifactCard } from "./Artifacts";
+import { ForwardDialog, MessageActionBar, Reactions, ReplyContext, excerptOf, useTapToShow, type ReplyDraft } from "./MessageActions";
+import { SelectionQuote } from "./chat/SelectionQuote";
+import { IntentNote, UserText, richText } from "./chat/Bubble";
+import { GroupMessage, PersonAvatar, SeenBy } from "./chat/Group";
+import { receiptsAt, runs, senderOf } from "@/lib/participants";
+import { useNamer, useWorkspaceRoster } from "@/lib/members";
+import { seedReads, useReadPosition, useReads } from "@/lib/readReceipts";
+import { useViewingReport } from "@/lib/viewing";
+import { JumpToLatest } from "./chat/JumpToLatest";
+import { TurnTimeline } from "./chat/TurnTimeline";
+import { turnMarks } from "@/lib/turnTimeline";
+import { HeldSends } from "./chat/HeldSends";
+import { heldToShow, isHostedWindow, useHeldSends, useWake } from "@/lib/waking";
+import { RoomComposer } from "./room/RoomComposer";
+import { OptionCard } from "./OptionCard";
+import { Markdownish } from "./Markdown";
+import { GenUiHost } from "./genui/host";
+import { ChangesCard } from "./ChangesCard";
+import { ToolRun } from "./ToolRun";
+import { TurnFoldLine } from "./TurnFold";
+import { Button } from "@/components/ui/button";
+import { BrowseFolderButton } from "@/components/ui/browse-folder";
+import { ForumLens } from "./ForumLens";
+import { MessageComponent } from "./Gallery";
+import { Phone } from "@/components/icons";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { ROOM_ANSWERS, answersOf, answersWords, routeWords, type RoomAnswers, type RoomRoute } from "@/lib/roomRoute";
+import { replyCounts, replyLabel } from "@/lib/threads";
+import { queuedLine } from "@/lib/when";
+import { cn } from "@/lib/cn";
+import { shareAsFile, teamFilename } from "@/lib/shareFile";
+import { toast } from "@/components/ui/toast";
+import { roomLead } from "@/lib/roomLead";
+import { useStickToBottom } from "@/lib/useStickToBottom";
+import { usePageVisible } from "@/lib/pageVisible";
+import { handoffsIn, namesLine, unsaid, type Handoff, type StreamMark } from "@/lib/roomVoices";
+import { OWLBOT_COLORS, type OwlBotColor } from "@/lib/mascot";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { useHoldPlace } from "@/lib/useHoldPlace";
+import { foldHolding, foldRoom, lastFoldKey, rowsFrom } from "@/lib/turnFold";
+import { confirm } from "@/components/ui/confirm";
+import { onAsk, peekRoomAsk, takeAsk } from "@/lib/chatAsk";
+import { freshStartPreset } from "@/lib/roomEdit";
+import { RoomRename } from "./room/RoomRename";
+import { RoomAgentsDialog } from "./room/RoomAgentsDialog";
+import { formatList, t } from "@/lib/i18n";
+import { FileText, Globe, PanelRight } from "@/components/icons";
+import { SideDock, type DockPane } from "./dock/SideDock";
+import { MiniDock } from "./dock/MiniDock";
+import { useExtensionsPane } from "./extensions/ExtensionDock";
+import { FilesPanel } from "./dock/FilesPanel";
+import { createPortal } from "react-dom";
+import { useTitlebarSlot } from "@/lib/titlebarSlot";
+import { DockHostContext, type DockHost } from "./dock/context";
+import { DockedBrowser, MiniBrowser, MiniViewport, showPage, useBrowserState, useBrowserWhere, useMiniAspect } from "./browser/BrowserPanel";
+import { tabLabel } from "@/lib/appBrowser";
+import { DOCK_SIDE_BY_SIDE, dock, placeIn, roomKey, useDockState } from "@/lib/dock";
+import { browserStatus, pageOpen, strongest, teammateActive, TEAMMATE_MS, type DockStatus } from "@/lib/dockActivity";
+import { inThread, orderTopics, topicCounts, topicPowers, topicState, type RoomTopic, type TopicState } from "@/lib/roomTopics";
+import { NewTopicDialog, TopicBar, TopicPanel } from "./room/RoomTopics";
+
+/** A topic's mark, as the dot on the dock's topic icon. */
+const topicDot: Record<TopicState, DockStatus | null> = { working: "working", waiting: "waiting", idle: null, closed: null };
+
+/** A reaction in a room is the cheapest thing anyone can say, and often
+ * the right thing: agreeing with a plan should not wake six agents. */
+function deleteRoomMessage(roomId: string, messageId: string) {
+  void api(`/api/threads/${roomId}/messages/${messageId}`, { method: "DELETE" }).catch(() => {});
+}
+
+function reactTo(roomId: string, messageId: string, emoji: string) {
+  void api(`/api/threads/${roomId}/messages/${messageId}/react`, {
+    method: "POST",
+    body: JSON.stringify({ emoji }),
+  }).catch(() => {});
+}
+
+/** Where a room message said in a linked chat came from, for the strip. */
+// product names, the same in every language
+const CHANNEL_NAMES: Partial<Record<NonNullable<Message["via"]>, string>> = {
+  slack: "Slack",
+  discord: "Discord",
+  whatsapp: "WhatsApp",
+};
+
+/** A member's last words in the room, which its stream is cut after. */
+function lastWordsOf(said: readonly Message[], botId: string): { id: string; text: string } | undefined {
+  for (let i = said.length - 1; i >= 0; i--) {
+    const m = said[i];
+    if (m.role === "bot" && m.from === botId && m.kind === "text" && !m.deleted && m.text) return { id: m.id, text: m.text };
+  }
+  return undefined;
+}
+
+/** The lead, then everyone else in the room's own order: the chart the
+ * room was made from, read left to right. */
+function byLead(members: readonly Bot[], lead: Bot | null): Bot[] {
+  return lead ? [lead, ...members.filter((m) => m.id !== lead.id)] : [...members];
+}
+
+/** A face's own corners, for the ring drawn just outside them: a photo
+ * is round, a owlbot is a square with soft corners. */
+function ringShape(bot: Bot) {
+  return bot.avatarAt ? "rounded-full" : "rounded-[9px]";
+}
+
+const SETTLE = [0.23, 1, 0.32, 1] as const;
+/** The brief wash behind a message you were sent to, the chat's own: a
+ * little wider than its row, behind the words, faded in and out rather
+ * than painted, so it costs no layout. */
+function LandMark({ on }: { on: boolean }) {
+  return (
+    <AnimatePresence>
+      {on && (
+        <motion.span
+          aria-hidden
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1, transition: { duration: 0.15, ease: "easeOut" } }}
+          exit={{ opacity: 0, transition: { duration: 0.28, ease: "easeOut" } }}
+          className="pointer-events-none absolute -inset-x-2 -inset-y-1 -z-10 rounded-xl bg-warning/12"
+        />
+      )}
+    </AnimatePresence>
+  );
+}
+
+/** How many faces the header shows before it counts the rest. */
+const FACES = 6;
+
+/**
+ * Who is in the room, in the header, and who is speaking right now.
+ *
+ * A member taking its turn here wears a soft ring in its own colour that
+ * breathes while it works. It loops for as long as the turn runs, so
+ * it stops when nobody can see it: the window is
+ * hidden, the header is out of view, or motion is turned down, which
+ * leaves the ring still and lit. The lead wears a small crown, and what
+ * that means is in its tooltip.
+ */
+function RoomPresence({
+  members,
+  lead,
+  working,
+  answers,
+}: {
+  members: Bot[];
+  lead: Bot | null;
+  working: Bot[];
+  answers: RoomAnswers;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const inView = useInView(ref);
+  const visible = usePageVisible();
+  const reduced = useReducedMotion();
+  const breathe = inView && visible && !reduced;
+  const ordered = byLead(members, lead);
+  const shown = ordered.slice(0, ordered.length > FACES ? FACES - 1 : FACES);
+  const more = ordered.length - shown.length;
+  return (
+    <TooltipProvider delayDuration={300}>
+      <div ref={ref} role="group" aria-label={t("common.members")} className="mr-1 hidden items-center gap-1.5 sm:flex">
+        {shown.map((m) => {
+          const crowned = m.id === lead?.id && members.length > 1;
+          const live = working.some((w) => w.id === m.id);
+          const tint = OWLBOT_COLORS[m.color as OwlBotColor] ?? "var(--brand)";
+          return (
+            <Tooltip key={m.id}>
+              <TooltipTrigger asChild>
+                <span
+                  role="img"
+                  aria-label={
+                    crowned && live
+                      ? t("roomView.presence.leadWorking", { name: m.name })
+                      : crowned
+                        ? t("roomView.presence.lead", { name: m.name })
+                        : live
+                          ? t("roomView.presence.working", { name: m.name })
+                          : m.name
+                  }
+                  className="relative flex shrink-0"
+                >
+                  <AnimatePresence initial={false}>
+                    {live && (
+                      <motion.span
+                        key="ring"
+                        aria-hidden
+                        className={cn("pointer-events-none absolute -inset-[3px]", ringShape(m))}
+                        initial={{ opacity: 0, scale: 0.9 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        exit={{ opacity: 0, scale: 0.9 }}
+                        transition={{ duration: 0.2, ease: SETTLE }}
+                      >
+                        <motion.span
+                          className={cn("absolute inset-0 border-2", ringShape(m))}
+                          style={{ borderColor: tint }}
+                          animate={breathe ? { opacity: [0.9, 0.35, 0.9], scale: [1, 1.08, 1] } : { opacity: 0.8, scale: 1 }}
+                          transition={breathe ? { duration: 2.2, ease: "easeInOut", repeat: Infinity } : { duration: 0.2 }}
+                        />
+                      </motion.span>
+                    )}
+                  </AnimatePresence>
+                  <AgentAvatar bot={m} size={26} />
+                  {crowned && (
+                    <span
+                      aria-hidden
+                      className="absolute -right-1.5 -top-1.5 flex size-3.5 items-center justify-center rounded-full bg-brand-ink text-brand-foreground ring-2 ring-background"
+                    >
+                      <Crown size={8} strokeWidth={2.4} />
+                    </span>
+                  )}
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="max-w-[240px] text-center">
+                {crowned ? t("roomView.leadsWithFinalCall", { name: m.name }) : m.name}
+                {crowned && answers !== "everyone" && (
+                  <span className="block font-normal opacity-75">
+                    {answers === "auto" ? t("roomView.answersWhenAutoCantPick") : t("roomView.answersUnlessYouNameSomeone")}
+                  </span>
+                )}
+                {live && <span className="block font-normal opacity-75">{t("roomView.workingNow")}</span>}
+              </TooltipContent>
+            </Tooltip>
+          );
+        })}
+        {more > 0 && (
+          <span
+            title={formatList(ordered.slice(shown.length).map((m) => m.name), { type: "unit" })}
+            className="flex h-[26px] min-w-[26px] items-center justify-center rounded-[9px] bg-muted px-1 text-caption font-medium tabular-nums text-muted-foreground"
+          >
+            +{more}
+          </span>
+        )}
+      </div>
+    </TooltipProvider>
+  );
+}
+
+/** One member passing the turn to another, where the other's answer
+ * begins. Pressed, it brings back the message that did it. */
+function HandoffLine({ from, to, ask, onOpen }: { from: string; to: string; ask: string; onOpen: () => void }) {
+  return (
+    // a little more room above than below: it opens what follows rather
+    // than closing what came before
+    <div className="mt-1.5 flex pl-9">
+      <button
+        onClick={onOpen}
+        className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md py-0.5 text-small text-muted-foreground transition-colors duration-150 hover:text-foreground"
+      >
+        <span className="shrink-0 font-medium text-foreground/80">{from}</span>
+        <span aria-hidden className="shrink-0">→</span>
+        <span className="sr-only">{t("roomView.to")}</span>
+        <span className="shrink-0 font-medium text-foreground/80">
+          {to}
+          {ask && ":"}
+        </span>
+        {ask && <span className="truncate">{ask}</span>}
+      </button>
+    </div>
+  );
+}
+
+/** What a room on Auto chose for a message that named nobody, on the
+ * side the answer comes from: who it went to and what it read the
+ * message as, or that the lead took it. Pressed, it opens to the reason
+ * and to the others, any of whom one tap names instead. */
+function RouteLine({
+  route,
+  nameOf,
+  others,
+  onMention,
+}: {
+  route: RoomRoute;
+  nameOf: (id: string) => string;
+  /** Who else could have answered, for asking one of them instead. */
+  others: Bot[];
+  onMention: (name: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const detailId = useId();
+  const words = routeWords(route, nameOf);
+  return (
+    <div className="mt-1 flex flex-col items-start pl-9">
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={detailId}
+        onClick={() => setOpen((was) => !was)}
+        className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md py-0.5 text-small text-muted-foreground transition-colors duration-150 hover:text-foreground"
+      >
+        {route.fallback ? (
+          <Crown size={12} className="shrink-0" />
+        ) : (
+          <Sparkles size={12} className="shrink-0 text-brand-ink" />
+        )}
+        <span className="truncate">{words.line}</span>
+        <ChevronDown size={12} className={cn("shrink-0 transition-transform duration-150", open && "rotate-180")} />
+      </button>
+      {open && (
+        <div id={detailId} className="max-w-[460px] animate-fade-in pb-1 pt-0.5">
+          <p className="text-pretty text-small leading-snug text-muted-foreground">{words.detail}</p>
+          {others.length > 0 && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-1">
+              <span className="mr-0.5 text-small text-muted-foreground">{t("roomView.askInstead")}</span>
+              {others.slice(0, 4).map((m) => (
+                <button
+                  key={m.id}
+                  type="button"
+                  onClick={() => onMention(m.name)}
+                  className="inline-flex items-center gap-1 rounded-full border bg-card py-0.5 pl-0.5 pr-2 text-small text-foreground transition-[background-color,border-color,scale] duration-150 ease-out hover:border-foreground/20 hover:bg-accent active:scale-[0.97]"
+                >
+                  <AgentAvatar bot={m} size={16} className={m.avatarAt ? undefined : "rounded-[5px]"} />@{m.name}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A member's reply while it is still arriving, where it will land and
+ * drawn as it will be, so the finished message takes its place without
+ * a jump. The caret is the stream's own (styles.css, .streaming-text). */
+function LiveWords({ bot, text, showSpeaker, mentions }: { bot: Bot; text: string; showSpeaker: boolean; mentions: string[] }) {
+  return (
+    <GroupMessage
+      mine={false}
+      first={showSpeaker}
+      last={false}
+      face={<AgentAvatar bot={bot} size={28} />}
+      name={bot.name}
+      at={Date.now()}
+      rich={text.length > 400 || richText(text)}
+      bubble={
+        <div className="streaming-text min-w-0">
+          <Markdownish text={text} mentions={mentions} streaming />
+        </div>
+      }
+    />
+  );
+}
+
+/** Everyone at work with nothing to read yet, said once: "Ada and Ben
+ * are working". Their faces sit where a speaker's face does, so the line
+ * reads as theirs. */
+function WorkingLine({ bots }: { bots: Bot[] }) {
+  return (
+    <div role="status" className="flex animate-fade-in items-center gap-2.5 text-small text-muted-foreground">
+      <span className="flex w-7 shrink-0 justify-end -space-x-1">
+        {bots.slice(0, 3).map((b) => (
+          <AgentAvatar key={b.id} bot={b} size={16} className="rounded-[5px] ring-2 ring-background" />
+        ))}
+      </span>
+      <span className="min-w-0 truncate">
+        {t("roomView.working", { count: bots.length, names: namesLine(bots.map((b) => b.name)) })}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * A room nobody has spoken in yet. The opening line the server writes
+ * ("Room opened with ...") says who is here and how to reach them; this
+ * says the same with faces, and each face is a way to name that member.
+ */
+function RoomWelcome({
+  name,
+  members,
+  lead,
+  answers,
+  onMention,
+}: {
+  name: string;
+  members: Bot[];
+  lead: Bot | null;
+  answers: RoomAnswers;
+  onMention: (name: string) => void;
+}) {
+  const others = members.filter((m) => m.id !== lead?.id).map((m) => m.name);
+  return (
+    <div className="mx-auto flex min-h-full max-w-[var(--transcript-width,760px)] flex-col items-center justify-center px-2 py-12 text-center">
+      <div className="flex items-end gap-2">
+        {members.map((m, i) => (
+          <motion.span
+            key={m.id}
+            className="relative"
+            initial={{ opacity: 0, y: 6 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.22, delay: Math.min(i, 4) * 0.025, ease: SETTLE }}
+          >
+            <AgentAvatar bot={m} size={m.id === lead?.id ? 44 : 36} />
+            {m.id === lead?.id && (
+              <span
+                aria-hidden
+                className="absolute -right-1.5 -top-1.5 flex size-[18px] items-center justify-center rounded-full bg-brand-ink text-brand-foreground ring-2 ring-background"
+              >
+                <Crown size={10} />
+              </span>
+            )}
+          </motion.span>
+        ))}
+      </div>
+      <h2 className="mt-5 text-title font-semibold text-foreground">{name}</h2>
+      <p className="mt-1 max-w-[360px] text-pretty text-body leading-relaxed text-muted-foreground">
+        {lead
+          ? t("roomView.welcome.leadsWith", { lead: lead.name, others: namesLine(others) })
+          : t("roomView.welcome.here", { count: members.length, names: namesLine(members.map((m) => m.name)) })}
+      </p>
+      <div className="mt-5 flex max-w-[420px] flex-wrap justify-center gap-1.5">
+        {members.map((m) => (
+          <button
+            key={m.id}
+            onClick={() => onMention(m.name)}
+            className="inline-flex items-center gap-1.5 rounded-full border bg-card py-1 pl-1 pr-2.5 text-small text-foreground transition-[background-color,border-color,scale] duration-150 ease-out hover:border-foreground/20 hover:bg-accent active:scale-[0.97]"
+          >
+            <AgentAvatar bot={m} size={18} className={m.avatarAt ? undefined : "rounded-[5px]"} />@{m.name}
+          </button>
+        ))}
+      </div>
+      <p className="mt-3 max-w-[360px] text-pretty text-caption text-muted-foreground">
+        {answers === "auto" && lead && members.length > 1
+          ? t("roomView.welcome.auto", { lead: lead.name })
+          : answers !== "everyone" && lead
+            ? t("roomView.welcome.leadAnswers", { lead: lead.name })
+            : t("roomView.everyoneCanAnswerNameSomeone")}
+      </p>
+    </div>
+  );
+}
+
+
+function RoomMessage({
+  message,
+  members,
+  people,
+  ownerName,
+  showSpeaker,
+  place,
+  receipts,
+  fresh,
+  memberName,
+  roomId,
+  onReply,
+  onForward,
+}: {
+  message: Message;
+  members: Bot[];
+  people: RoomPerson[];
+  ownerName?: string;
+  showSpeaker: boolean;
+  /** Where it sits in its sender's run: a room is always a group, so
+   * every message is a bubble (src/lib/participants.ts). */
+  place: { first: boolean; last: boolean };
+  receipts?: React.ReactNode;
+  fresh?: boolean;
+  /** A workspace member's name: in a room open to everyone, members are
+   * in it without a membership of their own, so the room's list alone
+   * does not name them. */
+  memberName?: (id: string) => string;
+  roomId: string;
+  onReply: (draft: ReplyDraft) => void;
+  onForward: (message: Message, author: string) => void;
+}) {
+  const names = [...members.map((m) => m.name), ...people.map((p) => p.name), ...(ownerName ? [ownerName] : [])];
+  const speaker = message.from ? members.find((m) => m.id === message.from) : null;
+  const nameOfReactor = (id: string) =>
+    id === "user" ? t("roomView.you") : (members.find((m) => m.id === id)?.name ?? t("common.anAgent"));
+  // where nothing hovers, a tap on the words shows the row
+  const tap = useTapToShow();
+
+  // The verbs float on the bubble's top edge on hover, with its time,
+  // so a hover moves nothing and a run stays close together.
+  const verbs = (author: string) => (
+    <MessageActionBar
+      look="pill"
+      at={message.at}
+      open={tap.open}
+      message={message}
+      author={author}
+      onReply={onReply}
+      onForward={onForward}
+      onReact={(emoji) => reactTo(roomId, message.id, emoji)}
+      onDelete={() => deleteRoomMessage(roomId, message.id)}
+    />
+  );
+  const reactions = (
+    <Reactions
+      reactions={message.reactions}
+      onToggle={(emoji: string) => reactTo(roomId, message.id, emoji)}
+      nameOf={nameOfReactor}
+    />
+  );
+
+  if (message.deleted) {
+    return (
+      <div className={cn("flex", message.role === "user" ? "justify-end" : "justify-start pl-9")}>
+        <div className="rounded-2xl border border-dashed px-3 py-1.5 text-body italic text-muted-foreground">
+          {t("roomView.messageTakenBack")}
+        </div>
+      </div>
+    );
+  }
+
+  // somebody else in the room: on the left, named, with their face
+  if (message.role === "user" && message.author) {
+    const who = memberName?.(message.author) ?? people.find((p) => p.id === message.author)?.name ?? t("roomView.aFormerMember");
+    return (
+      <GroupMessage
+        mine={false}
+        first={place.first}
+        last={place.last}
+        face={<PersonAvatar id={message.author} name={who} />}
+        name={who}
+        at={message.at}
+        readId={message.id}
+        rowRef={tap.row}
+        onPointerUp={tap.onPointerUp}
+        className={cn(fresh && "animate-receive-in")}
+        bubble={
+          <>
+            {message.replyTo && <ReplyContext replyTo={message.replyTo} />}
+            <Markdownish text={message.text ?? ""} mentions={names} />
+          </>
+        }
+        under={reactions}
+        actions={verbs(who)}
+        receipts={receipts}
+      />
+    );
+  }
+
+  // your own words: on your side, in your accent
+  if (message.role === "user") {
+    return (
+      <GroupMessage
+        mine
+        first={place.first}
+        last={place.last}
+        at={message.at}
+        readId={message.id}
+        rowRef={tap.row}
+        onPointerUp={tap.onPointerUp}
+        className={cn(fresh && "animate-send-in")}
+        bubbleClassName="whitespace-pre-wrap"
+        bubble={
+          <>
+            {message.replyTo && <ReplyContext replyTo={message.replyTo} onAccent />}
+            <UserText text={message.text ?? ""} />
+          </>
+        }
+        under={
+          <>
+            {reactions}
+            {message.deliveredAt && (
+              <div data-copy="skip" className="mt-0.5 px-1 text-caption leading-4 tabular-nums text-muted-foreground">
+                {queuedLine(message.queuedAt ?? message.at, message.deliveredAt)}
+              </div>
+            )}
+          </>
+        }
+        actions={verbs(t("roomView.you"))}
+        receipts={receipts}
+      />
+    );
+  }
+
+  if (message.kind === "notice" && message.sessionReset) return <Notice message={message} />;
+
+  if (message.kind === "notice" && (message.event || message.compaction)) {
+    return <div className="py-1 text-center text-small text-muted-foreground">{message.text}</div>;
+  }
+
+  if (message.kind === "notice" && message.intent) {
+    return (
+      <div className="pl-9">
+        <IntentNote message={message} />
+      </div>
+    );
+  }
+
+  // what failed in the room, put to the person (server/incidents.ts)
+  if (message.kind === "notice" && message.incident && message.incident.kind !== "note") {
+    return (
+      <div className="pl-9">
+        <IncidentNotice message={message} />
+      </div>
+    );
+  }
+
+  if (message.kind === "notice") {
+    return (
+      <div className="flex gap-2.5 pl-9">
+        <div className="flex max-w-[560px] gap-2 rounded-xl border border-warning/30 bg-warning/5 px-3 py-2">
+          <AlertTriangle size={14} className="mt-0.5 shrink-0 text-warning" />
+          <div className="whitespace-pre-wrap text-body leading-relaxed text-foreground">
+            {message.text}
+            <CarryOn message={message} />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (message.kind === "artifact" && message.artifact) {
+    return (
+      <div className="pl-9">
+        <ArtifactCard botId={message.from ?? ""} artifact={message.artifact} />
+      </div>
+    );
+  }
+
+
+  // the room's own opening line has no speaker
+  if (!speaker) {
+    return (
+      <div className="py-1 text-center text-small text-muted-foreground">{message.text}</div>
+    );
+  }
+
+  // a card asks or reports rather than says: it keeps its own shape,
+  // lined up with the bubbles, under the agent's name
+  if (message.kind === "changes" || message.kind === "options") {
+    return (
+      <div className="flex gap-2">
+        <div className="w-7 shrink-0 pt-0.5">{showSpeaker && <AgentAvatar bot={speaker} size={28} />}</div>
+        <div className="min-w-0 flex-1">
+          {showSpeaker && <div className="mb-1 px-1 text-small font-medium text-muted-foreground">{speaker.name}</div>}
+          {message.kind === "changes" ? (
+            <ChangesCard message={message} />
+          ) : (
+            // an agent can need you mid-room; the ask has to be answerable here
+            <OptionCard botId={speaker.id} roomId={roomId} message={message} />
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const ui = message.kind === "component" && message.component;
+  return (
+    <GroupMessage
+      mine={false}
+      first={place.first}
+      last={place.last}
+      face={<AgentAvatar bot={speaker} size={28} />}
+      name={speaker.name}
+      at={message.at}
+      rich={Boolean(ui) || richText(message.text ?? "")}
+      readId={message.id}
+      rowRef={ui ? undefined : tap.row}
+      onPointerUp={ui ? undefined : tap.onPointerUp}
+      className={cn(fresh && "animate-fade-in")}
+      bubble={
+        ui ? (
+          <MessageComponent message={message} threadId={roomId} />
+        ) : (
+          <>
+            {message.replyTo && <ReplyContext replyTo={message.replyTo} />}
+            {/* a click in the answer goes back to this agent, in this room */}
+            <GenUiHost target={{ kind: "room", roomId, agentName: speaker.name }}>
+              <Markdownish text={message.text ?? ""} mentions={names} />
+            </GenUiHost>
+          </>
+        )
+      }
+      under={ui ? undefined : reactions}
+      actions={ui ? undefined : verbs(speaker.name)}
+      receipts={receipts}
+    />
+  );
+}
+
+export function RoomView({ owlbot }: { owlbot: OwlBot }) {
+  const { state, dispatch } = useStore();
+  // One view per room (App keys it). The box (room/RoomComposer.tsx)
+  // keeps its own words and files for the room; the view keeps the
+  // reply being written, since a message's own row starts it.
+  const [closing, setClosing] = useState(false);
+  // Two ways to read the same transcript. A device preference rather than
+  // a room setting: which one helps depends on what you are doing, not on
+  // which room you are in.
+  const [lens, setLens] = useState<"stream" | "forum">(
+    () => (localStorage.getItem("owlbot-room-lens") === "forum" ? "forum" : "stream"),
+  );
+  useSettingsObservation({ "room.lens": { status: "observed", value: lens } });
+  const setLensAnd = (next: "stream" | "forum") => {
+    setLens(next);
+    try {
+      localStorage.setItem("owlbot-room-lens", next);
+    } catch {
+      /* private mode: the choice still holds for this session */
+    }
+  };
+  const [highlightId, setHighlightId] = useState<string | null>(null);
+
+  const [sharingOpen, setSharingOpen] = useState(false);
+  const [ownerName, setOwnerName] = useState<string | undefined>(undefined);
+  const roomPeople = state.roomPeople[owlbot.id] ?? [];
+  const knocking = state.joinRequests[owlbot.id] ?? 0;
+  // the last person seen typing, for a few seconds
+  const typing = state.roomTyping[owlbot.id];
+  const [, tick] = useState(0);
+  const typingNow = typing && teammateActive(typing) ? typing.name : null;
+  useEffect(() => {
+    if (!typing) return;
+    const timer = setTimeout(() => tick((n) => n + 1), TEAMMATE_MS + 100);
+    return () => clearTimeout(timer);
+  }, [typing]);
+
+  // Who is in a shared room, fetched once here and kept current by the
+  // room.people frames the server sends when it changes.
+  useEffect(() => {
+    if (!owlbot.sharing) return;
+    api(`/api/owlbot/${owlbot.id}/people`)
+      .then((next: { people: RoomPerson[]; hostName: string; invites: Array<{ claim?: unknown }> }) => {
+        dispatch({ type: "roomPeople", roomId: owlbot.id, people: next.people });
+        setOwnerName(next.hostName);
+        dispatch({ type: "joinRequest", roomId: owlbot.id, pending: next.invites.filter((i) => i.claim).length });
+      })
+      .catch(() => {});
+  }, [owlbot.id, owlbot.sharing, dispatch]);
+
+  const members = owlbot.memberIds
+    .map((id) => state.bots.find((b) => b.id === id))
+    .filter(Boolean) as Bot[];
+  // Who is in the room and who can answer are two different lists. An
+  // archived member keeps its place, so an old transcript still names
+  // somebody, but the roster and the crown and the mention list all
+  // describe the present.
+  const answering = members.filter((m) => !m.archivedAt);
+  const [replyTo, setReplyTo] = useState<ReplyDraft | null>(null);
+  const [forwarding, setForwarding] = useState<{ message: Message; author: string } | null>(null);
+  const [showRoutines, setShowRoutines] = useState(false);
+  const [justSaved, setJustSaved] = useState(false);
+  // the name in the header, while it is a field
+  const [renaming, setRenaming] = useState(false);
+  const [editingAgents, setEditingAgents] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const pinned = useRef(true);
+  // The crown goes to whoever the server would actually route to: the
+  // member crowned for this room, or the most senior, of those who can
+  // answer.
+  const lead = roomLead(answering, owlbot.leadId);
+  // thinking here, not just busy: a member at work in another
+  // conversation is not about to answer this room
+  const working = members.filter((m) => workingInRoom(m, owlbot.id));
+
+  // ── topics (GitHub 523, server/room-topics.ts) ──
+  // The thread being read: one of the room's topics, or the main stream
+  // (null), which is everything said in none. Everything below reads the
+  // thread, so the scrubber, the folds and the box all follow it.
+  const topics = useMemo(() => orderTopics(owlbot.topics), [owlbot.topics]);
+  const [topicId, setTopicId] = useState<string | null>(null);
+  const topic = topicId ? (topics.find((tp) => tp.id === topicId) ?? null) : null;
+  const thread = topic?.id ?? null;
+  // the owner's app: the owner may do all of it (the server checks anyway)
+  const powers = topicPowers({ kind: "owner" });
+  const [topicDialog, setTopicDialog] = useState<{ topic?: RoomTopic } | null>(null);
+
+  // The room's conversation, and what waits behind the round it is in,
+  // above the composer until it goes (GitHub 170).
+  const split = useMemo(() => splitWaiting(owlbot.messages), [owlbot.messages]);
+  const said = useMemo(() => split.said.filter((m) => inThread(m, thread)), [split.said, thread]);
+  const waiting = useMemo(() => split.waiting.filter((m) => inThread(m, thread)), [split.waiting, thread]);
+  const earlier = useHistoryPaging("room", { ...owlbot, threadId: owlbot.id }, said, scrollRef, pinned, lens === "stream" && !highlightId);
+  const start = earlier.start;
+  // which messages have answers hanging off them, for the stream's hint
+  const counts = replyCounts(said);
+  // where each person's turn starts, for the rail beside the stream
+  const turns = useMemo(() => turnMarks(said), [said]);
+
+  // A room is a group: every message a bubble, a run from one sender as
+  // one, and with people in it, who has read how far
+  // (src/lib/participants.ts, src/lib/readReceipts.ts).
+  const roster = useWorkspaceRoster();
+  // everyone by the name the room calls them, guests included, told apart
+  // where two share a first name (src/lib/names.ts)
+  const nameOf = useNamer(roomPeople);
+  const personName = (id: string) => nameOf(id, t("roomView.aFormerMember"));
+  const isBubble = (m: Message) =>
+    !m.deleted && (m.role === "user" || (Boolean(m.from) && (m.kind === "text" || m.kind === "component")));
+  const roomRuns = useMemo(() => runs(said, isBubble), [said]); // eslint-disable-line react-hooks/exhaustive-deps
+  const withPeople = roomPeople.length > 0 || roster.members.length > 0;
+  const reads = useReads(withPeople ? owlbot.id : null);
+  useEffect(() => {
+    if (!withPeople) return;
+    api(`/api/threads/${owlbot.id}/reads`)
+      .then((r: { reads?: unknown }) => seedReads(owlbot.id, r.reads))
+      .catch(() => {});
+  }, [withPeople, owlbot.id]);
+  // on screen here, so an answer that lands in it is no news for the phone
+  useViewingReport(owlbot.id, (body) => api("/api/viewing", { method: "POST", body: JSON.stringify(body) }));
+  useReadPosition({
+    threadId: withPeople ? owlbot.id : null,
+    scroller: scrollRef,
+    enabled: withPeople && lens === "stream",
+    post: (threadId, messageId) => api(`/api/threads/${threadId}/read`, { method: "POST", body: JSON.stringify({ messageId }) }),
+    tick: said.length,
+  });
+  const receiptRows = useMemo(
+    () => (withPeople ? receiptsAt(said.map((m) => m.id), new Set(roomRuns.keys()), reads, "owner", new Map(said.map((m) => [m.id, senderOf(m)]))) : new Map<string, string[]>()),
+    [withPeople, said, roomRuns, reads],
+  );
+  const readerName = (id: string) =>
+    id === "owner" ? (ownerName ?? roster.owner ?? t("roomView.you")) : personName(id);
+  const receiptsFor = (id: string) => {
+    const who = receiptRows.get(id);
+    return who?.length ? <SeenBy people={who.map((p) => ({ id: p, name: readerName(p) }))} /> : undefined;
+  };
+  // Each agent's finished turn is one line above its reply
+  // (src/lib/turnFold.ts). A room's transcript does not say where a turn
+  // began, so where one seen starting began is kept here: nothing of it
+  // folds while it runs, whoever else speaks meanwhile. One already
+  // running when the room was opened has no such place (null).
+  const liveFrom = useRef<Map<string, number | null> | null>(null);
+  const seen = liveFrom.current;
+  const live = new Map<string, number | null>();
+  for (const m of working) live.set(m.id, seen ? (seen.has(m.id) ? (seen.get(m.id) ?? null) : said.length) : null);
+  // Room history can arrive before the initial agent list. Those workers
+  // were not observed starting here, so keep their boundary unknown.
+  liveFrom.current = state.hydrated ? live : null;
+  const liveKey = [...live].map(([id, since]) => `${id}:${since}`).join(" ");
+  const folded = useMemo(() => foldRoom(said, live, !owlbot.olderMessages), [said, liveKey, owlbot.olderMessages]); // eslint-disable-line react-hooks/exhaustive-deps
+  const visibleRows = useMemo(() => rowsFrom(folded.rows, start), [folded, start]);
+  const [openFolds, setOpenFolds] = useState<ReadonlySet<string>>(() => new Set());
+
+  // Who handed what to whom, read the way the server reads a mention
+  // (src/lib/roomVoices.ts). Everyone ever in the room counts, so a
+  // handoff to a member since archived still reads as one.
+  const memberKey = members.map((m) => `${m.id}:${m.name}`).join(" ");
+  const handoffs = useMemo(() => handoffsIn(said, members), [said, memberKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Each member's words as they arrive, under its name. The stream is
+  // kept per lane, and a lane says which room its turn speaks in while it
+  // runs; the part that already landed here is cut off the front
+  // (unsaid). Where each lane was cut is kept between renders.
+  const streamMarks = useRef(new Map<string, StreamMark>());
+  const voices: Array<{ bot: Bot; text: string }> = [];
+  const streamingLanes = new Set<string>();
+  for (const m of working) {
+    const lane = m.tasks?.find((t) => t.room === owlbot.id)?.id;
+    const stream = lane ? state.streaming[lane] : undefined;
+    if (!lane || !stream) continue;
+    streamingLanes.add(lane);
+    const next = unsaid(stream, lastWordsOf(said, m.id), streamMarks.current.get(lane));
+    streamMarks.current.set(lane, next.mark);
+    if (next.text) voices.push({ bot: m, text: next.text });
+  }
+  for (const lane of [...streamMarks.current.keys()]) if (!streamingLanes.has(lane)) streamMarks.current.delete(lane);
+  const mentionNames = [
+    ...members.map((m) => m.name),
+    ...roomPeople.map((p) => p.name),
+    ...(owlbot.sharing && ownerName ? [ownerName] : []),
+  ];
+  // at work with nothing to read yet: one line says who
+  const quiet = working.filter((m) => !voices.some((v) => v.bot.id === m.id));
+
+  // ── landing on a message ──
+  // A handoff line pressed, a topic found in the stream, or a message
+  // picked in the palette: the message is drawn (the whole room when it
+  // is above what is drawn, its fold opened when it is under one), then
+  // brought into view once it is on the page, and lit for a moment so
+  // the eye knows which line it was sent to.
+  const [landing, setLanding] = useState<{ id: string; nonce: number } | null>(null);
+  const landed = useRef<number | null>(null);
+  const [flashId, setFlashId] = useState<string | null>(null);
+  const reduced = useReducedMotion();
+  const land = (messageId: string, whole: boolean) => {
+    const index = said.findIndex((m) => m.id === messageId);
+    pinned.current = false;
+    if (whole || (index !== -1 && index < start)) earlier.showAll();
+    const fold = foldHolding(folded.rows, index);
+    if (fold) setOpenFolds((open) => new Set(open).add(fold));
+    setLanding({ id: messageId, nonce: Date.now() });
+  };
+  useEffect(() => {
+    if (!landing || landed.current === landing.nonce) return;
+    const el = scrollRef.current;
+    const row = el?.querySelector(`[data-room-msg="${landing.id}"]`);
+    if (!el || !row) return;
+    landed.current = landing.nonce;
+    pinned.current = false;
+    // From far away at once, since a long glide is only waiting. From
+    // the very end at once too: the first steps of a glide up from there
+    // are still close enough to the end to read as following it, and the
+    // room would be taken straight back down.
+    const far = Math.abs(row.getBoundingClientRect().top - el.getBoundingClientRect().top) > el.clientHeight * 2;
+    const atEnd = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
+    row.scrollIntoView({ block: "center", behavior: far || atEnd || reduced ? "auto" : "smooth" });
+    setFlashId(landing.id);
+  });
+  // the light is a moment, not a state
+  useEffect(() => {
+    if (!flashId) return;
+    const t = setTimeout(() => setFlashId(null), 1600);
+    return () => clearTimeout(t);
+  }, [flashId, landing]);
+  const openHandoff = (handoff: Handoff) => land(handoff.sourceId, false);
+
+  // Asks from outside, the palette's (src/lib/chatAsk.ts): taken once
+  // the message is in hand, and one further back than what has arrived
+  // is paged in until it is.
+  const [askTick, setAskTick] = useState(0);
+  useEffect(() => onAsk(() => setAskTick((n) => n + 1)), []);
+  useEffect(() => {
+    const ask = peekRoomAsk(owlbot.id);
+    if (!ask) return;
+    if (said.some((m) => m.id === ask.messageId)) {
+      takeAsk(ask);
+      // a message is found in the stream, where it can be answered
+      if (lens === "forum") setLensAnd("stream");
+      land(ask.messageId, false);
+    } else if (earlier.remaining > 0 && !earlier.loading) {
+      earlier.showEarlier();
+    }
+  }, [askTick, owlbot.id, said, earlier.remaining, earlier.loading]); // eslint-disable-line react-hooks/exhaustive-deps
+  const handoffLine = (handoff: Handoff) => (
+    <HandoffLine
+      key={`handoff:${handoff.sourceId}:${handoff.toId}`}
+      from={members.find((b) => b.id === handoff.fromId)?.name ?? t("common.anAgent")}
+      to={members.find((b) => b.id === handoff.toId)?.name ?? t("roomView.anAgentLower")}
+      ask={handoff.ask}
+      onOpen={() => openHandoff(handoff)}
+    />
+  );
+
+  // A room with nothing in it yet but its opening line: a welcome, with
+  // the members and how to reach one of them. A first message waiting for
+  // your hosted workspace to wake is something in it already.
+  const wake = useWake();
+  const held = heldToShow(useHeldSends(`room:${owlbot.id}`), { waking: wake.waking, hosted: isHostedWindow() }, said, waiting);
+  const fresh =
+    lens === "stream" &&
+    !owlbot.olderMessages &&
+    !working.length &&
+    !waiting.length &&
+    !held.length &&
+    said.every((m) => m.role === "bot" && !m.from && m.kind === "text");
+  /** Puts @name in the box, for a member picked on the welcome. */
+  const [mentionAsk, setMentionAsk] = useState<{ name: string; nonce: number } | null>(null);
+  const mention = (name: string) => setMentionAsk({ name, nonce: Date.now() });
+
+  const { away, toLatest } = useStickToBottom(scrollRef, pinned);
+  // What stood at the end the last time the reader was following it.
+  // What anyone else says after that, while they read further up, is
+  // what the way back counts as new: a member's words, or a person's in
+  // a shared room, and never a tool call or a notice.
+  const seenThrough = useRef<string | undefined>(undefined);
+  if (pinned.current) seenThrough.current = said[said.length - 1]?.id;
+  const seenAt = seenThrough.current ? said.findIndex((m) => m.id === seenThrough.current) : -1;
+  const freshBelow =
+    !away || seenAt < 0
+      ? 0
+      : said
+          .slice(seenAt + 1)
+          .filter((m) => !m.deleted && (m.role === "bot" ? Boolean(m.from) && (m.kind === "text" || m.kind === "options") : Boolean(m.author)))
+          .length;
+
+  // When a turn ends its work folds, and the reply stays where it is on
+  // screen for a reader who is not at the end. After the effect above:
+  // that one adds to where the reader is, and this one then finds the
+  // reply already in place.
+  useHoldPlace(
+    scrollRef,
+    pinned,
+    owlbot.id,
+    lastFoldKey(folded.rows),
+    folded.hold ? `[data-room-msg="${folded.hold.message.id}"]` : null,
+  );
+  // Opening a fold leaves its line where it was pressed. At the end of
+  // the room, following the end would scroll the line away instead.
+  const toggleFold = (key: string) => {
+    pinned.current = false;
+    setOpenFolds((open) => {
+      const next = new Set(open);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    if (!pinned.current) return;
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+  }, [owlbot.id, said.length, waiting.length, working.length, voices.length]);
+
+  // Named rather than inline, because the header shows them as buttons on
+  // a desktop and as menu items on a phone, and the two must not drift.
+  const saveToLibrary = () => {
+    // Banking the room in the library makes it repeatable: the same roles
+    // can be hired again as a fresh team later.
+    if (justSaved) return;
+    api(`/api/owlbot/${owlbot.id}/manifest`)
+      .then((manifest) =>
+        api("/api/team-library", {
+          method: "POST",
+          body: JSON.stringify({ name: owlbot.name, members: manifest.members }),
+        }),
+      )
+      .then(() => {
+        setJustSaved(true);
+        setTimeout(() => setJustSaved(false), 1600);
+      })
+      .catch(() => {});
+  };
+
+  const exportManifest = () => {
+    // The room's roles as a file, for handing to someone else or to the
+    // catalogue: a Markdown team file in the catalogue's own format
+    // (server/catalog.ts), with this workspace's secrets, addresses and
+    // the hire's project brief taken out by the server.
+    shareAsFile(`/api/owlbot/${owlbot.id}/team.md`, teamFilename(owlbot.name))
+      .then(() => toast(t("roomView.savedTeamFile"), { description: t("roomView.savedTeamFileHint") }))
+      .catch((e: Error) => toast.error(e.message));
+  };
+
+  // Seniority is the agent's in every room; the crown is this room's own.
+  // The header follows the server's frame, so nothing moves until it lands.
+  const makeLead = (id: string | null) => {
+    api(`/api/owlbot/${owlbot.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ leadId: id }),
+    }).catch((e: Error) => dispatch({ type: "error", message: e.message }));
+  };
+
+  // where each topic stands, from the whole room, not the thread on screen
+  const topicStates = useMemo(
+    () => new Map<string, TopicState>(topics.map((tp) => [tp.id, topicState(tp, split.said, working.length > 0)])),
+    [topics, split.said, working.length],
+  );
+  const topicSizes = useMemo(() => topicCounts(split.said), [split.said]);
+
+  // ── the side dock (dock/SideDock.tsx) ──
+  // The topic's context, documents opened here and the browser, in one
+  // column. Never opened by an agent's work in a room: several agents at
+  // once would pull it back and forth. Only what the person does opens it.
+  const dockKey = roomKey(owlbot.id);
+  useEffect(() => dock.setCurrent(dockKey), [dockKey]);
+  const dockPlace = placeIn(useDockState(), dockKey);
+  const browserState = useBrowserState();
+  const browserWhere = useBrowserWhere();
+  const [chatLinksIn] = useChatLinksIn();
+  const browserHere = browserWhere.home === "own" || browserWhere.home === "server";
+  const browserMiniAspect = useMiniAspect();
+  const pageInFront = browserState?.tabs.find((tab) => tab.id === browserState.activeTabId);
+  const dockHost: DockHost = {
+    openDoc: (doc) => dock.openDoc(dockKey, doc),
+    // in the dock only where its browser can open the page and the person
+    // has not chosen their own browser for links (GitHub 539)
+    openLink: linksOpenInDock(browserWhere, chatLinksIn) ? (url) => void showPage(url, browserState?.tabs) : null,
+  };
+  const nameOfActor = (by: string) =>
+    by === "owner" ? t("forumLens.you") : by.startsWith("agent:") ? (members.find((b) => `agent:${b.id}` === by)?.name ?? t("common.anAgent")) : personName(by);
+  // the running extensions' panels, as one more panel of the dock
+  const extensionsPane = useExtensionsPane();
+  const dockPanes: DockPane[] = [
+    {
+      id: "topic",
+      label: t("roomTopics.panel.label"),
+      icon: <MessagesSquare size={15} />,
+      // the topic on screen working or waiting, or another person typing
+      // in the room
+      status: strongest(
+        topic ? topicDot[topicStates.get(topic.id) ?? "idle"] : null,
+        typingNow ? "teammate" : null,
+      ),
+      render: () => (
+        <TopicPanel
+          owlbot={owlbot}
+          topic={topic}
+          state={topic ? (topicStates.get(topic.id) ?? "idle") : "idle"}
+          members={answering}
+          messages={split.said}
+          count={topic ? (topicSizes.get(topic.id) ?? 0) : 0}
+          canClose={powers.close}
+          canEdit={powers.edit}
+          lead={lead}
+          creatorName={nameOfActor}
+          onEdit={() => topic && setTopicDialog({ topic })}
+          onOpenDoc={dockHost.openDoc}
+          onOpenLink={dockHost.openLink}
+        />
+      ),
+    },
+    {
+      id: "docs",
+      label: t("dock.docs.label"),
+      icon: <FileText size={15} />,
+      keepAlive: true,
+      render: (shown) => <FilesPanel placeKey={dockKey} place={dockPlace} shown={shown} />,
+    },
+    ...(browserHere
+      ? [
+          {
+            id: "browser" as const,
+            label: t("dock.browser.label"),
+            detail: browserWhere.home === "server" ? t("dock.browser.onServer") : t("dock.browser.here"),
+            icon: <Globe size={15} />,
+            status: browserStatus(browserState),
+            render: (shown: boolean) => <DockedBrowser shown={shown} />,
+            minimizable: pageOpen(browserState),
+            mini: () => <MiniBrowser />,
+            miniActions: () => <MiniViewport />,
+            miniAspect: browserMiniAspect,
+            miniLabel: pageInFront ? tabLabel(pageInFront) || undefined : undefined,
+          },
+        ]
+      : []),
+    ...(extensionsPane ? [extensionsPane] : []),
+  ];
+  // A topic picked opens its context in the dock, where there is room for
+  // both; on a narrow window the thread alone changes.
+  const pickTopic = (id: string | null) => {
+    setTopicId(id);
+    pinned.current = true;
+    if (id && window.innerWidth >= DOCK_SIDE_BY_SIDE + 320) dock.show(dockKey, "topic");
+  };
+
+  const answers = answersOf(owlbot);
+  const setAnswers = (next: RoomAnswers) => {
+    if (next === answers) return;
+    api(`/api/owlbot/${owlbot.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ answers: next }),
+    }).catch((e: Error) => dispatch({ type: "error", message: e.message }));
+  };
+
+  // Shown at once in the header and the sidebar, and taken back with the
+  // reason if the server says no (src/lib/roomPatch.ts).
+  const rename = (next: string | null) => {
+    setRenaming(false);
+    if (next) dispatch({ type: "patchRoom", owlbotId: owlbot.id, patch: { name: next } });
+  };
+
+  // A room is one conversation, so starting clean is a new room with the
+  // same team, opened in the New room dialog to be looked over first.
+  // This one, and everything said in it, stays where it is.
+  const freshStart = () =>
+    dispatch({ type: "toggleNewRoom", open: true, preset: freshStartPreset(owlbot, state.bots) });
+
+  // One stretch of the room as its rows: what stays in the open, or a
+  // fold's work once it is opened. Who spoke last and a run of tool calls
+  // are read within the stretch, since rows with a fold between them are
+  // not next to each other on the page.
+  //
+  // A handoff line goes in front of the first row at or past where its
+  // member's answer begins. Each is placed once a render, so a fold that
+  // opens does not draw again the one already drawn above its line.
+  const handoffAt = [...handoffs.placed.keys()].filter((i) => i >= start).sort((a, b) => a - b);
+  const handoffsDrawn = new Set<number>();
+  const handoffsBefore = (index: number) => {
+    const lines = [];
+    for (const at of handoffAt) {
+      if (at > index) break;
+      if (handoffsDrawn.has(at)) continue;
+      handoffsDrawn.add(at);
+      lines.push(...(handoffs.placed.get(at) ?? []).map(handoffLine));
+    }
+    return lines;
+  };
+  const rowsOf = (list: readonly Message[], indices: readonly number[]) =>
+    list.flatMap((m, i) => {
+      const prev = list[i - 1];
+      // one member's run of tool calls reads as one line
+      if (m.kind === "activity" && m.tool) {
+        if (prev?.kind === "activity" && prev.from === m.from && !prev.deleted) return [];
+        const run: Message[] = [];
+        for (let j = i; j < list.length; j++) {
+          const next = list[j];
+          if (next.kind !== "activity" || next.from !== m.from || next.deleted || !next.tool) break;
+          run.push(next);
+        }
+        return [
+          ...handoffsBefore(indices[i]),
+          <MessageGuard key={m.id} id={m.id} resetKey={m} className="ml-9" render={() => <ToolRun messages={run} className="pl-9" />} />,
+        ];
+      }
+      const showSpeaker = !prev || prev.from !== m.from || prev.role !== m.role;
+      const answers = replyLabel(counts.get(m.id) ?? 0);
+      const lit = flashId === m.id;
+      // each message is drawn inside its own guard, so one that cannot be
+      // drawn costs that message and not the room (src/lib/rowGuard.ts)
+      return [
+        ...handoffsBefore(indices[i]),
+        <MessageGuard
+          key={m.id}
+          id={m.id}
+          resetKey={m}
+          className="ml-9"
+          render={() => (
+            <div data-room-msg={m.id} className={cn("relative isolate", roomRuns.get(m.id)?.first === false && "-mt-1.5")}>
+              <LandMark on={lit} />
+              <RoomMessage
+                message={m}
+                members={members}
+                people={roomPeople}
+                ownerName={owlbot.sharing ? ownerName : undefined}
+                showSpeaker={showSpeaker}
+                place={roomRuns.get(m.id) ?? { first: showSpeaker, last: true }}
+                receipts={receiptsFor(m.id)}
+                memberName={personName}
+                roomId={owlbot.id}
+                onReply={setReplyTo}
+                onForward={(message, author) => setForwarding({ message, author })}
+              />
+              {m.moved && !m.deleted && (
+                <p className="ml-9 mt-0.5 flex items-center gap-1.5 text-small text-muted-foreground">
+                  <MessagesSquare size={12} className="shrink-0" aria-hidden />
+                  {t("roomTopics.movedBy", { name: nameOfActor(m.moved.by) })}
+                </p>
+              )}
+              {m.route && !m.deleted && (
+                <RouteLine
+                  route={m.route}
+                  nameOf={(id) => members.find((b) => b.id === id)?.name ?? t("common.anAgent")}
+                  others={answering.filter((b) => !m.route!.to.includes(b.id))}
+                  onMention={mention}
+                />
+              )}
+              {answers && (
+                <button
+                  onClick={() => setLensAnd("forum")}
+                  className="ml-9 mt-0.5 rounded-md px-1.5 py-0.5 text-small text-brand-ink transition-colors duration-150 hover:bg-accent"
+                >
+                  {answers}
+                </button>
+              )}
+            </div>
+          )}
+        />,
+      ];
+    });
+
+  const titleSlot = useTitlebarSlot();
+  const [dockHead, setDockHead] = useState<HTMLDivElement | null>(null);
+  const [folderOpen, setFolderOpen] = useState(false);
+  const [calling, setCalling] = useState(false);
+  const voiced = answering.filter((m) => m.voice).length;
+  const folderShown = owlbot.pinnedCwd ?? owlbot.cwd;
+  const roomMenu = (
+    <RoomMenu
+      owlbot={owlbot}
+      knocking={knocking}
+      shareLabel={owlbot.sharing ? t("roomView.sharedWith", { count: roomPeople.length }) : t("roomView.shareRoom")}
+      onShare={() => setSharingOpen(true)}
+      folderLabel={folderShown ? t("roomView.sharedFolderIs", { path: folderShown }) : t("roomView.sharedWorkingFolder")}
+      onFolder={() => setFolderOpen(true)}
+      callLabel={
+        voiced === 0
+          ? undefined
+          : voiced === answering.length
+            ? t("voice.call", { name: owlbot.name })
+            : t("voice.callSomeInText", { name: owlbot.name, count: answering.length - voiced })
+      }
+      onCall={() => setCalling(true)}
+      onRename={() => setRenaming(true)}
+      onAgents={() => setEditingAgents(true)}
+      onFreshStart={freshStart}
+      justSaved={justSaved}
+      onRoutines={() => setShowRoutines(true)}
+      onSave={saveToLibrary}
+      onExport={exportManifest}
+      answers={answers}
+      onAnswers={setAnswers}
+      members={answering}
+      lead={lead}
+      onLead={makeLead}
+      onClose={() => setClosing(true)}
+      onNewTopic={powers.open ? () => setTopicDialog({}) : undefined}
+    />
+  );
+  // the room's name and who answers in it, up in the top row (`up`) or in
+  // its own header
+  const roomIdentity = (up: boolean) => (
+        <div className="relative flex min-w-0 items-center gap-2.5">
+          <span className={cn("flex shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground", up ? "size-6" : "size-7")}>
+            <Users size={15} />
+          </span>
+          <span className={cn("min-w-0", up && "flex items-baseline gap-2")}>
+            {renaming ? (
+              <RoomRename name={owlbot.name} onDone={rename} className="-ml-1.5 block w-[min(360px,55vw)] text-ui font-semibold" />
+            ) : (
+              <span className="flex min-w-0 items-center gap-0.5">
+                <span className={cn("block truncate text-ui font-semibold text-foreground", up && "shrink-0")}>{owlbot.name}</span>
+                {roomMenu}
+              </span>
+            )}
+            {/* the lead first, crowned, so a phone without the faces on
+                the right still says who has the final call */}
+            <span className={cn("flex min-w-0 items-center gap-1 text-small text-muted-foreground", up && "hidden sm:flex")}>
+              {lead && answering.length > 1 && <Crown size={11} className="shrink-0 text-brand-ink" aria-label={t("roomView.lead")} />}
+              <span className="truncate">
+                {formatList(byLead(answering, lead).map((m) => m.name), { type: "unit" })}
+                {answering.length < members.length &&
+                  ` · ${t("roomView.archivedCount", { count: members.length - answering.length })}`}
+              </span>
+            </span>
+          </span>
+          {folderOpen && <RoomFolderPanel owlbot={owlbot} onClose={() => setFolderOpen(false)} />}
+          {calling && <GroupCallOverlay owlbot={owlbot} members={answering} onClose={() => setCalling(false)} />}
+        </div>
+  );
+  // Two buttons, as in a chat (ChatView.tsx): how to read the room, and
+  // the side panel. Who is here shows as their faces; sharing, the folder,
+  // a call and changing or tidying the room are the menu after its name.
+  const roomActions = (
+        <div className="flex shrink-0 items-center gap-1.5">
+          <RoomPresence members={answering} lead={lead} working={working} answers={answers} />
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setLensAnd(lens === "stream" ? "forum" : "stream")}
+            className={cn(lens === "forum" && "bg-accent text-foreground")}
+            title={
+              lens === "stream"
+                ? t("roomView.viewAsTopics")
+                : t("roomView.viewInOrder")
+            }
+            aria-label={lens === "stream" ? t("roomView.viewAsTopics") : t("roomView.viewInOrder")}
+            aria-pressed={lens === "forum"}
+          >
+            {lens === "stream" ? <MessagesSquare size={16} /> : <Rows3 size={16} />}
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => dock.toggle(dockKey, dockPanes.map((p) => p.id))}
+            className={cn(dockPlace.open && "bg-accent text-foreground")}
+            title={t("dock.toggle")}
+            aria-label={t("dock.toggle")}
+            aria-pressed={dockPlace.open}
+          >
+            <PanelRight size={16} />
+          </Button>
+        </div>
+  );
+
+  return (
+    <main className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
+      {/* Who and what the room is, and its buttons: on a wide window up
+          in the window's top row, as a chat's are (ChatView.tsx), with the
+          side dock's tabs over the dock; on a narrow one here. */}
+      {titleSlot ? (
+        createPortal(
+          <div className="flex h-full min-w-0 flex-1 items-center">
+            <div className="flex min-w-0 flex-1 items-center pl-1.5 pr-2">{roomIdentity(true)}</div>
+            <div className="flex shrink-0 items-center pr-2">{roomActions}</div>
+            <div ref={setDockHead} className="h-full w-0 shrink-0 overflow-hidden" />
+          </div>,
+          titleSlot,
+        )
+      ) : (
+        <div className="titlebar-drag flex h-[52px] shrink-0 items-center justify-between gap-2 border-b px-3 max-md:pl-16 md:px-4">
+          {roomIdentity(false)}
+          {roomActions}
+        </div>
+      )}
+
+      <SharePanel owlbot={owlbot} open={sharingOpen} onOpenChange={setSharingOpen} />
+
+      {closing && (
+        <div
+          className="absolute inset-0 z-40 flex items-center justify-center bg-black/30 p-4"
+          onClick={() => setClosing(false)}
+        >
+          <div
+            className="w-[400px] max-w-[92vw] animate-pop-in rounded-2xl border bg-popover p-4 shadow-2xl sm:p-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="text-lead font-semibold text-foreground">
+              {t("roomView.closeRoom", { name: owlbot.name })}
+            </div>
+            <p className="mt-1 text-body leading-relaxed text-muted-foreground">
+              {t("roomView.archivingKeepsEverythingAndYou")}
+            </p>
+            <div className="mt-4 flex flex-col gap-2">
+              <Button
+                onClick={() => {
+                  dispatch({ type: "patchRoom", owlbotId: owlbot.id, patch: { archived: true } });
+                  setClosing(false);
+                }}
+              >
+                {t("roomView.archiveRoom")}
+              </Button>
+              <Button
+                variant="secondary"
+                className="text-destructive"
+                onClick={() => {
+                  // the second decision, in its own words, naming the room
+                  void confirm({
+                    title: t("roomView.deleteConfirm.title", { name: owlbot.name }),
+                    body: t("roomView.deleteConfirm.body"),
+                    confirmLabel: t("common.delete"),
+                    destructive: true,
+                  }).then((yes) => yes && dispatch({ type: "deleteRoom", owlbotId: owlbot.id }));
+                }}
+              >
+                {t("roomView.deletePermanently")}
+              </Button>
+              <Button variant="ghost" onClick={() => setClosing(false)}>
+                {t("common.cancel")}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <DockHostContext.Provider value={dockHost}>
+      <div className="relative flex min-h-0 min-w-0 flex-1">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      {topics.length > 0 && (
+        <TopicBar
+          topics={topics}
+          current={thread}
+          states={topicStates}
+          counts={topicSizes}
+          canOpen={powers.open}
+          onPick={pickTopic}
+          onNew={() => setTopicDialog({})}
+        />
+      )}
+      <div className="relative flex min-h-0 flex-1 flex-col">
+      <div
+        ref={scrollRef}
+        onScroll={earlier.onScroll}
+        className="flex-1 overflow-y-auto px-4 md:px-6 [overflow-anchor:none]"
+      >
+        {lens === "forum" ? (
+          <ForumLens
+            messages={said}
+            members={members}
+            people={roomPeople}
+            onOpenInStream={(messageId) => {
+              setLensAnd("stream");
+              setHighlightId(messageId);
+              // the stream may be windowed to its tail, so the whole of
+              // it is drawn rather than scrolling to something not there
+              land(messageId, true);
+            }}
+          />
+        ) : fresh ? (
+          <RoomWelcome
+            name={owlbot.name}
+            members={byLead(answering, lead)}
+            lead={answering.length > 1 ? lead : null}
+            answers={answers}
+            onMention={mention}
+          />
+        ) : (
+        <div className="mx-auto flex max-w-[var(--transcript-width,760px)] flex-col gap-2 pb-4 pt-3">
+          {(start > 0 || earlier.remaining > 0) && (
+            <button
+              onClick={earlier.showEarlier}
+              disabled={earlier.loading}
+              className="mx-auto mt-3 inline-flex items-center gap-1.5 rounded-full border px-3.5 py-1.5 text-small text-muted-foreground transition-colors duration-150 hover:border-foreground/25 hover:text-foreground disabled:opacity-60"
+            >
+              {earlier.loading && <Loader2 size={12} className="animate-spin" />}
+              {t("roomView.showEarlier", { count: start + earlier.remaining })}
+            </button>
+          )}
+          {visibleRows.flatMap((row) =>
+            row.kind === "said"
+              ? rowsOf(
+                  row.items.map((item) => item.message),
+                  row.items.map((item) => item.index),
+                )
+              : [
+                  ...handoffsBefore(Math.min(...row.fold.indices)),
+                  <TurnFoldLine
+                    key={`fold:${row.fold.key}`}
+                    fold={row.fold}
+                    open={openFolds.has(row.fold.key)}
+                    onToggle={() => toggleFold(row.fold.key)}
+                    className="pl-9"
+                  >
+                    {openFolds.has(row.fold.key) && rowsOf(row.fold.messages, row.fold.indices)}
+                  </TurnFoldLine>,
+                ],
+          )}
+          {/* sent while your hosted workspace wakes, faded until it goes */}
+          <HeldSends conversation={`room:${owlbot.id}`} said={said} queued={waiting} group />
+          {/* what members are saying right now, each under its own
+              name, after the handoff that started it when one did */}
+          {voices.flatMap(({ bot, text: words }, i) => {
+            const handoff = handoffs.pending.get(bot.id);
+            const last = said[said.length - 1];
+            const continues = i === 0 && !handoff && last?.role === "bot" && last.from === bot.id;
+            return [
+              ...(handoff ? [handoffLine(handoff)] : []),
+              <LiveWords key={`live:${bot.id}`} bot={bot} text={words} showSpeaker={!continues} mentions={mentionNames} />,
+            ];
+          })}
+          {quiet.flatMap((m) => {
+            const handoff = handoffs.pending.get(m.id);
+            return handoff ? [handoffLine(handoff)] : [];
+          })}
+          {quiet.length > 0 && <WorkingLine bots={quiet} />}
+          {typingNow && (
+            <div className="flex items-center gap-2.5 pl-9 text-small text-muted-foreground">
+              <span className="size-1.5 rounded-full bg-muted-foreground motion-safe:animate-pulse" />
+              {t("roomView.isTyping", { name: typingNow })}
+            </div>
+          )}
+        </div>
+        )}
+      </div>
+
+      {lens === "stream" && !fresh && (
+        <TurnTimeline
+          marks={turns}
+          scroller={scrollRef}
+          rowOf={(id) => `[data-room-msg="${CSS.escape(id)}"]`}
+          onJump={(mark) => land(mark.id, false)}
+          authorOf={(mark) =>
+            mark.author ? personName(mark.author) : owlbot.sharing && ownerName ? ownerName : t("roomView.you")
+          }
+          tick={`${said.length}:${start}:${openFolds.size}:${voices.length}`}
+        />
+      )}
+      <JumpToLatest show={away && lens === "stream" && !fresh} fresh={freshBelow} onJump={toLatest} />
+      <MiniDock placeKey={dockKey} panes={dockPanes} />
+      </div>
+
+      <RoomComposer
+        owlbot={owlbot}
+        members={members}
+        answering={byLead(answering, lead)}
+        lead={answering.length > 1 ? lead : null}
+        working={working}
+        people={roomPeople}
+        ownerName={owlbot.sharing ? ownerName : undefined}
+        nameOf={personName}
+        waiting={waiting}
+        senderOf={(m) =>
+          m.role === "bot"
+            ? (members.find((b) => b.id === m.from)?.name ?? t("common.anAgent"))
+            : m.author
+              ? personName(m.author)
+              : m.via
+                ? (CHANNEL_NAMES[m.via] ?? t("roomView.theLinkedChat"))
+                : null
+        }
+        replyTo={replyTo}
+        onClearReply={() => setReplyTo(null)}
+        mentionAsk={mentionAsk}
+        // what you send is followed to the end, wherever you were reading:
+        // the answers you are now waiting for arrive down there
+        onSent={() => {
+          if (!pinned.current) toLatest();
+        }}
+        topic={topic ? { id: topic.id, title: topic.title, closed: topic.status === "closed" } : null}
+      />
+      {/* words selected in one message, quoted into the reply; a room has
+          no branches, so Quote is all it offers */}
+      <SelectionQuote
+        container={scrollRef}
+        source={(id) => {
+          const m = said.find((x) => x.id === id);
+          if (!m || m.deleted || m.kind !== "text" || !m.text) return null;
+          const author =
+            m.role === "bot"
+              ? (members.find((b) => b.id === m.from)?.name ?? t("common.anAgent"))
+              : m.author
+                ? personName(m.author)
+                : m.via
+                  ? (CHANNEL_NAMES[m.via] ?? t("roomView.theLinkedChat"))
+                  : t("roomView.you");
+          return { author, excerpt: excerptOf(m), branchable: false };
+        }}
+        onQuote={setReplyTo}
+      />
+      </div>
+      <SideDock canMove={false} placeKey={dockKey} panes={dockPanes} headSlot={titleSlot ? dockHead : null} />
+      </div>
+      </DockHostContext.Provider>
+      {topicDialog && (
+        <NewTopicDialog
+          owlbot={owlbot}
+          members={answering}
+          topic={topicDialog.topic}
+          onClose={() => setTopicDialog(null)}
+          onDone={(done) => {
+            setTopicDialog(null);
+            if (!topicDialog.topic) pickTopic(done.id);
+          }}
+        />
+      )}
+      {forwarding && (
+        <ForwardDialog
+          message={forwarding.message}
+          author={forwarding.author}
+          onClose={() => setForwarding(null)}
+        />
+      )}
+      {showRoutines && (
+        <RoutinesDialog
+          initialTarget={{ id: owlbot.id, kind: "room" }}
+          onClose={() => setShowRoutines(false)}
+        />
+      )}
+      {editingAgents && <RoomAgentsDialog owlbot={owlbot} onClose={() => setEditingAgents(false)} />}
+    </main>
+  );
+}
+
+
+/** The room's shared desk: one folder every member's room turns run in.
+ * Settable until the first turn pins it; a chip afterwards. */
+function RoomFolderPanel({ owlbot, onClose }: { owlbot: OwlBot; onClose: () => void }) {
+  const setOpen = (open: boolean) => !open && onClose();
+  const [draft, setDraft] = useState(owlbot.cwd ?? "");
+  const [error, setError] = useState<string | null>(null);
+  const pinned = owlbot.pinnedCwd !== undefined;
+  const shown = owlbot.pinnedCwd ?? owlbot.cwd;
+
+  const save = () => {
+    setError(null);
+    // straight fetch: a rejected path must not stick in local state
+    api(`/api/owlbot/${owlbot.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ cwd: draft.trim() || null }),
+    })
+      .then(() => setOpen(false))
+      .catch((e: Error) => setError(e.message));
+  };
+
+  // opened from the room's menu, under its name; Escape or a click
+  // outside puts it away
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const away = (e: PointerEvent) => !box.current?.contains(e.target as Node) && onClose();
+    const esc = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("pointerdown", away);
+    window.addEventListener("keydown", esc);
+    return () => {
+      window.removeEventListener("pointerdown", away);
+      window.removeEventListener("keydown", esc);
+    };
+  }, [onClose]);
+  return (
+      <div
+        ref={box}
+        role="dialog"
+        aria-label={t("roomView.sharedWorkingFolder")}
+        title={shown ? t("roomView.sharedFolderIs", { path: shown }) : undefined}
+        className="absolute left-0 top-full z-30 mt-2 w-[320px] max-w-[92vw] animate-pop-in rounded-2xl border bg-popover p-3.5 shadow-xl shadow-(color:--shadow-color)"
+      >
+          <div className="text-body font-semibold text-foreground">{t("roomView.sharedWorkingFolder")}</div>
+          {pinned ? (
+            <>
+              <div className="mt-1 break-all text-body text-muted-foreground">
+                {owlbot.pinnedCwd ?? t("roomView.eachMemberUsesItsOwn")}
+              </div>
+              <div className="mt-1.5 text-small text-muted-foreground/70">
+                {t("roomView.setWhenTheRoomStarted")}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="mt-1 text-small text-muted-foreground">
+                {t("roomView.whereMembersWorkInThis")}
+              </div>
+              <div className="mt-2 flex gap-1.5">
+                <input
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && save()}
+                  placeholder={t("roomView.folderPlaceholder", { path: "/Users/you/Projects/launch" })}
+                  className="w-full rounded-lg border border-input bg-transparent px-2.5 py-1.5 text-body text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-ring/60"
+                />
+                <BrowseFolderButton onPick={setDraft} />
+              </div>
+              {error && <div className="mt-1.5 text-small text-destructive">{error}</div>}
+              <div className="mt-2 flex justify-end gap-1.5">
+                <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>
+                  {t("common.cancel")}
+                </Button>
+                <Button size="sm" onClick={save}>
+                  {t("common.save")}
+                </Button>
+              </div>
+            </>
+          )}
+      </div>
+  );
+}
+
+/**
+ * The room's actions, from the small button after its name, at every
+ * width: sharing it, its folder and a call first, since those are what
+ * the header held before, then changing the room and tidying it.
+ *
+ * Changing the room itself comes first: its name, who is in it, and a
+ * fresh start with the same team, since a room is one conversation and
+ * has no "New conversation" of its own. Tidying it follows.
+ */
+function RoomMenu({
+  owlbot,
+  knocking,
+  shareLabel,
+  onShare,
+  folderLabel,
+  onFolder,
+  callLabel,
+  onCall,
+  onRename,
+  onAgents,
+  onFreshStart,
+  justSaved,
+  onRoutines,
+  onSave,
+  onExport,
+  answers,
+  onAnswers,
+  members,
+  lead,
+  onLead,
+  onClose,
+  onNewTopic,
+}: {
+  owlbot: OwlBot;
+  /** People asking to join, marked on the button and on Share. */
+  knocking: number;
+  shareLabel: string;
+  onShare: () => void;
+  folderLabel: string;
+  onFolder: () => void;
+  /** Said only once anyone in the room can speak. */
+  callLabel?: string;
+  onCall: () => void;
+  /** Opens a new topic, for whoever may (server/room-topics.ts). */
+  onNewTopic?: () => void;
+  /** Turns the name in the header into a field. */
+  onRename: () => void;
+  onAgents: () => void;
+  /** The New room dialog, filled in with this room's team. */
+  onFreshStart: () => void;
+  justSaved: boolean;
+  onRoutines: () => void;
+  onSave: () => void;
+  onExport: () => void;
+  /** Who answers a message naming nobody, and the way to change it. */
+  answers: RoomAnswers;
+  onAnswers: (next: RoomAnswers) => void;
+  /** Those who can answer, the only ones a crown means anything on. */
+  members: Bot[];
+  lead: Bot | null;
+  /** An id crowns that member; null hands the room back to seniority. */
+  onLead: (id: string | null) => void;
+  onClose: () => void;
+}) {
+  // The rename starts once the menu has gone: closing hands focus back to
+  // the menu's button, which would take it straight out of the new field.
+  const renameNext = useRef(false);
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        title={t("roomView.more")}
+        aria-label={knocking > 0 ? `${t("roomView.moreRoomActions")}, ${shareLabel}` : t("roomView.moreRoomActions")}
+        className="relative flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none transition-[background-color,color,scale] duration-150 ease-out hover:bg-accent hover:text-foreground active:scale-[0.96] data-[state=open]:bg-accent data-[state=open]:text-foreground"
+      >
+        <ChevronDown size={15} />
+        {knocking > 0 && (
+          <span aria-hidden className="absolute right-0.5 top-0.5 size-2 rounded-full bg-brand-ink ring-2 ring-background" />
+        )}
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="start"
+        className="min-w-[210px]"
+        onCloseAutoFocus={(e) => {
+          if (!renameNext.current) return;
+          renameNext.current = false;
+          e.preventDefault();
+          onRename();
+        }}
+      >
+        <DropdownMenuItem onClick={onShare}>
+          <UserPlus size={15} className={owlbot.sharing ? "text-foreground" : undefined} />
+          <span className="min-w-0 flex-1 truncate">{shareLabel}</span>
+          {knocking > 0 && (
+            <span className="flex min-w-4 items-center justify-center rounded-full bg-brand-ink px-1 text-micro font-semibold leading-4 text-brand-foreground">{knocking}</span>
+          )}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={onFolder}>
+          <FolderOpen size={15} className={owlbot.cwd || owlbot.pinnedCwd ? "text-brand-ink" : undefined} />
+          <span className="min-w-0 flex-1 truncate">{folderLabel}</span>
+        </DropdownMenuItem>
+        {callLabel && (
+          <DropdownMenuItem onClick={onCall}>
+            <Phone size={15} />
+            <span className="min-w-0 flex-1 truncate">{callLabel}</span>
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={() => (renameNext.current = true)}>
+          <Pencil size={15} />
+          {t("roomView.rename")}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={onAgents}>
+          <Users size={15} />
+          {t("roomView.agents")}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={onFreshStart}>
+          <Plus size={15} />
+          {t("roomView.newRoomWithTheseAgents")}
+        </DropdownMenuItem>
+        {onNewTopic && (
+          <DropdownMenuItem onClick={onNewTopic}>
+            <MessagesSquare size={15} />
+            {t("roomTopics.new")}
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={onRoutines}>
+          <CalendarClock size={15} />
+          {t("common.routines")}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={onSave}>
+          {justSaved ? <Check size={15} className="text-success" /> : <BookmarkPlus size={15} />}
+          {t("roomView.saveThisTeam")}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={onExport}>
+          <Download size={15} />
+          {t("roomView.shareAsFile")}
+        </DropdownMenuItem>
+        {members.length > 1 && (
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger icon={<Crown size={15} />} value={answersWords(answers, null).label}>
+              {t("roomView.whoAnswers")}
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="w-[260px] max-w-[calc(100vw-24px)]">
+              {ROOM_ANSWERS.map((value) => {
+                const words = answersWords(value, lead?.name ?? null);
+                return (
+                  <DropdownMenuItem
+                    key={value}
+                    role="menuitemradio"
+                    aria-checked={answers === value}
+                    onClick={() => onAnswers(value)}
+                    className="items-start gap-2.5 py-2 [&_svg]:text-inherit"
+                  >
+                    <span className="mt-0.5 flex size-4 shrink-0 items-center justify-center text-brand-ink">
+                      {answers === value && <Check size={14} />}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block font-medium text-foreground">{words.label}</span>
+                      <span className="block text-pretty text-small leading-snug text-muted-foreground">{words.hint}</span>
+                    </span>
+                  </DropdownMenuItem>
+                );
+              })}
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        )}
+        {members.length > 1 && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel>{t("roomView.lead")}</DropdownMenuLabel>
+            {members.map((m) => (
+              <DropdownMenuItem
+                key={m.id}
+                // choosing the one already crowned by name changes nothing
+                onClick={() => m.id !== owlbot.leadId && onLead(m.id)}
+              >
+                <AgentAvatar bot={m} size={18} />
+                <span className="min-w-0 flex-1 truncate">{m.name}</span>
+                {m.id === lead?.id ? (
+                  <Crown size={13} className="shrink-0 text-brand-ink" />
+                ) : (
+                  <span className="shrink-0 text-small text-muted-foreground">{t("roomView.makeLead")}</span>
+                )}
+              </DropdownMenuItem>
+            ))}
+            {owlbot.leadId && lead?.id === owlbot.leadId && (
+              <DropdownMenuItem onClick={() => onLead(null)} className="text-muted-foreground">
+                {t("roomView.mostSeniorLeads")}
+              </DropdownMenuItem>
+            )}
+          </>
+        )}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={onClose} className="text-destructive focus:text-destructive">
+          <Trash2 size={15} />
+          {t("roomView.archiveOrDelete")}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}

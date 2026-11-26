@@ -1,0 +1,126 @@
+// The sign-in card an agent plants when it needs an app.
+//
+// Most people do not know what an API or an MCP is, and they should not
+// have to: the agent asks, a card appears, one tap opens the sign-in,
+// and the task picks itself up when the connection lands. While the
+// sign-in tab is open the card quietly polls, so coming back to the
+// chat usually means coming back to "Connected".
+import { useEffect, useRef, useState } from "react";
+import { Check } from "@/components/icons";
+import { Loader2 } from "@/components/icons";
+import { X } from "@/components/icons";
+import { type Message } from "@/state/store";
+import { cn } from "@/lib/cn";
+import { t } from "@/lib/i18n";
+
+async function api(path: string, init?: RequestInit): Promise<any> {
+  const res = await fetch(path, { headers: { "content-type": "application/json" }, ...init });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error ?? `${res.status} ${res.statusText}`);
+  return body;
+}
+
+export function ConnectorCard({ botId, message }: { botId: string; message: Message }) {
+  const connector = message.connector;
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const polling = useRef(false);
+
+  const call = (verb: "authorize" | "refresh" | "dismiss") =>
+    api(`/api/bots/${botId}/connector-cards/${message.id}/${verb}`, { method: "POST" });
+
+  // while the sign-in tab is open, look for the landing every few
+  // seconds; the message.patch frame flips the card the moment it lands
+  useEffect(() => {
+    if (connector?.status !== "authorizing") return;
+    const timer = setInterval(() => {
+      if (polling.current) return;
+      polling.current = true;
+      call("refresh")
+        .catch(() => {})
+        .finally(() => {
+          polling.current = false;
+        });
+    }, 4_000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connector?.status, message.id]);
+
+  if (!connector) return null;
+  const { label, status } = connector;
+
+  const connect = () => {
+    setBusy(true);
+    setError(null);
+    call("authorize")
+      .then((r) => {
+        if (r.url) window.open(r.url, "_blank", "noopener");
+      })
+      .catch((e: Error) => setError(e.message))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <div className="flex justify-start">
+      <div
+        className={cn(
+          "flex w-full max-w-[420px] items-center gap-3 rounded-2xl border bg-card p-3",
+          status === "dismissed" && "opacity-55",
+        )}
+      >
+        {/* the app's monogram; a logo can come later, a letter never lies */}
+        <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-muted text-lead font-bold text-muted-foreground">
+          {label.slice(0, 1).toUpperCase()}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-ui font-semibold text-foreground">{label}</div>
+          <div className="truncate text-small text-muted-foreground">
+            {status === "connected"
+              ? connector.resumed
+                ? t("connectorCard.connectedTaskResumed")
+                : t("common.connected")
+              : status === "authorizing"
+                ? t("connectorCard.waitingForYourSignIn")
+                : status === "failed"
+                  ? (connector.error ?? t("connectorCard.connectionFailed"))
+                  : status === "dismissed"
+                    ? t("connectorCard.dismissed")
+                    : t("connectorCard.signInSoYourAgent")}
+          </div>
+        </div>
+        {status === "connected" ? (
+          <span className="flex shrink-0 items-center gap-1 rounded-full bg-success/15 px-2.5 py-1 text-small font-semibold text-success">
+            <Check size={13} strokeWidth={3} />
+            {t("connectorCard.added")}
+          </span>
+        ) : status === "dismissed" ? null : (
+          <div className="flex shrink-0 items-center gap-1">
+            <button
+              onClick={connect}
+              disabled={busy}
+              className="rounded-full bg-primary px-3 py-1.5 text-body font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-60"
+            >
+              {busy ? (
+                <Loader2 size={13} className="animate-spin" />
+              ) : status === "authorizing" ? (
+                t("connectorCard.reopen")
+              ) : status === "failed" ? (
+                t("connectorCard.retry")
+              ) : (
+                t("common.connect")
+              )}
+            </button>
+            <button
+              onClick={() => void call("dismiss").catch(() => {})}
+              title={t("common.dismiss")}
+              className="rounded-full p-1.5 text-muted-foreground/60 transition-colors hover:text-foreground"
+            >
+              <X size={13} />
+            </button>
+          </div>
+        )}
+      </div>
+      {error && <div className="mt-1 text-small text-destructive">{error}</div>}
+    </div>
+  );
+}

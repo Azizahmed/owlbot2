@@ -1,0 +1,1749 @@
+import { useSettingsObservation } from "@/lib/useSettingsObservation";
+import { linksOpenInDock, useChatLinksIn } from "@/lib/chatLinks";
+import { useNamer, useWorkspaceRoster } from "@/lib/members";
+import { isGroup, otherHumans, receiptsAt, runs, senderOf, speakers, teamHumans } from "@/lib/participants";
+import { seedReads, useReadPosition, useReads } from "@/lib/readReceipts";
+import { useLastRead } from "@/lib/lastRead";
+import { useViewingReport } from "@/lib/viewing";
+import { useEffect, useLayoutEffect, useRef, useState, useMemo } from "react";
+import { Search } from "@/components/icons";
+import { ChevronUp } from "@/components/icons";
+import { ChevronDown } from "@/components/icons";
+import { Loader2 } from "@/components/icons";
+import { Monitor } from "@/components/icons";
+import { SquareTerminal } from "@/components/icons";
+import { X } from "@/components/icons";
+import { api, useStore, laneHasMessages, openLaneWorking, type Bot, type Message } from "@/state/store";
+import { AgentAvatar } from "./Avatar";
+import { OptionCard } from "./OptionCard";
+import { MessageComponent } from "./Gallery";
+import { GenUiHost } from "./genui/host";
+import { Composer } from "./Composer";
+import { useTerminalDock } from "./terminal/TerminalDock";
+import { showTerminalTab, useTerminalTabs } from "./Terminal";
+import { act as browserAct, BrowsingOnMac, DockedBrowser, MiniBrowser, MiniViewport, showPage, useMiniAspect, useBrowserReveal, useBrowserState, useBrowserWhere, useTabScope } from "./browser/BrowserPanel";
+import { Activity, Bot as BotIcon, Eraser, FileDiff, Folder, Globe, Hourglass, PanelRight, Phone, Plus, Settings } from "@/components/icons";
+import { focusedSide, SideDock, toggleExpand, type DockPane } from "./dock/SideDock";
+import { MiniDock } from "./dock/MiniDock";
+import { useDockExpanded } from "@/lib/dockActions";
+import { useExtensionsPane } from "./extensions/ExtensionDock";
+import { FilesPanel } from "./dock/FilesPanel";
+import { ChangesPanel, useLaneChanges } from "./dock/ChangesPanel";
+import { TasksPanel, useBackgroundTasks } from "./dock/TasksPanel";
+import { runningCount } from "@/lib/backgroundTasks";
+import { DockHostContext, type DockHost } from "./dock/context";
+import { ComputerPanel } from "./ComputerPanel";
+import { chatKey, dock, DOCK_SIDES, minimizedIn, paneOf, placeIn, shownAnywhere, sideOf, useDockFocus, useDockState, type DockPanel } from "@/lib/dock";
+import { browserStatus, computerStatus, pageOpen, currentTurn, strongest, tabsInScope, turnComputerUse } from "@/lib/dockActivity";
+import { tabLabel } from "@/lib/appBrowser";
+import { dockChord, expandChord, panelChord } from "@/lib/dockKeys";
+import { changesRound, changeTotals, totalsLabel } from "@/lib/laneChanges";
+import { moveTerminal } from "@/lib/terminalLayout";
+import { stepTab, terminalChord } from "@/lib/terminalTabs";
+import { closeRefusal, conversationChord, keysOwner, keysWhere, type ConversationChord } from "@/lib/conversationKeys";
+import { toast } from "@/components/ui/toast";
+import { lastEditable, quietRunAt, splitWaiting } from "@/lib/transcript";
+import { useHistoryPaging } from "@/lib/useHistoryPaging";
+import { useLanesInSidebar } from "@/lib/conversationsView";
+import { findHits, stepHit } from "@/lib/find";
+import { isApproval, waitingQuestions } from "@/lib/cardAnswer";
+import { AnimatePresence, motion } from "motion/react";
+import { dayLine, timeSaidBelow } from "@/lib/when";
+import { MAX_TASKS, TaskStrip } from "./TaskStrip";
+import { GoalDialog } from "./Goal";
+import { AfterAgentLink, AgentExchangeDialog, AgentExchangeRow } from "./AgentExchange";
+import { CallOverlay } from "./Voice";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { ArtifactCard } from "./Artifacts";
+import { ConnectorCard } from "./ConnectorCard";
+import { SecretCard } from "./SecretCard";
+import { ChangesCard } from "./ChangesCard";
+import { ToolRun } from "./ToolRun";
+import { TurnFoldLine } from "./TurnFold";
+import { TracePanel } from "./trace/TracePanel";
+import { askForFold, type TraceAsk } from "@/lib/traceView";
+import { MeetingPanel } from "./MeetingPanel";
+import { meetingNotesHere } from "@/lib/thisComputer";
+import { useEars } from "@/lib/hearingWords";
+import { NotebookPen } from "@/components/icons";
+import { ForwardDialog, excerptOf, type ReplyDraft } from "./MessageActions";
+import { SelectionQuote } from "./chat/SelectionQuote";
+import { listenForReply } from "@/lib/replyHandoff";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/cn";
+import { placeLine, placeTrouble } from "@/lib/workplace";
+import { useStickToBottom } from "@/lib/useStickToBottom";
+import { useHoldPlace } from "@/lib/useHoldPlace";
+import { foldHolding, foldTurns, lastFoldKey, rowsFrom, turnRunning } from "@/lib/turnFold";
+import { type RedoPreview } from "@/lib/redo";
+
+import { Bubble, Notice, QuietCheckIns, Rewound, TakenBack } from "./chat/Bubble";
+import { BranchLine } from "./chat/BranchLine";
+import { branchBlocked } from "@/lib/branch";
+import { MessageGuard } from "./chat/MessageGuard";
+import { GroupMessage, PersonAvatar, SeenBy } from "./chat/Group";
+import { Markdownish } from "./Markdown";
+import { ShareRequestContext } from "@/lib/shareRequest";
+import { shareRequestText } from "@/lib/sharedFile";
+import { LiveBrowser, ScreenFrame, StreamingBubble, WorkingClock, WorkingLine } from "./chat/Live";
+import { EmptyState } from "./chat/EmptyState";
+import { NewLine } from "./chat/NewLine";
+import { JumpToLatest } from "./chat/JumpToLatest";
+import { TurnTimeline } from "./chat/TurnTimeline";
+import { turnMarks } from "@/lib/turnTimeline";
+import { HeldSends } from "./chat/HeldSends";
+import { QuestionDock } from "./chat/QuestionDock";
+import { onAsk, peekAsk, takeAsk } from "@/lib/chatAsk";
+import { keysFor, platformOf } from "@/lib/shortcuts";
+import { confirm } from "@/components/ui/confirm";
+import { createPortal } from "react-dom";
+import { useTitlebarSlot } from "@/lib/titlebarSlot";
+import { t } from "@/lib/i18n";
+
+/**
+ * Which messages should animate in: ones that arrive while you're
+ * watching, never the backlog when you open a thread. Opening a chat and
+ * seeing forty bubbles fly in would be noise, not feedback.
+ */
+function useArrivals(botId: string, messages: Message[]): Set<string> {
+  const seen = useRef<Set<string>>(new Set());
+  const [arrivals, setArrivals] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    // switching threads: adopt the whole transcript silently
+    seen.current = new Set(messages.map((m) => m.id));
+    setArrivals(new Set());
+  }, [botId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // a message that waited arrives here when it goes, so it rises into
+  // the conversation like anything else said now
+  useEffect(() => {
+    const fresh = messages.filter((m) => !seen.current.has(m.id)).map((m) => m.id);
+    if (!fresh.length) return;
+    fresh.forEach((id) => seen.current.add(id));
+    setArrivals(new Set(fresh));
+  }, [messages]);
+
+  return arrivals;
+}
+
+/** Toggling a reaction is a fire and forget write: the server answers
+ * with a patched message and the event stream puts it on every screen,
+ * so there is nothing local to keep in step. */
+function editMessage(threadId: string, messageId: string, text: string) {
+  void api(`/api/threads/${threadId}/messages/${messageId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ text }),
+  }).catch(() => {});
+}
+
+function deleteMessage(threadId: string, messageId: string) {
+  void api(`/api/threads/${threadId}/messages/${messageId}`, { method: "DELETE" }).catch(() => {});
+}
+
+function reactTo(threadId: string, messageId: string, emoji: string) {
+  void api(`/api/threads/${threadId}/messages/${messageId}/react`, {
+    method: "POST",
+    body: JSON.stringify({ emoji }),
+  }).catch(() => {});
+}
+
+/** Something the agent said, as the way back counts new ones: not its
+ * tool calls, frames or quiet check-ins, which arrive by the dozen. */
+const isReply = (m: Message) =>
+  m.role === "bot" && !m.quiet && !m.deleted && m.kind !== "activity" && m.kind !== "screen" && m.kind !== "notice";
+
+/** Typed here and sent, rather than said for you by a routine, a goal,
+ * a watcher, another agent, the agent itself or someone on Telegram. */
+const sentByYou = (m: Message) => m.role === "user" && !m.via && !m.agent && !m.selfSent && !m.telegramPerson && !m.telegramDelegate && !m.telegramGroup;
+
+/** Somebody on Telegram who is not the owner, let in or given full access. */
+const telegramSpeaker = (m: Message) => {
+  const sender = m.telegramPerson ?? m.telegramDelegate ?? m.telegramGroup;
+  const group = m.telegramPerson?.group ?? m.telegramGroup?.group;
+  return sender ? { personId: "personId" in sender ? sender.personId : "owner", name: sender.name + (group ? " in " + group.title : "") } : undefined;
+};
+
+const reducedMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+
+/** How far behind what is drawn the New line may open the transcript on
+ * its own, in messages: beyond that it waits for "Show earlier" like the
+ * rest of a long history, rather than drawing thousands of rows. */
+const LINE_REACH = 300;
+/** And how many earlier pages it asks for, where the transcript arrived
+ * as its newest part only (a phone, OwlBot Cloud). */
+const LINE_PAGES = 3;
+
+/** The brief wash behind a message the palette sent you to, a little
+ * wider than its row. Drawn first in the row, so a bubble, positioned
+ * itself, paints over it and keeps its own colours. */
+function LandMark({ on }: { on: boolean }) {
+  return (
+    <AnimatePresence>
+      {on && (
+        <motion.span
+          aria-hidden
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1, transition: { duration: 0.15, ease: "easeOut" } }}
+          exit={{ opacity: 0, transition: { duration: 0.28, ease: "easeOut" } }}
+          className="pointer-events-none absolute -inset-x-2 -inset-y-1 rounded-xl bg-warning/12"
+        />
+      )}
+    </AnimatePresence>
+  );
+}
+
+/** What is running in a panel, beside its name: "running" for one, the
+ * number before it for more, nothing for none. */
+function runningLabel(n: number): string | undefined {
+  if (n <= 0) return undefined;
+  return n === 1 ? t("dock.running") : t("dock.tasks.count", { count: n });
+}
+
+export function ChatView({ bot }: { bot: Bot }) {
+  // people by the name a conversation calls them, told apart where two
+  // share a first name (src/lib/names.ts)
+  const nameOf = useNamer();
+  const personName = (id: string) => nameOf(id, t("chatView.formerMember"));
+  // On a desktop the conversation's tabs sit up in the title bar, in the
+  // row with the window's own buttons; on a phone they stay under the header
+  const titleSlot = useTitlebarSlot();
+  // where the dock's tabs go in the window's top row, over the dock
+  const [dockHead, setDockHead] = useState<HTMLDivElement | null>(null);
+  const { state, dispatch } = useStore();
+  const { ears, macApp } = useEars();
+  // Only a frame that arrived during this turn is live. The one held from
+  // the last turn is already in the transcript, and showing it again as
+  // live would be a picture of the past with a click handler on it.
+  const frame = state.screens[bot.id];
+  const frameAtTurnStart = useMemo(() => state.screens[bot.id], [bot.busy, bot.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  const liveBrowser =
+    bot.busy && frame?.source === "browser" && frame !== frameAtTurnStart ? frame : null;
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const pinned = useRef(true);
+  // The conversation, and what waits to join it above the composer.
+  const { said, waiting } = useMemo(() => splitWaiting(bot.messages), [bot.messages]);
+  const arrivals = useArrivals(bot.id, said);
+
+  // More than two in this conversation (src/lib/participants.ts): a team
+  // agent's shared one with somebody else on its list or speaking, or
+  // anyone writing in from Telegram. Then every message is a bubble, and
+  // "Seen by" says who has read how far. A chat with one agent stays as
+  // it always was.
+  const roster = useWorkspaceRoster();
+  const groupLane = bot.tasks?.find((t) => t.id === (bot.activeTaskId ?? bot.threadId));
+  const participants = useMemo(() => {
+    const humans = groupLane?.team ? teamHumans(bot.access, roster.members) : new Set<string>(["owner"]);
+    for (const id of speakers(said)) humans.add(id);
+    return { humans, agents: new Set([bot.id]) };
+  }, [groupLane?.team, bot.access, bot.id, roster.members, said]);
+  const group = isGroup(participants);
+  const withPeople = group && otherHumans(participants, "owner") > 0;
+  const reads = useReads(withPeople ? bot.threadId : null);
+  useEffect(() => {
+    if (!withPeople) return;
+    api(`/api/threads/${bot.threadId}/reads`)
+      .then((r: { reads?: unknown }) => seedReads(bot.threadId, r.reads))
+      .catch(() => {});
+  }, [withPeople, bot.threadId]);
+  // on screen here, so an answer that lands in it is no news for the phone
+  useViewingReport(bot.threadId, (body) => api("/api/viewing", { method: "POST", body: JSON.stringify(body) }));
+  useReadPosition({
+    threadId: withPeople ? bot.threadId : null,
+    scroller: scrollRef,
+    enabled: withPeople,
+    post: (threadId, messageId) => api(`/api/threads/${threadId}/read`, { method: "POST", body: JSON.stringify({ messageId }) }),
+    tick: said.length,
+  });
+  // which rows are bubbles, where each sits in its sender's run, and
+  // under which one each other person's place is shown
+  const isBubble = (m: Message) =>
+    !m.deleted && !m.quiet && !m.takeBack && !(m.agent && m.agent.dir !== "reply" && (m.kind === "text" || m.kind === "activity")) && (m.kind === "text" || m.kind === "component");
+  const groupRuns = useMemo(() => (group ? runs(said, isBubble, bot.id) : new Map<string, { first: boolean; last: boolean }>()), [group, said, bot.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  const receiptRows = useMemo(
+    () => (withPeople ? receiptsAt(said.map((m) => m.id), new Set(groupRuns.keys()), reads, "owner", new Map(said.map((m) => [m.id, senderOf(m)]))) : new Map<string, string[]>()),
+    [withPeople, said, groupRuns, reads],
+  );
+  const readerName = (id: string) => (id === "owner" ? (roster.owner ?? t("chatView.you")) : personName(id));
+  const receiptsFor = (id: string) => {
+    const who = receiptRows.get(id);
+    return who?.length ? <SeenBy people={who.map((p) => ({ id: p, name: readerName(p) }))} /> : undefined;
+  };
+  const faceOf = (m: Message) =>
+    m.role === "bot" || m.selfSent ? (
+      <AgentAvatar bot={bot} size={28} />
+    ) : telegramSpeaker(m) ? (
+      <PersonAvatar id={telegramSpeaker(m)!.personId} name={telegramSpeaker(m)!.name} />
+    ) : (
+      <PersonAvatar id={m.author ?? "owner"} name={m.author ? personName(m.author) : (roster.owner ?? t("chatView.you"))} />
+    );
+  const [replyTo, setReplyTo] = useState<ReplyDraft | null>(null);
+  const [forwarding, setForwarding] = useState<{ message: Message; author: string } | null>(null);
+  // A rewind hands your message back to the composer, to send again or
+  // change first. The nonce makes the same words land twice in a row.
+  const [prefill, setPrefill] = useState<{ text: string; nonce: number; append?: boolean } | null>(null);
+  // ↑ in the empty composer opens your last message for editing in its
+  // bubble, the same edit as the bubble's own Edit button. The bubble
+  // watches the nonce, so every press is heard.
+  const [editAsk, setEditAsk] = useState<{ id: string; nonce: number } | null>(null);
+  const editLast = () => {
+    const mine = lastEditable(bot.messages);
+    if (!mine) return false;
+    setEditAsk({ id: mine.id, nonce: Date.now() });
+    return true;
+  };
+  // Asked once. The bubble has opened by the time this runs (a child's
+  // effects run first), and one drawn again later, after a trip to
+  // another agent, must not open itself a second time.
+  useEffect(() => {
+    if (editAsk) setEditAsk(null);
+  }, [editAsk]);
+  // Sent again as what it says now, at the end of the conversation like
+  // anything said now, and the one that never went is cleared from the
+  // strip once the new one is in.
+  const sendAgain = (message: Message) => {
+    const threadId = bot.threadId;
+    api(`/api/bots/${bot.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ text: message.text, taskId: threadId }),
+    })
+      .then(() => api(`/api/threads/${threadId}/messages/${message.id}`, { method: "DELETE" }))
+      .catch((e) => dispatch({ type: "error", message: e instanceof Error ? e.message : String(e) }));
+  };
+  const rewindTo = (threadId: string, messageId: string) => {
+    api(`/api/threads/${threadId}/rewind`, { method: "POST", body: JSON.stringify({ messageId }) })
+      .then((r) => setPrefill({ text: r.text ?? "", nonce: Date.now() }))
+      .catch((e) => dispatch({ type: "error", message: e instanceof Error ? e.message : String(e) }));
+  };
+  // Redo is one call: the server stops the agent, rewinds and sends, so
+  // nothing here can leave a rewound conversation with nothing sent. A
+  // refusal takes nothing back and is said in the editor. If the rewind
+  // went through and the send did not, the words come back to the box,
+  // as they do after a rewind.
+  const previewRedo = (threadId: string, messageId: string): Promise<RedoPreview> =>
+    api(`/api/threads/${threadId}/messages/${messageId}/redo`);
+  const redoFrom = (threadId: string, messageId: string, text: string): Promise<string | null> =>
+    api(`/api/threads/${threadId}/messages/${messageId}/redo`, { method: "POST", body: JSON.stringify({ text }) })
+      .then((r) => {
+        if (r.sent === false) {
+          setPrefill({ text: r.text ?? text, nonce: Date.now() });
+          dispatch({ type: "error", message: r.error ?? t("chatView.rewoundNotSent") });
+        }
+        return null;
+      })
+      .catch((e) => (e instanceof Error ? e.message : String(e)));
+  // The terminal. Only whether it is on screen lives here, and where it
+  // sits lives with the dock: the shells themselves are on the server and
+  // outlive this component, so hiding the panel is closing a window onto
+  // them rather than ending them.
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  // bumped by ⌃⇧` to ask the panel for a new tab as it opens
+  const [terminalAskNew, setTerminalAskNew] = useState(0);
+  // whether the terminal is on screen, for the keys below: in the side
+  // dock, that is the dock showing it (set once the dock is read)
+  const terminalShown = useRef(terminalOpen);
+  // what ⌃` does, which depends on where the terminal sits (below)
+  const toggleTerminalRef = useRef<() => void>(() => setTerminalOpen((open) => !open));
+  const openTerminalRef = useRef<() => void>(() => setTerminalOpen(true));
+  // what ⇧⌘F, ⇧⌘D, ⇧⌘B and ⌘J do, set once the dock is read
+  const panelKeyRef = useRef<(panel: DockPanel) => void>(() => {});
+  const expandKeyRef = useRef<() => void>(() => {});
+
+  const streaming = state.streaming[bot.threadId];
+  const provisioning = state.provisioning[bot.id];
+
+  // A finished turn's work is one line above its result
+  // (src/lib/turnFold.ts). These are the ones opened to read the work.
+  const [openFolds, setOpenFolds] = useState<ReadonlySet<string>>(() => new Set());
+  // ── landing on a message picked in the palette ──
+  // The palette opens the conversation (src/lib/chatAsk.ts); this brings
+  // the message itself into view and marks it for a moment, so the eye
+  // knows which line it was sent to. The landing stays once done, so the
+  // rows opened back to reach it stay open while the reader looks around.
+  const [landing, setLanding] = useState<{ id: string; nonce: number } | null>(null);
+  const [lit, setLit] = useState<string | null>(null);
+  const landed = useRef<number | null>(null);
+  // the New line's landing and the pages asked for to reach it, per visit
+  const lineLanded = useRef(false);
+  const linePages = useRef(0);
+  const threadKey = `${bot.id}:${bot.threadId}`;
+  const lastThreadKey = useRef(threadKey);
+  if (lastThreadKey.current !== threadKey) {
+    lastThreadKey.current = threadKey;
+    setOpenFolds(new Set());
+    // A quote is of a message in the conversation it was picked in, and a
+    // rewind's words belong to theirs: neither goes with you to another.
+    setReplyTo(null);
+    setPrefill(null);
+    // a landing is on a message in the conversation it was asked for
+    setLanding(null);
+    setLit(null);
+    lineLanded.current = false;
+    linePages.current = 0;
+  }
+  // except one handed to this conversation on its way here: Branch with
+  // this puts its quote in the new branch's box (src/lib/replyHandoff.ts)
+  useEffect(() => listenForReply(threadKey, setReplyTo), [threadKey]);
+  // ── where the person left off (src/lib/lastRead.ts) ──
+  // The New line, asked for once the conversation's messages are in hand,
+  // and their place said as they read on.
+  const lastRead = useLastRead({
+    key: threadKey,
+    threadId: bot.threadId,
+    lastId: said[said.length - 1]?.id,
+    ready: state.hydrated && !(bot.id in state.laneLoads),
+    post: (threadId, through) => api(`/api/threads/${threadId}/last-read`, { method: "POST", body: JSON.stringify(through ? { through } : {}) }),
+  });
+  // Something they said, here or on another screen of theirs: what was
+  // new is read, and the line goes.
+  useEffect(() => {
+    const last = said[said.length - 1];
+    if (last && arrivals.has(last.id) && sentByYou(last)) lastRead.clear();
+  }, [arrivals]); // eslint-disable-line react-hooks/exhaustive-deps
+  // "Mark unread from here" (MessageActions.tsx): the line moves above
+  // that message at once, and the conversation is unread again on every
+  // screen, with its place just before it
+  const markUnreadFrom = (messageId: string) => {
+    lastRead.markFrom(messageId);
+    dispatch({ type: "markLaneUnread", botId: bot.id, taskId: bot.activeTaskId ?? bot.threadId, from: messageId });
+  };
+  // and words that wait for the turn running now were sent all the same
+  const lastWaiting = waiting[waiting.length - 1];
+  useEffect(() => {
+    if (lastWaiting && sentByYou(lastWaiting)) lastRead.clear();
+  }, [lastWaiting?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  // ── find within this conversation ──
+  // The palette answers "which thread was that in"; this answers "where
+  // in this one", which is a different question and needs the whole
+  // thread rather than the rendered tail of it.
+  const [finding, setFinding] = useState(false);
+  const [query, setQuery] = useState("");
+  const [hitAt, setHitAt] = useState(0);
+  const findRef = useRef<HTMLInputElement>(null);
+  // Opening find again while it is open goes back to its field with the
+  // words selected, as a browser's does, rather than doing nothing.
+  const openFind = () => {
+    setFinding(true);
+    requestAnimationFrame(() => {
+      findRef.current?.focus();
+      findRef.current?.select();
+    });
+  };
+  const closeFind = () => {
+    setFinding(false);
+    setQuery("");
+  };
+  const hits = useMemo(() => findHits(said, query), [said, query]);
+  // where each turn starts, for the rail beside the transcript
+  // (chat/TurnTimeline.tsx)
+  const turns = useMemo(() => turnMarks(said), [said]);
+  // The last turn folds once it has ended, and not before: this
+  // conversation's turn, whatever the agent's other ones are doing.
+  const openLane = bot.tasks?.find((t) => t.id === (bot.activeTaskId ?? bot.threadId));
+  const running = turnRunning(
+    openLane?.state,
+    Boolean(bot.busy),
+    said,
+    Boolean(bot.tasks?.some((t) => t !== openLane && t.state !== "idle")),
+  );
+  const folded = useMemo(() => foldTurns(said, running, !bot.olderMessages), [said, running, bot.olderMessages]);
+
+  // Approvals stacked up while the user was away. One or two are a
+  // conversation; several are a queue, and a queue deserves queue
+  // controls rather than a scroll of identical presses. Only approvals:
+  // a question waiting beside them is not something "Allow all" answers.
+  const pendingApprovals = useMemo(
+    () =>
+      bot.messages.filter(
+        (m) =>
+          m.kind === "options" && m.card && isApproval(m.card) && !m.card.answered && !m.card.dismissed,
+      ),
+    [bot.messages],
+  );
+  // Questions the agent is still owed an answer for wait above the
+  // composer, not up in the transcript where the work after them would
+  // push them out of view (chat/QuestionDock.tsx).
+  const questions = useMemo(() => waitingQuestions(said), [said]);
+  const docked = useMemo(() => new Set(questions.map((m) => m.id)), [questions]);
+  const currentHit = hits.length ? hits[Math.min(hitAt, hits.length - 1)] : -1;
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+        e.preventDefault();
+        openFind();
+        return;
+      }
+      // ⌃` shows and hides the terminal; ⌃⇧` opens it on a new tab. With
+      // the panel open, the new tab is the panel's to make.
+      const chord = e.defaultPrevented ? null : terminalChord(e, platformOf());
+      if (chord === "toggle") {
+        e.preventDefault();
+        toggleTerminalRef.current();
+      } else if (chord === "new" && !terminalShown.current) {
+        e.preventDefault();
+        setTerminalAskNew((n) => n + 1);
+        openTerminalRef.current();
+      } else if (!e.defaultPrevented && dockChord(e, platformOf())) {
+        // ⌘⌥B shows and hides the side dock, as ⌘B does the sidebar
+        e.preventDefault();
+        toggleDockRef.current();
+      } else if (!e.defaultPrevented && expandChord(e, platformOf())) {
+        // ⇧⌘\ expands the pane the keyboard is in, or the first one open
+        e.preventDefault();
+        expandKeyRef.current();
+      } else if (!e.defaultPrevented && window.owlbot) {
+        // ⇧⌘F, ⇧⌘D, ⇧⌘B and ⌘J bring a panel forward, in the desktop
+        // app only: a browser keeps those keys for itself
+        const panel = panelChord(e, platformOf());
+        if (panel) {
+          e.preventDefault();
+          panelKeyRef.current(panel);
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const earlier = useHistoryPaging("bot", bot, said, scrollRef, pinned, !finding);
+  const start = earlier.start;
+  const landAt = landing ? said.findIndex((m) => m.id === landing.id) : -1;
+  const lineAt = lastRead.from ? said.findIndex((m) => m.id === lastRead.from) : -1;
+  // A hit above the rendered slice would be invisible and unscrollable,
+  // so finding one opens the window far enough back to show it. So does
+  // a landing, and the New line when it is not too far back.
+  const reach = [currentHit, landAt, start - lineAt <= LINE_REACH ? lineAt : -1].filter((i) => i >= 0 && i < start);
+  const visibleStart = reach.length ? Math.max(0, Math.min(...reach) - 4) : start;
+  const visibleRows = useMemo(() => rowsFrom(folded.rows, visibleStart), [folded, visibleStart]);
+  // A hit in folded work would be just as invisible, so its fold opens,
+  // and stays open as the reader steps on to the next.
+  const hitFold = currentHit >= 0 ? foldHolding(folded.rows, currentHit) : null;
+  const hitShown = !hitFold || openFolds.has(hitFold);
+  const landFold = landAt >= 0 ? foldHolding(folded.rows, landAt) : null;
+  const landShown = !landFold || openFolds.has(landFold);
+
+  // follow the tail only while the reader is actually at the tail
+  const { away, toLatest } = useStickToBottom(scrollRef, pinned);
+  // What stood at the end the last time the reader was following it.
+  // What the agent says after that, while they read further up, is what
+  // the way back counts as new.
+  const seenThrough = useRef<string | undefined>(undefined);
+  if (pinned.current) seenThrough.current = said[said.length - 1]?.id;
+  const seenAt = seenThrough.current ? said.findIndex((m) => m.id === seenThrough.current) : -1;
+  const freshBelow = !away || seenAt < 0 ? 0 : said.slice(seenAt + 1).filter(isReply).length;
+
+  // What you send is followed to the end, wherever you were reading: the
+  // reply you are now waiting for will arrive down there.
+  useEffect(() => {
+    const last = said[said.length - 1];
+    if (last && arrivals.has(last.id) && sentByYou(last) && !pinned.current) toLatest();
+  }, [arrivals]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (pinned.current) {
+      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+    }
+  }, [bot.id, said.length, waiting.length, streaming, bot.busy]);
+
+  // When a turn ends its work folds, and the reply stays where it is on
+  // screen for a reader who is not at the end. After the effect above:
+  // that one adds to where the reader is, and this one then finds the
+  // reply already in place.
+  useHoldPlace(
+    scrollRef,
+    pinned,
+    threadKey,
+    lastFoldKey(folded.rows),
+    folded.hold ? `[data-msg-index="${folded.hold.index}"]` : null,
+  );
+
+  // Opening a fold leaves its line where it was pressed. At the end of a
+  // conversation, following the end would scroll the line away instead.
+  const toggleFold = (key: string) => {
+    pinned.current = false;
+    setOpenFolds((open) => {
+      const next = new Set(open);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
+  };
+  useEffect(() => {
+    for (const fold of [hitFold, landFold]) {
+      if (!fold) continue;
+      pinned.current = false;
+      setOpenFolds((open) => (open.has(fold) ? open : new Set(open).add(fold)));
+    }
+  }, [hitFold, landFold]);
+
+  // Walk to a hit: render it, then bring it to the middle of the view.
+  useEffect(() => {
+    if (currentHit < 0) return;
+    pinned.current = false;
+    const row = scrollRef.current?.querySelector(`[data-msg-index="${currentHit}"]`);
+    row?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [currentHit, visibleStart, hitShown]);
+
+  // Land once, when the message is drawn: from far away at once, since a
+  // long glide through a conversation you just opened is only waiting,
+  // and close by with the same smooth step find takes.
+  useEffect(() => {
+    if (!landing || landAt < 0 || !landShown || landed.current === landing.nonce) return;
+    const el = scrollRef.current;
+    const row = el?.querySelector(`[data-msg-index="${landAt}"]`);
+    if (!el || !row) return;
+    landed.current = landing.nonce;
+    pinned.current = false;
+    const far = Math.abs(row.getBoundingClientRect().top - el.getBoundingClientRect().top) > el.clientHeight * 2;
+    row.scrollIntoView({ block: "center", behavior: far || reducedMotion() ? "auto" : "smooth" });
+    setLit(landing.id);
+  }, [landing, landAt, visibleStart, landShown]);
+  // ── opening at the New line ──
+  // A conversation opens at its end. When what came since is more than
+  // the screen holds, it opens at the line instead, so reading starts
+  // where they left off; when it all fits, the end shows the line anyway.
+  // Never over a message the palette sent them to, and never once they
+  // have scrolled themselves.
+  useLayoutEffect(() => {
+    if (!lastRead.from || lineLanded.current) return;
+    // pages asked for to reach the line leave the end on purpose
+    if (landing || peekAsk(bot.id) || (!pinned.current && linePages.current === 0)) {
+      lineLanded.current = true;
+      return;
+    }
+    const el = scrollRef.current;
+    const line = el?.querySelector("[data-new-line]");
+    if (!el || !line) return;
+    lineLanded.current = true;
+    const above = line.getBoundingClientRect().top - el.getBoundingClientRect().top;
+    if (above >= 0) return;
+    pinned.current = false;
+    // a little air over it, so it reads as the top of what is new
+    el.scrollTop += above - 12;
+  }, [lastRead.from, lineAt, threadKey, visibleStart, landing]); // eslint-disable-line react-hooks/exhaustive-deps
+  // The line further back than a transcript that arrived as its newest
+  // part: a few earlier pages are asked for to reach it, as a landing
+  // does, and no more.
+  useEffect(() => {
+    if (!lastRead.from || lineAt >= 0) return;
+    if (linePages.current >= LINE_PAGES || earlier.remaining <= 0 || earlier.loading) return;
+    linePages.current++;
+    earlier.showEarlier();
+  }, [lastRead.from, lineAt, threadKey, earlier.remaining, earlier.loading]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // the mark is a moment, not a state
+  useEffect(() => {
+    if (!lit) return;
+    const t = setTimeout(() => setLit(null), 1600);
+    return () => clearTimeout(t);
+  }, [lit, landing]);
+
+  // Asks from outside, the palette's above all (src/lib/chatAsk.ts):
+  // taken once they are for this agent, and a landing once its
+  // conversation is the open one and the message is in hand. One further
+  // back than what has arrived is paged in until it is.
+  const [askTick, setAskTick] = useState(0);
+  useEffect(() => onAsk(() => setAskTick((n) => n + 1)), []);
+  useEffect(() => {
+    const ask = peekAsk(bot.id);
+    if (!ask) return;
+    if (ask.kind === "find") {
+      takeAsk(ask);
+      openFind();
+    } else if (ask.kind === "terminal") {
+      takeAsk(ask);
+      openTerminalRef.current();
+    } else if (ask.kind === "close") {
+      takeAsk(ask);
+      closeOpen();
+    } else if (ask.threadId === bot.threadId) {
+      if (said.some((m) => m.id === ask.messageId)) {
+        takeAsk(ask);
+        setLanding({ id: ask.messageId, nonce: Date.now() });
+      } else if (earlier.remaining > 0 && !earlier.loading) {
+        earlier.showEarlier();
+      }
+    }
+  }, [askTick, bot.id, bot.threadId, said, earlier.remaining, earlier.loading]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Closing deletes the transcript, and on a phone the X sits right
+  // where a thumb lands, so a lane with anything in it asks first,
+  // in the words the sidebar's Close uses. An empty one just goes.
+  // ⌘W and the palette close through here as well, so no key skips it.
+  const closeLane = (taskId: string) => {
+    const lane = bot.tasks?.find((t) => t.id === taskId);
+    const open = taskId === (bot.activeTaskId ?? bot.threadId);
+    const anything = laneHasMessages(lane) || (open && bot.messages.length > 0);
+    if (!anything) return dispatch({ type: "closeTask", botId: bot.id, taskId });
+    void confirm({
+      title: lane?.title ? t("chatView.closeNamed", { title: lane.title }) : t("chatView.closeThis"),
+      body: t("chatView.messagesDeleted"),
+      confirmLabel: t("common.close"),
+      destructive: true,
+    }).then((yes) => yes && dispatch({ type: "closeTask", botId: bot.id, taskId }));
+  };
+  // The open one, or the reason it stays, which the tab's × says by
+  // being a Clear, or by being greyed while it works.
+  const closeOpen = () => {
+    const open = bot.activeTaskId ?? bot.threadId;
+    const lane = bot.tasks?.find((t) => t.id === open);
+    const why = closeRefusal(bot.tasks ?? [], open);
+    if (why === "first") {
+      toast.info(t("chatView.staysOpen", { title: lane?.title ?? t("common.general") }), {
+        id: "close-first",
+        description: t("chatView.keepsFirst"),
+      });
+    } else if (why === "working") {
+      toast.info(t("chatView.stopBeforeClosing"), { id: "close-working", description: t("chatView.stillWorking", { title: lane?.title ?? "" }) });
+    } else closeLane(open);
+  };
+
+  // ⌘T, ⌘W, ⌘⇧[ and ⌘⇧] (conversationKeys.ts), on the conversation on
+  // screen. In a room, on a page, or with no agent, nothing here hears
+  // them and they do nothing: a ⌘W that closed the window whenever there
+  // was no tab to close would be the surprise this replaced.
+  const tabKey = (chord: ConversationChord) => {
+    const tasks = bot.tasks ?? [];
+    const open = bot.activeTaskId ?? bot.threadId;
+    if (chord === "close") return closeOpen();
+    if (chord === "new") {
+      // where the strip stops offering its +
+      if (tasks.length >= MAX_TASKS) {
+        toast.info(t("chatView.tooMany", { name: bot.name, count: MAX_TASKS }), {
+          id: "new-full",
+          description: t("chatView.closeOne"),
+        });
+        return;
+      }
+      return dispatch({ type: "newTask", botId: bot.id });
+    }
+    const next = stepTab(
+      tasks.map((t) => t.id),
+      open,
+      chord === "next" ? 1 : -1,
+    );
+    if (next && next !== open) dispatch({ type: "selectTask", botId: bot.id, taskId: next });
+  };
+  const tabKeyRef = useRef(tabKey);
+  tabKeyRef.current = tabKey;
+  useEffect(() => {
+    // a browser keeps these for its own tabs and never passes them on
+    if (!window.owlbot) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
+      const chord = conversationChord(e, platformOf());
+      if (!chord) return;
+      const owner = keysOwner(keysWhere());
+      if (owner === "terminal") return;
+      // taken with a dialog up as well, where it does nothing: the
+      // question on screen is answered before anything under it changes
+      e.preventDefault();
+      if (owner === "conversation") tabKeyRef.current(chord);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // A starter from the empty page goes into the message box, never out:
+  // the words are there to read, change or finish, and the box has the
+  // keyboard with the caret at their end.
+  const mainRef = useRef<HTMLElement>(null);
+  // How wide the header's buttons are, so the name in the middle can keep
+  // the same room on both sides at any width. The buttons come and go
+  // (calls, meeting notes), so it is measured rather than guessed.
+  const actionsRef = useRef<HTMLDivElement>(null);
+  const [actionsWidth, setActionsWidth] = useState(0);
+  useLayoutEffect(() => {
+    const el = actionsRef.current;
+    if (!el) return;
+    const measure = () => setActionsWidth(el.offsetWidth);
+    measure();
+    const watch = new ResizeObserver(measure);
+    watch.observe(el);
+    return () => watch.disconnect();
+  }, []);
+  // The room each side keeps: the buttons plus the header's own padding and
+  // a little air, and never less than the menu button a narrow window puts
+  // on the left.
+  const headerSide = Math.max(actionsWidth + 24, 72);
+  // a call with a voiced agent, started from the menu after its name
+  const [calling, setCalling] = useState(false);
+  // the side panel expanded over the conversation takes its buttons' place
+  const dockExpanded = useDockExpanded(chatKey(bot.id, bot.activeTaskId ?? bot.threadId));
+  const [expandedSlot, setExpandedSlot] = useState<HTMLDivElement | null>(null);
+  const focusBox = () =>
+    requestAnimationFrame(() => {
+      // the composer's field is the one drawn over its skill marks
+      const box = mainRef.current?.querySelector<HTMLTextAreaElement>("[data-skill-layer] ~ textarea");
+      if (!box) return;
+      box.focus();
+      box.setSelectionRange(box.value.length, box.value.length);
+    });
+  const startWith = (prompt: string) => {
+    setPrefill({ text: prompt, nonce: Date.now() });
+    focusBox();
+  };
+  // Request share on a file link nobody shared (GitHub 543): the ask, with
+  // the exact path, goes into this chat's composer after anything already
+  // typed, and waits there for you to read and send. Nothing is sent here.
+  const requestShare = (href: string) => {
+    setPrefill({ text: shareRequestText(href), nonce: Date.now(), append: true });
+    focusBox();
+  };
+
+  // ── the side dock (dock/SideDock.tsx, src/lib/dock.ts) ──
+  // One column on the right for the documents, the browser, a terminal
+  // moved to the right, the agent's computer and a turn's timeline,
+  // remembered per conversation.
+  const dockKey = chatKey(bot.id, bot.activeTaskId ?? bot.threadId);
+  useLayoutEffect(() => dock.setCurrent(dockKey), [dockKey]);
+  const dockState = useDockState();
+  const dockPlace = placeIn(dockState, dockKey);
+  // on screen in whichever pane it sits in (src/lib/dock.ts, sideOf)
+  const dockShows = (panel: DockPanel) => shownAnywhere(dockPlace, panel);
+
+  const terminal = useTerminalDock({
+    open: terminalOpen,
+    botId: bot.id,
+    botName: bot.name,
+    askNew: terminalAskNew,
+    sideDock: true,
+    onClose: () => {
+      setTerminalOpen(false);
+      dock.drop(dockKey, "terminal");
+      // the keyboard goes back where you were typing before
+      focusBox();
+    },
+  });
+  // On the right, the terminal is the dock's: ⌃` shows and hides it there,
+  // and anywhere else it opens and closes where it sits, as it always did.
+  terminalShown.current = terminalOpen && (!terminal.inDock || dockShows("terminal"));
+  toggleTerminalRef.current = () => {
+    if (!terminal.inDock) return setTerminalOpen((open) => !open);
+    if (dockShows("terminal")) return dock.hide(dockKey, sideOf(dockPlace, "terminal"));
+    setTerminalOpen(true);
+    dock.show(dockKey, "terminal");
+  };
+  openTerminalRef.current = () => {
+    setTerminalOpen(true);
+    if (terminal.inDock) dock.show(dockKey, "terminal");
+  };
+  // Moved to the right while open, it goes into the dock; moved out, the
+  // dock lets it go. A dock remembered on the terminal opens it again.
+  useEffect(() => {
+    if (!terminal.inDock) {
+      dock.drop(dockKey, "terminal");
+      return;
+    }
+    if (terminalOpen && !dockShows("terminal") && paneOf(dockPlace, sideOf(dockPlace, "terminal")).panel !== "terminal") dock.show(dockKey, "terminal");
+  }, [terminal.inDock]); // eslint-disable-line react-hooks/exhaustive-deps
+  // shown in the side panel, or minimized out of it (dock/MiniDock.tsx):
+  // either way its shells are on screen and open
+  const terminalMini = minimizedIn(dockPlace).some((m) => m.panel === "terminal");
+  useEffect(() => {
+    if ((dockShows("terminal") || terminalMini) && terminal.inDock && !terminalOpen) setTerminalOpen(true);
+  }, [dockKey, dockShows("terminal"), terminalMini]); // eslint-disable-line react-hooks/exhaustive-deps
+  useSettingsObservation({
+    "terminal.height": { status: "observed", value: terminal.layout.sizes.bottom },
+    "terminal.open": { status: "observed", value: terminalOpen },
+    "terminal.position": { status: "observed", value: terminal.layout.position },
+    "terminal.arrangement": { status: "observed", value: terminal.layout.arrangement },
+  });
+  // The OwlBot browser (browser/BrowserPanel.tsx): its panel in the desktop
+  // app and wherever a server keeps a browser of its own, opened too when
+  // an agent starts browsing, and news of the Mac's anywhere else.
+  useBrowserReveal();
+  const browserState = useBrowserState();
+  const browserWhere = useBrowserWhere();
+  const [chatLinksIn] = useChatLinksIn();
+  const someoneBrowsing = browserState?.control.by === "agent";
+  const browserHere = browserWhere.home === "own" || browserWhere.home === "server";
+  // the minimized browser's shape (the chosen viewport) and its name (the
+  // page in front)
+  const browserMiniAspect = useMiniAspect();
+  const pageInFront = browserState?.tabs.find((tab) => tab.id === browserState.activeTabId);
+  const botNames = useMemo(() => Object.fromEntries(state.bots.map((b) => [b.id, b.name])), [state.bots]);
+
+  // the two-agent exchange opened from one of its rows, if any
+  const [exchange, setExchange] = useState<{ peerId: string; messageId: string; text: string } | null>(null);
+  // A turn's timeline beside the chat (trace/TracePanel.tsx), opened from
+  // the working line or a fold, for the conversation it was opened in:
+  // moving to another one puts it away.
+  const [traceAsk, setTraceAsk] = useState<{ key: string; ask: TraceAsk } | null>(null);
+  const traceShown = traceAsk?.key === threadKey ? traceAsk.ask : null;
+  const openTrace = (ask: TraceAsk) => {
+    setTraceAsk({ key: threadKey, ask });
+    dock.show(dockKey, "trace");
+  };
+  // The computer, asked for from anywhere (an agent's settings, say), is
+  // a panel of the dock now: the ask is taken here and the dock opens on it.
+  useEffect(() => {
+    if (!state.computerOpen) return;
+    dock.show(dockKey, "computer");
+    dispatch({ type: "toggleComputer", open: false });
+  }, [state.computerOpen]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // An agent starting to work its computer opens the computer in the dock,
+  // by the rule the browser opens by (mayReveal in src/lib/dock.ts): in a
+  // chat, with room beside it, never under the person's keys and never
+  // after they put it away. Once a turn, and only for a call made while
+  // this conversation is on screen: what it did before is not news. The
+  // terminal is not opened this way: its shells are the person's, and an
+  // agent's commands do not run in them, so opening it would point at
+  // something other than what the agent is doing.
+  const computerUse = useMemo(() => turnComputerUse(bot.messages), [bot.messages]);
+  const laneWorking = openLaneWorking(bot);
+  const seenUse = useRef<{ key: string; computer: string | null } | null>(null);
+  const revealedTurns = useRef(new Set<string>());
+  useEffect(() => {
+    const was = seenUse.current;
+    const latest = computerUse.latest;
+    seenUse.current = { key: dockKey, computer: latest };
+    if (!was || was.key !== dockKey || !laneWorking || !latest || latest === was.computer) return;
+    const once = `${dockKey}:${computerUse.turn}`;
+    if (revealedTurns.current.has(once)) return;
+    revealedTurns.current.add(once);
+    dock.reveal("computer");
+  }, [dockKey, computerUse, laneWorking]);
+
+  // the running extensions' panels, as one more panel of the dock
+  const extensionsPane = useExtensionsPane();
+  const terminalTabs = useTerminalTabs(bot.id);
+  // what the agent has running beside the chat, for Background tasks
+  const bgTasks = useBackgroundTasks(bot.id);
+  const tasksRunning = runningCount(bgTasks);
+  const [browserScope] = useTabScope();
+  // what this conversation's turns changed, for the Changes panel and the
+  // count beside it in the + menu
+  const laneId = bot.activeTaskId ?? bot.threadId;
+  const laneChanges = useLaneChanges(laneId, useMemo(() => changesRound(bot.messages), [bot.messages]), dockShows("changes"));
+  // a panel in a window of its own, in the desktop app (DockWindow.tsx)
+  // a popup in a browser tab, as the terminal's is (terminal/TerminalDock.tsx),
+  // but not from the web app reaching another computer
+  const panelWindow = (panel: "docs" | "changes" | "tasks" | "browser") =>
+    window.owlbot?.dockWindow
+      ? () => void window.owlbot!.dockWindow!({ panel, botId: bot.id, laneId })
+      : !window.owlbot && !window.owlbotWeb
+        ? () =>
+            void window.open(
+              `${location.pathname}?dock=${panel}&agent=${encodeURIComponent(bot.id)}&lane=${encodeURIComponent(laneId)}`,
+              `owlbot-dock-${panel}-${bot.id}`,
+              "popup,width=760,height=640",
+            )
+        : undefined;
+  const dockPanes: DockPane[] = [
+    {
+      id: "docs",
+      label: t("dock.docs.label"),
+      icon: <Folder size={15} />,
+      count: dockPlace.docs.length ? String(dockPlace.docs.length) : undefined,
+      keys: keysFor("dockFiles", platformOf(), Boolean(window.owlbot))[0],
+      keepAlive: true,
+      popOut: panelWindow("docs"),
+      render: (shown) => <FilesPanel placeKey={dockKey} place={dockPlace} shown={shown} botId={bot.id} />,
+    },
+    {
+      id: "changes",
+      label: t("dock.changes.label"),
+      icon: <FileDiff size={15} />,
+      count: totalsLabel(laneChanges ?? []),
+      delta: laneChanges?.length ? changeTotals(laneChanges) : undefined,
+      keys: keysFor("dockChanges", platformOf(), Boolean(window.owlbot))[0],
+      popOut: panelWindow("changes"),
+      render: (shown) => <ChangesPanel placeKey={dockKey} threadId={laneId} files={laneChanges} shown={shown} />,
+    },
+    ...(browserHere
+      ? [
+          {
+            id: "browser" as const,
+            label: t("dock.browser.label"),
+            detail: browserWhere.home === "server" ? t("dock.browser.onServer") : t("dock.browser.here"),
+            icon: <Globe size={15} />,
+            keys: keysFor("dockBrowser", platformOf(), Boolean(window.owlbot))[0],
+            // on while it has a page open here or an agent is at it
+            count: runningLabel(Math.max(someoneBrowsing ? 1 : 0, tabsInScope(browserState?.tabs ?? [], browserScope, bot.id, browserState?.activeTabId ?? null).filter((tab) => tab.url && tab.url !== "about:blank").length)),
+            status: browserStatus(browserState),
+            // each page a tab of its own in the dock's strip
+            items: tabsInScope(browserState?.tabs ?? [], browserScope, bot.id, browserState?.activeTabId ?? null).map((tab) => ({
+              id: tab.id,
+              label: tabLabel(tab) || t("browserPanel.newTab"),
+              // the page's own icon, read by the browser as data
+              icon: tab.favicon ? <img src={tab.favicon} alt="" draggable={false} className="size-[15px] rounded-[3px] object-contain" /> : undefined,
+              title: tab.url,
+              active: tab.id === browserState?.activeTabId,
+              onSelect: () => void browserAct("selectTab", tab.id),
+              onClose: () => void browserAct("closeTab", tab.id),
+            })),
+            onAdd: () => void browserAct("newTab"),
+            render: (shown: boolean) => <DockedBrowser shown={shown} botNames={botNames} agent={{ id: bot.id, name: bot.name }} flat />,
+            // minimized only with a page in it, as a picture of the page
+            minimizable: pageOpen(browserState),
+            mini: () => <MiniBrowser />,
+            miniActions: () => <MiniViewport />,
+            miniAspect: browserMiniAspect,
+            miniLabel: pageInFront ? tabLabel(pageInFront) || undefined : undefined,
+            // its own window, with its tabs: the panel lets it go, so the
+            // pages move to the window (electron/dock-window.mjs)
+            popOut: (() => {
+              const open = panelWindow("browser");
+              return open
+                ? () => {
+                    dock.closeTab(dockKey, "browser");
+                    open();
+                  }
+                : undefined;
+            })(),
+          },
+        ]
+      : []),
+    {
+      id: "terminal",
+      label: t("dock.terminal.label"),
+      icon: <SquareTerminal size={15} />,
+      keys: keysFor("dockTerminal", platformOf(), Boolean(window.owlbot))[0],
+      count: runningLabel(terminalTabs?.tabs.length ?? 0),
+      keepAlive: true,
+      // each shell a tab of its own in the dock's strip, an agent's own
+      // wearing its badge
+      items: terminal.inDock
+        ? (terminalTabs?.tabs ?? []).map((tab) => ({
+            id: tab.id,
+            label: tab.title,
+            icon: tab.agent ? <BotIcon size={14} className="text-brand-ink" /> : <SquareTerminal size={14} />,
+            title: tab.agent ? t("terminal.agentTab", { name: tab.agent.name, command: tab.agent.command }) : tab.cwd,
+            active: tab.id === terminalTabs?.current,
+            onSelect: () => showTerminalTab(bot.id, tab.id),
+            onClose: () => terminalTabs?.close(tab.id),
+          }))
+        : undefined,
+      onAdd: () => {
+        if (terminalTabs?.tabs.length) terminalTabs.add();
+      },
+      popOut: window.owlbot ? terminal.popOut : undefined,
+      render: () =>
+        terminal.dockSlot ?? <div className="flex h-full items-center justify-center text-small text-muted-foreground">{t("common.loading")}</div>,
+    },
+    {
+      id: "tasks",
+      label: t("dock.tasks.label"),
+      icon: <Hourglass size={15} />,
+      count: runningLabel(tasksRunning),
+      popOut: panelWindow("tasks"),
+      render: () => (
+        <TasksPanel
+          tasks={bgTasks}
+          agentName={bot.name}
+          onShowTab={(id) => {
+            showTerminalTab(bot.id, id);
+            if (!terminal.inDock) terminal.setLayout((l) => moveTerminal(l, "right"));
+            setTerminalOpen(true);
+            dock.show(dockKey, "terminal");
+          }}
+          onStopTab={(id) => void api(`/api/bots/${bot.id}/terminals/${id}`, { method: "DELETE" }).catch(() => {})}
+          onOpenUrl={browserHere ? (url) => void showPage(url, browserState?.tabs) : null}
+          onOpenJob={(taskId) => dispatch({ type: "selectTask", botId: bot.id, taskId })}
+        />
+      ),
+    },
+    // meeting notes need something to hear them (src/lib/hearing.ts), and a
+    // hosted workspace refuses them; kept drawn while another tab is in
+    // front, or closed, so a meeting being heard goes on being heard
+    ...(meetingNotesHere(ears.kind, state.config?.hosted?.on, macApp)
+      ? [
+          {
+            id: "meeting" as const,
+            label: t("chatView.meetingNotes"),
+            icon: <NotebookPen size={15} />,
+            keepAlive: true,
+            render: () => <MeetingPanel bot={bot} docked />,
+          },
+        ]
+      : []),
+    {
+      id: "computer",
+      label: t("dock.computer.label"),
+      icon: <Monitor size={15} />,
+      status: strongest(computerStatus(bot.messages, laneWorking), provisioning ? "working" : null),
+      keepAlive: true,
+      render: (shown) => <ComputerPanel bot={bot} docked shown={shown} />,
+    },
+    {
+      id: "trace",
+      label: t("dock.trace.label"),
+      icon: <Activity size={15} />,
+      render: () => (
+        <TracePanel
+          docked
+          bot={bot}
+          taskId={bot.activeTaskId ?? bot.threadId}
+          ask={traceShown ?? {}}
+          working={working}
+          onClose={() => dock.drop(dockKey, "trace")}
+        />
+      ),
+    },
+    ...(extensionsPane ? [extensionsPane] : []),
+  ];
+  const offered = dockPanes.map((p) => p.id);
+  const toggleDockRef = useRef<() => void>(() => {});
+  toggleDockRef.current = () => dock.toggle(dockKey, offered);
+  // the turn this conversation is on, and what its dock offers, for an
+  // agent's `owlbot dock show` (dock.ask in src/lib/dock.ts)
+  const turnNow = useMemo(() => currentTurn(bot.messages).turn, [bot.messages]);
+  useLayoutEffect(() => dock.noteTurn(dockKey, turnNow, offered), [dockKey, turnNow, offered.join(" ")]); // eslint-disable-line react-hooks/exhaustive-deps
+  expandKeyRef.current = () => {
+    const side = focusedSide() ?? DOCK_SIDES.find((s) => paneOf(dockPlace, s).open);
+    if (side) toggleExpand(side);
+  };
+  panelKeyRef.current = (panel) => {
+    if (panel === "terminal") return toggleTerminalRef.current();
+    if (!offered.includes(panel)) return;
+    if (dockShows(panel)) return dock.hide(dockKey, sideOf(dockPlace, panel));
+    dock.show(dockKey, panel);
+  };
+  // A terminal picked on the ribbon comes into the dock from wherever it sat.
+  const pickPanel = (panel: DockPanel) => {
+    if (panel !== "terminal") return;
+    if (!terminal.inDock) terminal.setLayout((l) => moveTerminal(l, "right"));
+    setTerminalOpen(true);
+  };
+  // What an agent's `owlbot dock show` named inside a panel: a page in the
+  // browser, or one of its own terminal tabs, which brings the terminal
+  // into the dock from wherever it sat. A file and a change are their
+  // panels' to open (FilesPanel, ChangesPanel).
+  const dockFocus = useDockFocus(dockKey);
+  useEffect(() => {
+    if (!dockFocus) return;
+    const target = dockFocus.target;
+    if (target?.kind === "page") void showPage(target.url, browserState?.tabs);
+    if (target?.kind === "terminal") showTerminalTab(bot.id, target.id);
+    if (dockFocus.panel === "terminal") {
+      if (!terminal.inDock) terminal.setLayout((l) => moveTerminal(l, "right"));
+      setTerminalOpen(true);
+    }
+  }, [dockFocus?.n]); // eslint-disable-line react-hooks/exhaustive-deps
+  const dockHost: DockHost = {
+    openDoc: (doc) => dock.openDoc(dockKey, doc),
+    // in the dock only where its browser can open the page and the person
+    // has not chosen their own browser for links (GitHub 539)
+    openLink: linksOpenInDock(browserWhere, chatLinksIn) ? (url) => void showPage(url, browserState?.tabs) : null,
+  };
+  const lanesInSidebar = useLanesInSidebar();
+  // One conversation is the usual agent (GitHub 237): with nothing to
+  // switch to, the strip would only be a "+" inviting a second. New
+  // conversation and Clear stay on the agent's row in the sidebar.
+  // The conversations as tabs, wherever the sidebar is not listing them:
+  // its conversations switched off, or the sidebar folded away. Even one
+  // shows, as a browser shows its one tab, so a new one is always a +
+  // away.
+  const strip = !lanesInSidebar && (bot.tasks?.length ?? 0) > 0;
+
+
+  const first = said[0];
+  // this conversation, not the agent: another one may be the one working
+  const working = openLaneWorking(bot);
+  // Why Branch from here is greyed on this conversation's answers, if it
+  // is: what the server would refuse, said before it is pressed
+  const branchWhy = branchBlocked(openLane, { name: bot.name, lanes: bot.tasks?.length ?? 0, max: MAX_TASKS, working });
+  // where it works, when that is not this computer (src/lib/workplace.ts)
+  const placeNow = placeLine(bot.workplaceStatus, working);
+  // Nothing said, nothing on its way, and nothing still loading: a new
+  // conversation, which shows who is here and a few ways to begin.
+  const empty =
+    said.length === 0 &&
+    waiting.length === 0 &&
+    !bot.olderMessages &&
+    !state.laneLoads[bot.id] &&
+    !streaming &&
+    !provisioning &&
+    !working &&
+    !liveBrowser;
+
+  // One stretch of the conversation as its rows: what stays in the open,
+  // or a fold's work once it is opened. A run (a rewind, quiet check-ins,
+  // tool calls) is counted within its stretch, since rows with a fold
+  // between them are not next to each other on the page.
+  // Each message is drawn inside its own guard, so one that cannot be
+  // drawn costs that message and not the conversation (src/lib/rowGuard.ts).
+  // The New line goes once, above the first row that holds anything from
+  // where it starts: a fold, when the turn it opens on ran while they were
+  // away, or the message itself.
+  let lineDrawn = false;
+  const lineAbove = (indices: readonly number[]) => {
+    if (lineDrawn || lineAt < visibleStart || !indices.some((i) => i >= lineAt)) return [];
+    lineDrawn = true;
+    return [<NewLine key="new-line" />];
+  };
+  const rowsOf = (list: readonly Message[], indexOf: (offset: number) => number) =>
+    list.flatMap((m, offset) => [
+      ...lineAbove([indexOf(offset)]),
+      <MessageGuard key={m.id} id={m.id} resetKey={m} className={group ? "ml-9" : undefined} render={() => rowOf(list, indexOf, m, offset)} />,
+    ]);
+  const rowOf = (list: readonly Message[], indexOf: (offset: number) => number, m: Message, offset: number) => {
+      const fresh = arrivals.has(m.id);
+      const absolute = indexOf(offset);
+      if (m.deleted && m.rewound) {
+        // a run of one rewind shows once, at its first message
+        const before = list[offset - 1];
+        if (before?.deleted && before.rewound === m.rewound) return null;
+        const run: Message[] = [];
+        for (let i = offset; i < list.length; i++) {
+          const next = list[i];
+          if (!next.deleted || next.rewound !== m.rewound) break;
+          run.push(next);
+        }
+        return <Rewound key={m.id} messages={run} />;
+      }
+      if (m.deleted) return <TakenBack key={m.id} user={m.role === "user"} />;
+      // a run of quiet check-ins shows once, at its first message
+      if (m.quiet) {
+        const run = quietRunAt(list, offset);
+        return run ? <QuietCheckIns key={m.id} messages={run} /> : null;
+      }
+      // to or from another agent: a compact row, not a bubble that
+      // looks like the person's own words
+      // A reply the agent wrote in its own chat is never compacted,
+      // whoever started the turn (older ones were marked dir "reply").
+      if (m.takeBack || (m.agent && m.agent.dir !== "reply" && (m.kind === "text" || m.kind === "activity"))) {
+        return (
+          <div key={m.id} data-msg-index={absolute} data-message-id={m.id} className="relative">
+              <LandMark on={lit === m.id} />
+            <AgentExchangeRow
+              message={m}
+              botId={bot.id}
+              fresh={fresh}
+              onOpen={(peerId, messageId, text) => setExchange({ peerId, messageId, text })}
+            />
+          </div>
+        );
+      }
+      switch (m.kind) {
+        case "options":
+          // marked like any other row, so Find and the approvals bar can
+          // reach a card by its message
+          return (
+            <div key={m.id} data-msg-index={absolute} data-message-id={m.id} className={cn("relative", group && "pl-9")}>
+              <LandMark on={lit === m.id} />
+              <OptionCard botId={bot.id} message={m} dock={docked.has(m.id) ? "line" : undefined} />
+            </div>
+          );
+        case "activity": {
+          // a run of tool calls is one line; it starts at the first
+          const before = list[offset - 1];
+          if (before?.kind === "activity" && !before.deleted && !before.agent && !before.takeBack && !before.quiet) return null;
+          const run: Message[] = [];
+          for (let i = offset; i < list.length; i++) {
+            const next = list[i];
+            if (next.kind !== "activity" || next.deleted || next.agent || next.takeBack || next.quiet) break;
+            run.push(next);
+          }
+          return <ToolRun key={m.id} messages={run} fresh={fresh} className={group ? "pl-9" : undefined} />;
+        }
+        case "notice":
+          return m.branch ? <BranchLine key={m.id} message={m} bot={bot} fresh={fresh} /> : <Notice key={m.id} message={m} fresh={fresh} />;
+        case "screen":
+          return m.png ? <ScreenFrame key={m.id} png={m.png} mime={m.mime} /> : null;
+        case "artifact":
+          return m.artifact ? (
+            <div key={m.id} className={cn("flex", fresh && "animate-receive-in")}>
+              <ArtifactCard botId={bot.id} artifact={m.artifact} />
+            </div>
+          ) : null;
+        case "component":
+          if (m.component && group) {
+            // an answer drawn as interface keeps the whole bubble's width
+            const place = groupRuns.get(m.id) ?? { first: true, last: true };
+            return (
+              <GroupMessage
+                key={m.id}
+                mine={false}
+                first={place.first}
+                last={place.last}
+                face={faceOf(m)}
+                name={bot.name}
+                at={m.at}
+                rich
+                readId={m.id}
+                className={cn(fresh && "animate-receive-in", !place.first && "-mt-2")}
+                bubble={<MessageComponent message={m} threadId={bot.threadId} />}
+                receipts={receiptsFor(m.id)}
+              />
+            );
+          }
+          return m.component ? (
+            <div key={m.id} className={cn("flex", fresh && "animate-receive-in")}>
+              <MessageComponent message={m} threadId={bot.threadId} />
+            </div>
+          ) : null;
+        case "connector":
+          return <ConnectorCard key={m.id} botId={bot.id} message={m} />;
+        case "secret":
+          return <SecretCard key={m.id} botId={bot.id} message={m} />;
+        case "changes":
+          return <ChangesCard key={m.id} message={m} fresh={fresh} />;
+        default: {
+          // context for a reply in a turn another agent started: what
+          // prompted it, a click from the exchange, and nothing more.
+          // Once its turn has folded, the line above it says who asked.
+          const after = folded.named.has(m.id) ? undefined : (m.afterAgent ?? (m.agent?.dir === "reply" ? m.agent : undefined));
+          // a run from one sender sits close together
+          const continued = group && groupRuns.get(m.id)?.first === false && !after;
+          return (
+            <div key={m.id} data-msg-index={absolute} data-message-id={m.id} className={cn("relative", continued && "-mt-2")}>
+              <LandMark on={lit === m.id} />
+            {/* in a group the bubble names its sender; with one agent, a
+                line over the words says whose they are */}
+            {!group && (m.telegramPerson || m.telegramGroup) && <div className="mb-1 text-small text-muted-foreground">{t("chatView.telegramFrom", { name: telegramSpeaker(m)!.name })}</div>}
+            {!group && m.telegramDelegate && <div className="mb-1 text-small text-muted-foreground">{t("chatView.telegramDelegate", { name: m.telegramDelegate.name })}</div>}
+            {!group && m.role === "user" && m.author && <div className="mb-1 text-small font-medium text-muted-foreground">{personName(m.author)}</div>}
+            {m.telegramSent && <div className="mb-1 text-small text-muted-foreground">{t(m.telegramSent.state === "sent" ? "chatView.telegramSent.sent" : m.telegramSent.state === "sending" ? "chatView.telegramSent.sending" : m.telegramSent.state === "failed" ? "chatView.telegramSent.failed" : "chatView.telegramSent.uncertain", { name: m.telegramSent.name })}</div>}
+            {after && (
+              <AfterAgentLink
+                peerId={after.peerId}
+                peerName={after.peerName}
+                onOpen={() => setExchange({ peerId: after.peerId, messageId: m.id, text: m.text ?? "" })}
+              />
+            )}
+            <Bubble
+              message={m}
+              // a folded check-in below says no time of its own
+              hideTime={list[offset + 1]?.quiet ? false : timeSaidBelow(m, list[offset + 1])}
+              fresh={fresh}
+              author={telegramSpeaker(m)?.name ?? (m.role === "user" && !m.selfSent ? (m.author ? personName(m.author) : t("chatView.you")) : bot.name)}
+              onReply={setReplyTo}
+              onForward={(message, author) => setForwarding({ message, author })}
+              onReact={(messageId, emoji) => reactTo(bot.threadId, messageId, emoji)}
+              // the agent's own words are its record: not yours to edit or redo
+              onEdit={m.selfSent ? undefined : (messageId, next) => editMessage(bot.threadId, messageId, next)}
+              onDelete={(messageId) => deleteMessage(bot.threadId, messageId)}
+              onRewind={(messageId) => rewindTo(bot.threadId, messageId)}
+              onBranch={m.role === "bot" ? (messageId) => dispatch({ type: "branchTask", botId: bot.id, taskId: bot.threadId, messageId }) : undefined}
+              branchBlocked={branchWhy}
+              // somebody else's words only: what you wrote you have read
+              onUnreadFrom={sentByYou(m) ? undefined : markUnreadFrom}
+              previewRedo={(messageId) => previewRedo(bot.threadId, messageId)}
+              onRedo={m.selfSent ? undefined : (messageId, next) => redoFrom(bot.threadId, messageId, next)}
+              redoTick={`${bot.messages.length}:${working}`}
+              agentName={bot.name}
+              highlight={finding ? query : ""}
+              isHit={absolute === currentHit}
+              editNow={editAsk?.id === m.id ? editAsk.nonce : undefined}
+              nameOf={(id) => (id === "user" ? t("chatView.you") : (state.bots.find((b) => b.id === id)?.name ?? bot.name))}
+              group={
+                group
+                  ? {
+                      mine: m.role === "user" && !m.author && !m.selfSent && !telegramSpeaker(m),
+                      ...(groupRuns.get(m.id) ?? { first: true, last: true }),
+                      face: faceOf(m),
+                      receipts: receiptsFor(m.id),
+                      readId: m.id,
+                    }
+                  : undefined
+              }
+            />
+            </div>
+          );
+        }
+      }
+  };
+
+  // who you are talking to, up in the window's top row (`up`) or in the
+  // middle of the conversation's own header, with a small menu after the
+  // name for what is done to the conversation rather than in it, so the
+  // header keeps only what is reached for while reading
+  const identityButton = (up: boolean) => (
+    <div
+      className={cn("flex min-w-0 items-center gap-0.5", !up && "absolute left-1/2 -translate-x-1/2")}
+      style={up ? undefined : { maxWidth: `calc(100% - ${headerSide * 2}px)` }}
+    >
+        <button
+          onClick={() => dispatch({ type: "toggleSettings" })}
+          className="flex min-w-0 items-center gap-2.5 rounded-lg px-1.5 py-1 transition-colors duration-150 hover:bg-accent"
+          title={t("chatView.agentSettings")}
+        >
+          <AgentAvatar bot={bot} size={up ? 24 : 28} />
+          <span className="flex min-w-0 items-baseline gap-2 text-left">
+            <span className="truncate text-ui font-semibold text-foreground">{bot.name}</span>
+            {/* An agent that works elsewhere says where, in place of its
+                title: where its commands are running is the thing to know
+                about it, and a lost connection has to be seen. */}
+            {(working || bot.title || placeNow) && (
+              <span
+                className={cn("hidden truncate text-small sm:block", placeTrouble(bot.workplaceStatus) ? "text-warning" : "text-muted-foreground")}
+                title={bot.workplaceStatus?.detail}
+              >
+                {working && !placeTrouble(bot.workplaceStatus) ? (
+                  <WorkingClock threadKey={threadKey} working={working} messages={said} label={placeNow ?? t("chatView.working")} />
+                ) : (
+                  (placeNow ?? bot.title)
+                )}
+              </span>
+            )}
+          </span>
+        </button>
+        <DropdownMenu modal={false}>
+          <DropdownMenuTrigger
+            aria-label={t("chatView.options", { name: bot.name })}
+            title={t("chatView.options", { name: bot.name })}
+            className="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none transition-[background-color,color,scale] duration-150 ease-out hover:bg-accent hover:text-foreground active:scale-[0.96] data-[state=open]:bg-accent data-[state=open]:text-foreground"
+          >
+            <ChevronDown size={15} />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start" className="min-w-[220px]">
+            <DropdownMenuItem onSelect={() => dispatch({ type: "toggleSettings" })}>
+              <Settings size={15} />
+              {t("chatView.agentSettings")}
+            </DropdownMenuItem>
+            {bot.voice && (
+              <DropdownMenuItem onSelect={() => setCalling(true)}>
+                <Phone size={15} />
+                {t("voice.call", { name: bot.name })}
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={() => dispatch({ type: "newTask", botId: bot.id })}>
+              <Plus size={15} />
+              {t("chatView.newConversation")}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onSelect={() => {
+                const taskId = bot.activeTaskId ?? bot.threadId;
+                void confirm({
+                  title: t("chatView.clearThis"),
+                  body: t("chatView.messagesDeleted"),
+                  confirmLabel: t("common.clear"),
+                  destructive: true,
+                }).then((yes) => yes && dispatch({ type: "clearTask", botId: bot.id, taskId }));
+              }}
+              className="text-destructive focus:text-destructive"
+            >
+              <Eraser size={15} />
+              {t("chatView.clearConversation")}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+    </div>
+  );
+  // One button, as the desktop apps that keep panes beside a chat have
+  // it: the side panel, which holds everything else (the terminal, the
+  // browser, the changes, meeting notes) as tabs.
+  const headerActions = (
+        <div ref={actionsRef} className={cn("flex shrink-0 items-center gap-1.5", titleSlot ? "pr-2" : "ml-auto")}>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => toggleDockRef.current()}
+            className={cn("relative", dockPlace.open && "bg-accent text-foreground")}
+            title={`${someoneBrowsing && browserState?.control.by === "agent" ? t("chatView.browsing", { name: browserState.control.name }) : t("dock.toggle")}  ${keysFor("dockToggle", platformOf())[0]}`}
+            aria-label={t("dock.toggle")}
+            aria-pressed={dockPlace.open}
+          >
+            <PanelRight size={17} />
+            {someoneBrowsing && !dockShows("browser") && (
+              <span aria-hidden className="absolute right-1.5 top-1.5 size-1.5 animate-pulse rounded-full bg-brand" />
+            )}
+          </Button>
+        </div>
+  );
+
+  return (
+    <DockHostContext.Provider value={dockHost}>
+    <ShareRequestContext.Provider value={requestShare}>
+    <main ref={mainRef} className="@container/chat relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
+      {/* Header. On a wide window it is the window's own top row
+          (TitleBar.tsx): who you are talking to on the left where the
+          conversation starts, its buttons on the right, and over the side
+          dock the dock's own tabs (dock/SideDock.tsx), one row as the
+          desktop apps that keep panes beside a chat have it. The
+          conversation's tabs then sit where this header was. On a narrow
+          window there is no top row, and the header stays here: the name
+          in the middle at every width, with the same room kept on both
+          sides, truncating before it reaches either. */}
+      {titleSlot
+        ? createPortal(
+            <div className="flex h-full min-w-0 flex-1 items-center">
+              <div className="flex min-w-0 flex-1 items-center pr-2">{identityButton(true)}</div>
+              {/* the side panel expanded over the conversation puts its own
+                  buttons here, in place of these (dock/SideDock.tsx) */}
+              {dockExpanded ? <div ref={setExpandedSlot} className="flex shrink-0 items-center pr-2" /> : headerActions}
+              <div ref={setDockHead} className="h-full w-0 shrink-0 overflow-hidden" />
+            </div>,
+            titleSlot,
+          )
+        : (
+          <>
+            <div className="titlebar-drag relative flex h-[52px] shrink-0 items-center justify-between gap-2 px-3 max-md:pl-16 md:px-4">
+              {identityButton(false)}
+              {headerActions}
+            </div>
+            {/* A hairline under the header, faint and fading out at both
+                ends, so the header and what follows read as one surface. */}
+            <div aria-hidden className="h-px shrink-0 bg-linear-to-r from-transparent via-border to-transparent" />
+          </>
+        )}
+
+      {/* The conversation and the terminal, which can sit on any side of
+          it (terminal/TerminalDock.tsx). */}
+      <div ref={terminal.body} className="relative flex min-h-0 min-w-0 flex-1">
+      {terminal.slot("left")}
+      <SideDock side="left" placeKey={dockKey} panes={dockPanes} onPick={pickPanel} />
+      <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+      {/* The conversation's tabs and the find bar belong to its own
+          column: the side dock beside it starts right under the window's
+          top row, its edge running up unbroken. */}
+      {/* The conversations as tabs. The strip repeats what the sidebar
+          lists when it lists conversations, so it only shows when the
+          sidebar does not, and only once there is more than one. */}
+      {strip && (<TaskStrip
+        inTitleBar={false}
+        tasks={bot.tasks ?? []}
+        activeId={bot.activeTaskId ?? bot.threadId}
+        onSelect={(taskId) => taskId !== bot.activeTaskId && dispatch({ type: "selectTask", botId: bot.id, taskId })}
+        onNew={() => dispatch({ type: "newTask", botId: bot.id })}
+        onClose={closeLane}
+        onClear={(taskId) => {
+          void confirm({
+            title: t("chatView.clearThis"),
+            body: t("chatView.messagesDeleted"),
+            confirmLabel: t("common.clear"),
+            destructive: true,
+          }).then((yes) => yes && dispatch({ type: "clearTask", botId: bot.id, taskId }));
+        }}
+        onRename={(taskId, title) => dispatch({ type: "renameTask", botId: bot.id, taskId, title })}
+      />)}
+      {finding && (
+        <div className="flex shrink-0 items-center gap-2 border-b bg-background/95 px-4 py-2 md:px-6">
+          <Search size={14} className="shrink-0 text-muted-foreground" />
+          <input
+            ref={findRef}
+            autoFocus
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setHitAt(0);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                // the keyboard goes back to the message box it came from
+                e.preventDefault();
+                closeFind();
+                focusBox();
+                return;
+              }
+              if (e.key === "Enter") {
+                e.preventDefault();
+                setHitAt((at) => stepHit(at, hits.length, e.shiftKey ? -1 : 1));
+              }
+            }}
+            placeholder={t("chatView.findInThisConversation")}
+            aria-label={t("chatView.findInThisConversation")}
+            className="min-w-0 flex-1 bg-transparent text-ui text-foreground outline-none placeholder:text-muted-foreground"
+          />
+          <span aria-live="polite" className="shrink-0 text-small tabular-nums text-muted-foreground">
+            {query.trim().length < 2
+              ? ""
+              : hits.length === 0
+                ? t("chatView.noMatches")
+                : t("chatView.matchOf", { at: Math.min(hitAt, hits.length - 1) + 1, total: hits.length })}
+          </span>
+          <div className="flex shrink-0 items-center gap-0.5">
+            <button
+              onClick={() => setHitAt((at) => stepHit(at, hits.length, -1))}
+              disabled={hits.length === 0}
+              aria-label={t("chatView.previousMatch")}
+              title={`${t("chatView.previousMatch")}  ${keysFor("findStep", platformOf())[1]}`}
+              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
+            >
+              <ChevronUp size={15} />
+            </button>
+            <button
+              onClick={() => setHitAt((at) => stepHit(at, hits.length, 1))}
+              disabled={hits.length === 0}
+              aria-label={t("chatView.nextMatch")}
+              title={`${t("chatView.nextMatch")}  ${keysFor("findStep", platformOf())[0]}`}
+              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
+            >
+              <ChevronDown size={15} />
+            </button>
+            <button
+              onClick={closeFind}
+              aria-label={t("chatView.closeFind")}
+              title={`${t("common.close")}  ${keysFor("close", platformOf())[0]}`}
+              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            >
+              <X size={15} />
+            </button>
+          </div>
+        </div>
+      )}
+      {terminal.slot("top")}
+      <SideDock side="top" placeKey={dockKey} panes={dockPanes} onPick={pickPanel} />
+      {/* The transcript, and the way back to its end floating over it. */}
+      <div className="relative flex min-h-0 flex-1 flex-col">
+      <div
+        ref={scrollRef}
+        onScroll={earlier.onScroll}
+        className="min-h-0 flex-1 overflow-y-auto px-4 md:px-6 [overflow-anchor:none]"
+      >
+        {/* Full height only when empty, to centre the welcome: paging
+            measures this column to tell a short history from a full one. */}
+        <div className={cn("mx-auto flex max-w-[var(--transcript-width,760px)] flex-col gap-2.5 pb-4 pt-2", empty && "min-h-full")}>
+          {empty ? (
+            <EmptyState key={threadKey} bot={bot} onStart={startWith} />
+          ) : start > 0 || earlier.remaining > 0 ? (
+            <button
+              onClick={earlier.showEarlier}
+              disabled={earlier.loading}
+              className="mx-auto mt-3 inline-flex items-center gap-1.5 rounded-full border px-3.5 py-1.5 text-small text-muted-foreground transition-colors duration-150 hover:border-foreground/25 hover:text-foreground disabled:opacity-60"
+            >
+              {earlier.loading && <Loader2 size={12} className="animate-spin" />}
+              {t("chatView.showEarlier", { count: start + earlier.remaining })}
+            </button>
+          ) : (
+            first && (
+              <div data-copy="skip" className="py-3 text-center text-small text-muted-foreground">
+                {dayLine(first.at)}
+              </div>
+            )
+          )}
+          {/* a click in an answer drawn as interface goes back to this
+              agent, in the conversation on screen (genui/host.tsx) */}
+          <GenUiHost target={{ kind: "chat", botId: bot.id }}>
+            {visibleRows.flatMap((row) =>
+              row.kind === "said"
+                ? rowsOf(
+                    row.items.map((item) => item.message),
+                    (offset) => row.items[offset].index,
+                  )
+                : [
+                    ...lineAbove(row.fold.indices),
+                    <TurnFoldLine
+                      key={`fold:${row.fold.key}`}
+                      fold={row.fold}
+                      open={openFolds.has(row.fold.key)}
+                      onToggle={() => toggleFold(row.fold.key)}
+                      onOpenExchange={(asker) =>
+                        setExchange({ peerId: asker.peerId, messageId: asker.message.id, text: asker.message.text ?? "" })
+                      }
+                      onOpenTrace={() => openTrace(askForFold(row.fold.messages))}
+                    >
+                      {openFolds.has(row.fold.key) && rowsOf(row.fold.messages, (offset) => row.fold.indices[offset])}
+                    </TurnFoldLine>,
+                  ],
+            )}
+            {liveBrowser && <LiveBrowser botId={bot.id} frame={liveBrowser} />}
+            {streaming &&
+              (group ? (
+                <GroupMessage
+                  mine={false}
+                  first={said[said.length - 1]?.role !== "bot" || !isBubble(said[said.length - 1])}
+                  last={false}
+                  face={<AgentAvatar bot={bot} size={28} />}
+                  name={bot.name}
+                  at={Date.now()}
+                  rich={streaming.length > 400}
+                  bubble={
+                    <div className="streaming-text">
+                      <Markdownish text={streaming} streaming />
+                    </div>
+                  }
+                />
+              ) : (
+                <StreamingBubble text={streaming} />
+              ))}
+          </GenUiHost>
+          {/* sent while your hosted workspace wakes, faded until it goes */}
+          <HeldSends conversation={`${bot.id}:${bot.activeTaskId ?? bot.threadId}`} said={said} queued={waiting} group={group} />
+          <WorkingLine
+            threadKey={threadKey}
+            working={working}
+            streaming={streaming}
+            messages={said}
+            provisioning={provisioning}
+            speed={openLane?.codexDispatch}
+            onStop={() => dispatch({ type: "interrupt", botId: bot.id })}
+            onOpenTrace={() => openTrace({})}
+          />
+        </div>
+      </div>
+      {!empty && (
+        <TurnTimeline
+          marks={turns}
+          scroller={scrollRef}
+          rowOf={(id) => `[data-message-id="${CSS.escape(id)}"]`}
+          // the palette's landing: what it needs is drawn, then it is lit
+          onJump={(mark) => setLanding({ id: mark.id, nonce: Date.now() })}
+          authorOf={(mark) => (mark.author ? personName(mark.author) : t("chatView.you"))}
+          tick={`${said.length}:${visibleStart}:${openFolds.size}:${streaming ? 1 : 0}`}
+        />
+      )}
+      <JumpToLatest show={away && !empty} fresh={freshBelow} onJump={toLatest} />
+      {/* panels minimized out of the side panel, in the conversation's
+          corners above where you type */}
+      <MiniDock placeKey={dockKey} panes={dockPanes} />
+      </div>
+
+      <BrowsingOnMac botId={bot.id} name={bot.name} />
+      {terminal.slot("bottom")}
+      <GoalDialog />
+      <QuestionDock botId={bot.id} questions={questions} />
+      {/* approvals, other conversations, the engine, what waits, guest
+          mail and the goal all speak through the composer's one tray */}
+      <Composer
+        key={`${bot.id}:${bot.activeTaskId ?? bot.threadId}`}
+        bot={bot}
+        replyTo={replyTo}
+        onClearReply={() => setReplyTo(null)}
+        prefill={prefill}
+        onEditLast={editLast}
+        approvals={pendingApprovals}
+        waiting={waiting}
+        editAsk={editAsk}
+        onSendAgain={sendAgain}
+      />
+      {/* words selected in one message: quote them, or branch with them */}
+      <SelectionQuote
+        container={scrollRef}
+        source={(id) => {
+          const m = bot.messages.find((x) => x.id === id);
+          if (!m || m.deleted || m.kind !== "text" || !m.text) return null;
+          return {
+            author: telegramSpeaker(m)?.name ?? (m.role === "user" && !m.selfSent ? (m.author ? personName(m.author) : t("chatView.you")) : bot.name),
+            excerpt: excerptOf(m),
+            // one of the agent's own answers, as Branch from here takes
+            branchable: m.role === "bot" && !m.takeBack && (!m.agent || m.agent.dir === "reply"),
+          };
+        }}
+        onQuote={setReplyTo}
+        onBranch={(draft) => dispatch({ type: "branchTask", botId: bot.id, taskId: bot.threadId, messageId: draft.id, quote: { author: draft.author, excerpt: draft.excerpt, quote: draft.quote } })}
+        branchBlocked={branchWhy}
+      />
+      <SideDock side="bottom" placeKey={dockKey} panes={dockPanes} onPick={pickPanel} />
+      </div>
+      <SideDock placeKey={dockKey} panes={dockPanes} onPick={pickPanel} headSlot={titleSlot ? dockHead : null} expandedSlot={titleSlot ? expandedSlot : null} />
+      {calling && <CallOverlay bot={bot} onClose={() => setCalling(false)} />}
+      </div>
+      {terminal.overlay}
+      {terminal.panel}
+      {exchange && (
+        <AgentExchangeDialog
+          botId={bot.id}
+          peerId={exchange.peerId}
+          focusId={exchange.messageId}
+          focusText={exchange.text}
+          onClose={() => setExchange(null)}
+        />
+      )}
+
+      {forwarding && (
+        <ForwardDialog
+          message={forwarding.message}
+          author={forwarding.author}
+          onClose={() => setForwarding(null)}
+        />
+      )}
+    </main>
+    </ShareRequestContext.Provider>
+    </DockHostContext.Provider>
+  );
+}

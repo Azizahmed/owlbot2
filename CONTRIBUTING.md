@@ -1,0 +1,176 @@
+# Contributing to OwlBot
+
+Thanks for being here. OwlBot is a local-first desktop app for personal
+AI agents, and it is small enough that one good pull request moves it
+noticeably.
+
+## Getting set up
+
+```sh
+pnpm install
+pnpm dev:server   # the harness, on 127.0.0.1:8799
+pnpm dev          # the app, on 127.0.0.1:5199
+```
+
+Open `http://127.0.0.1:5199`. For the desktop shell, `pnpm dev:desktop`
+in a third terminal. It shows the dev server, which is one workspace. To
+work on workspaces themselves (the switcher, a server per workspace,
+joining), run `pnpm build`, then `OWLBOT_DEV_WORKSPACES=1 pnpm dev:desktop`,
+which starts the servers itself the way the installed app does.
+
+The dev server uses `~/.owlbot`, your real Personal workspace, unless you
+point it elsewhere: `OWLBOT_DATA_DIR=/tmp/owlbot-dev pnpm dev:server` keeps
+your own agents out of your experiments. The test suite never touches
+it.
+
+You need at least one engine to see an agent reply. The cheapest way in
+is an API key in Settings; the fullest is a CLI agent like Claude Code,
+Codex or Gemini CLI, because those can use tools.
+
+Before you push:
+
+```sh
+pnpm typecheck
+pnpm test
+pnpm build
+```
+
+All three run in CI and all three must pass. The suite is some four
+thousand tests, takes a few minutes and needs no credentials, so there is
+no excuse not to run it.
+
+## How the pieces fit
+
+Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) first. The short
+version, and the one rule worth internalising:
+
+**The client holds no transports.** The React app never talks to a
+provider. It sends typed commands over HTTP and folds one server-sent
+event stream. Every provider process runs in the harness server. If you
+find yourself reaching for `fetch` to a model API from `src/`, the change
+belongs in `server/` instead.
+
+A route you add to the server is closed to the members of a workspace
+until you name it in `server/member-access.ts`, and who may see what is
+decided in `server/access.ts`, never inline. If your change shows a
+member something, say in the pull request why they should see it.
+
+Adding an engine is usually data, not code:
+
+- An OpenAI-compatible API: add a spec to `server/providers.ts`.
+- An agent CLI that speaks the Agent Client Protocol: add a spec to
+  `ACP_SPECS` in `server/drivers/acp.ts`.
+- Anything else: a new driver in `server/drivers/`, implementing the
+  contract in `server/contracts.ts`.
+
+## What we look for in a pull request
+
+**One thing per pull request.** A focused diff gets reviewed the same
+day. A branch that renames files, fixes a bug and adds a feature gets
+read three times and merged never.
+
+**Say what you verified, not just what you changed.** "Ran a turn through
+it, tool call surfaced, approval card blocked until answered" is worth
+more than any description of the code. If you could not verify something,
+say that too. We would much rather know.
+
+**Bring a test when there is one to bring.** Anything pure belongs in
+`test/`, and anything touching the request path belongs in
+`test/api.test.ts`, which boots the real server. See
+[test/README.md](test/README.md) for how the suite is put together. Not
+every change needs one; a bug fix almost always does, because the test is
+the part that stops it coming back.
+
+**Match the surrounding code.** The codebase has a consistent voice:
+comments explain *why* a thing is the way it is, not what the next line
+does. Naming is plain. There is no formatter to argue with, so read the
+file you are editing and write like it.
+
+**Prose style.** Copy that ships in the UI, in commit messages, and in
+docs avoids em dashes and en dashes. Use a comma, a colon, parentheses,
+or a second sentence. This is a house preference, applied consistently.
+
+**Keep the approval gate.** Anything that lets an agent act without the
+user seeing it needs a very good reason. If your change adds a way to
+skip an approval, that belongs in its own pull request with its own
+argument.
+
+## Screenshots
+
+The images in the README come from made-up workspaces, not from anyone's
+real install, so they are reproducible and contain nobody's data.
+`pnpm screenshots` (`scripts/shoot-screenshots.mjs`) takes the README's
+set the same way every time: it builds the app, writes three made-up
+workspaces into a throwaway home, starts the real desktop app on them in
+an invisible window, plays a few turns through a stand-in engine, and
+photographs each place. `pnpm screenshots --only=hero,usage` takes some of
+them. Edit the workspaces and scenes in that script if a screenshot needs
+to show something new. Nothing in it calls a model; the transcripts are
+written by hand, because a screenshot should not depend on what a
+provider felt like saying that day.
+
+To click around a small seeded workspace yourself:
+
+```sh
+node scripts/seed-demo.mjs /tmp/owlbot-demo
+HOME=/tmp/owlbot-demo pnpm dev:server
+pnpm dev
+```
+
+## Security
+
+Do not open a public issue for anything exploitable. See
+[SECURITY.md](SECURITY.md) for how to report it and for the trust model
+you should assume while working on this.
+
+Two things to keep in mind while writing code here:
+
+- Anything a model produces is untrusted input, including text that ends
+  up in the UI, in a file path, or in a shell argument.
+- Every field that reaches disk or a system prompt needs a length cap.
+  Add it to `server/limits.ts` rather than inline.
+
+## Releases
+
+You do not need this to contribute, but it is worth knowing how the thing
+gets built. Pushing a tag makes CI sign and notarize a macOS build and
+upload it as a draft release; [docs/RELEASING.md](docs/RELEASING.md) has
+the details. `pnpm package` gives you the same build locally, unsigned.
+
+## Commit messages
+
+Write a subject line someone could scan in a changelog, then a body that
+explains why. We are not strict about a format, but we are strict about
+the body being useful. If a commit fixes a bug, say what the bug did.
+
+## Reporting bugs
+
+Use the issue templates. The single most useful thing you can include is
+what you expected versus what happened, plus which engine the agent was
+running on. Logs live in the workspace's folder (`~/.owlbot` for Personal;
+`events/` for the canonical stream, `native/` for raw provider traffic).
+For a window that went blank or froze, the desktop app keeps its own
+`app.log` in its logs folder (on a Mac, `~/Library/Logs/OwlBot`).
+Please scrub keys before pasting.
+
+## Licence
+
+OwlBot is under the [MIT licence](LICENSE). Use it, fork it, change it,
+ship it, sell it, with no restriction beyond keeping the copyright and
+permission notice in copies.
+
+By contributing you agree that your contributions are licensed under the
+same terms. There is no contributor licence agreement to sign and no
+copyright assignment.
+
+Being straight about the commercial side, because you should hear it here
+rather than work it out later. This desktop app is free and open, and
+stays that way: not a trial, not a crippled tier, no seat count. A paid
+hosted version is planned, agents that keep running when your laptop is
+shut. MIT means anyone may also host it and sell that, which is a trade
+this project makes on purpose in exchange for the code staying genuinely
+open.
+
+If that arrangement is not one you want to contribute to, that is a
+perfectly reasonable position and better discovered now than after you
+have written a patch.

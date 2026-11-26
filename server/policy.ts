@@ -1,0 +1,608 @@
+// Rules a person writes about what their agents may do.
+//
+// An agent partway through a turn asks before anything consequential, and
+// item 10 records the answer. That works and it does not scale: the
+// hundredth "may I read this file" is the same decision as the first, and
+// a person who answers a hundred cards stops reading them, which is worse
+// than not asking.
+//
+// So the questions get answered by rules first, and only what the rules do
+// not cover reaches a person. Five decisions, four of them borrowed and
+// one of them ours.
+//
+//   Deny is evaluated before allow, and deny wins. An operator can then
+//   reason about what is forbidden without reading every allow rule
+//   written since, and a broad allow added later cannot quietly reopen
+//   something that was shut.
+//
+//   The target is read here, from what the engine actually sent, rather
+//   than taken as a label. A rule about a path has to be checked against
+//   the path the tool was given, or renaming the thing gets past the rule.
+//
+//   Nothing that cannot be evaluated is permitted. A rule with an operator
+//   this build does not know cannot be shown not to apply, so a deny with
+//   one denies and an allow with one does not allow.
+//
+//   Rules compare, they never evaluate. The same call as item 20: there is
+//   no expression language here, so there is no sandbox to get wrong and
+//   nothing that can run away. It also means a rule is a form rather than
+//   a syntax, which is the difference between a person writing one and a
+//   person being told they could.
+//
+// And the one that is ours rather than theirs. **No rules means ask, not
+// deny.** A gateway that is the only way through is right to refuse what
+// it was told nothing about. Here the thing an empty policy replaces is a
+// person deciding, and quietly refusing everything the day somebody opens
+// this screen would be a worse product and a worse default. Fail closed
+// applies inside a rule, never to the absence of one.
+//
+// Questions are never governed. An agent asking its owner something is not
+// an action, and a rule that answered it would be inventing an answer.
+import { writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+
+import { DATA_DIR } from "./config.ts";
+import { newId } from "./contracts.ts";
+import { readSaved } from "./atomic-write.ts";
+import { dangerous } from "./safety-floor.ts";
+
+export type Effect = "allow" | "deny";
+
+/** What a rule can look at. Each one is read from the request rather than
+ * taken from a label the caller chose. */
+export type Field = "tool" | "command" | "path" | "url" | "agent";
+
+/** The same vocabulary as a workflow condition, for the same reason: a
+ * comparison a person can read, and nothing that evaluates.
+ *
+ * The last three are narrower than the rest, and exist for the rules
+ * OwlBot offers to write from what a person keeps approving
+ * (server/rule-suggestions.ts), which must never be broader than what
+ * was approved. "starts with" cannot say that about a command: a rule
+ * that lets through anything starting `pnpm test` also lets through
+ * `pnpm test; curl ... | sh`. So each of these reads its field rather
+ * than only comparing text, and each belongs to one field:
+ *
+ *   runs       a command that is one plain command, nothing chained,
+ *              piped, redirected or substituted, whose words begin with
+ *              these words.
+ *   in-folder  a file whose folder is exactly this one. Not a folder
+ *              under it, and not a sibling whose name happens to start
+ *              the same.
+ *   on-site    an address on exactly this scheme, host and port.
+ *
+ * A build that does not know one of them treats it the way it treats
+ * any operator it does not know: a deny with it denies, and an allow
+ * with it does not allow. That is the safe direction for a rule made to
+ * let things through. */
+export type Op = "contains" | "not-contains" | "equals" | "starts-with" | "ends-with" | "runs" | "in-folder" | "on-site";
+
+export const FIELDS: Field[] = ["tool", "command", "path", "url", "agent"];
+export const OPS: Op[] = ["contains", "not-contains", "equals", "starts-with", "ends-with", "runs", "in-folder", "on-site"];
+
+/** The field each narrow operator reads. A rule pairing one with any
+ * other field is refused at the door and never applies. */
+export const NARROW_OPS: Partial<Record<Op, Field>> = { runs: "command", "in-folder": "path", "on-site": "url" };
+
+export interface Rule {
+  id: string;
+  effect: Effect;
+  field: Field;
+  op: Op;
+  value: string;
+  /** Only this agent. Absent means every agent. */
+  botId?: string;
+  /** Only this tool, by name, as the engine sent it. Absent means any
+   * tool. A rule about a folder that reading was approved in should not
+   * also wave through writing there. */
+  tool?: string;
+  enabled: boolean;
+  createdAt: number;
+}
+
+/** One request, with its target already read out of what the tool was
+ * given. Absent fields are absent, not empty: a rule about a path must
+ * not match a request that has no path. */
+export interface Ask {
+  tool: string;
+  command?: string;
+  path?: string;
+  url?: string;
+  botId: string;
+  agent: string;
+}
+
+export type Decision =
+  | { verdict: "allow"; rule: Rule; because: string }
+  | { verdict: "deny"; rule: Rule; because: string }
+  | { verdict: "ask"; because: string };
+
+export const MAX_RULES = 100;
+export const MAX_VALUE = 200;
+
+// ── reading the target out of a request ────────────────────────────────
+
+/**
+ * What the tool was actually asked to do.
+ *
+ * Names differ by tool and by engine, so the likely ones are tried in
+ * turn. A field that is not there stays undefined, which is what stops a
+ * rule about paths from matching a request that has none.
+ */
+export function targetOf(tool: string, input: Record<string, unknown>, who: { botId: string; agent: string }): Ask {
+  const text = (value: unknown): string | undefined =>
+    typeof value === "string" && value.trim() ? value : undefined;
+  const first = (...keys: string[]): string | undefined => {
+    for (const key of keys) {
+      const found = text(input?.[key]);
+      if (found) return found;
+    }
+    return undefined;
+  };
+  return {
+    tool: (tool ?? "").trim() || "tool",
+    command: first("command", "cmd", "script"),
+    path: first("file_path", "path", "filePath", "notebook_path", "target_file"),
+    url: first("url", "uri"),
+    botId: who.botId,
+    agent: who.agent,
+  };
+}
+
+/**
+ * One Ask per file when a request names several (a patch across files, a
+ * move), so a rule about one of them is not missed because another was
+ * listed first. See decideEach for how they combine.
+ */
+export function targetsOf(tool: string, input: Record<string, unknown>, who: { botId: string; agent: string }): Ask[] {
+  const one = targetOf(tool, input, who);
+  // the path the input names itself and every path in its list, each once:
+  // either can be the one a rule is about
+  const listed = Array.isArray(input?.paths) ? input.paths : [];
+  const paths = [...new Set([one.path, ...listed].filter((p): p is string => typeof p === "string" && p.trim().length > 0))];
+  if (paths.length <= 1) return [paths[0] ? { ...one, path: paths[0] } : one];
+  return paths.map((path) => ({ ...one, path }));
+}
+
+// ── deciding ───────────────────────────────────────────────────────────
+
+/** What a rule is looking at in this request, or undefined when the
+ * request has no such thing. */
+function valueOf(field: Field, ask: Ask): string | undefined {
+  switch (field) {
+    case "tool":
+      return ask.tool;
+    case "command":
+      return ask.command;
+    case "path":
+      return ask.path;
+    case "url":
+      return ask.url;
+    case "agent":
+      return ask.agent;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Does this rule apply to this request.
+ *
+ * `unknown` is the third answer and it exists so the caller can fail in
+ * the safe direction: a rule this build cannot evaluate has not been
+ * shown not to apply, and what to do about that depends on whether it
+ * denies or allows.
+ */
+export function applies(rule: Rule, ask: Ask): boolean | "unknown" {
+  if (!FIELDS.includes(rule.field)) return "unknown";
+  if (!OPS.includes(rule.op)) return "unknown";
+  if (rule.botId && rule.botId !== ask.botId) return false;
+  if (rule.tool && rule.tool.trim().toLowerCase() !== ask.tool.trim().toLowerCase()) return false;
+
+  const found = valueOf(rule.field, ask);
+  // A rule about a path says nothing about a request that has no path,
+  // including a "does not contain" one: a request with no path has not
+  // satisfied it, it is simply not what the rule is about.
+  if (found === undefined) return false;
+
+  const left = found.toLowerCase();
+  const right = (rule.value ?? "").trim().toLowerCase();
+  switch (rule.op) {
+    case "contains":
+      return Boolean(right) && left.includes(right);
+    case "not-contains":
+      return Boolean(right) && !left.includes(right);
+    case "equals":
+      return left === right;
+    case "starts-with":
+      return Boolean(right) && left.startsWith(right);
+    case "ends-with":
+      return Boolean(right) && left.endsWith(right);
+    case "runs":
+      return NARROW_OPS.runs === rule.field && runsWords(found, rule.value ?? "");
+    case "in-folder":
+      return NARROW_OPS["in-folder"] === rule.field && inFolder(found, rule.value ?? "");
+    case "on-site":
+      return NARROW_OPS["on-site"] === rule.field && onSite(found, rule.value ?? "");
+    default:
+      return "unknown";
+  }
+}
+
+/** Anything that makes a command line more than one plain command: a
+ * second command, a pipe, a redirect, a substitution, a background job,
+ * a variable, or a line break. Quotes too, since a quoted `;` is still a
+ * character this does not try to read the meaning of. */
+const NOT_PLAIN = /[;&|<>`$(){}\\\n\r'"*?!~]/;
+
+/** The words of one plain command, or null when it is not one. */
+export function plainWords(command: string): string[] | null {
+  const text = command.trim();
+  if (!text || NOT_PLAIN.test(text)) return null;
+  return text.split(/\s+/);
+}
+
+/** Whether a command is one plain command whose words begin with these. */
+export function runsWords(command: string, prefix: string): boolean {
+  const words = plainWords(command);
+  const want = plainWords(prefix);
+  if (!words || !want || want.length > words.length) return false;
+  return want.every((word, i) => words[i].toLowerCase() === word.toLowerCase());
+}
+
+/** A path with its . and .. read, and its slashes tidied, or null for one
+ * that is not absolute: a relative path is relative to a folder this
+ * cannot see, so it cannot be shown to be anywhere in particular. */
+export function cleanPath(path: string): string | null {
+  const p = path.trim().replace(/\\/g, "/");
+  if (!p.startsWith("/")) return null;
+  const out: string[] = [];
+  for (const part of p.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (!out.length) return null;
+      out.pop();
+    } else out.push(part);
+  }
+  return `/${out.join("/")}`;
+}
+
+/** The folder a file is in, read the same way. */
+export function folderOf(path: string): string | null {
+  const clean = cleanPath(path);
+  if (!clean || clean === "/") return null;
+  return clean.slice(0, clean.lastIndexOf("/")) || "/";
+}
+
+/** Whether a file sits directly in this folder. */
+export function inFolder(path: string, folder: string): boolean {
+  const here = folderOf(path);
+  const there = cleanPath(folder);
+  return Boolean(here && there && here === there);
+}
+
+/** Scheme, host and port, the part of an address a site is. */
+export function siteOf(url: string): string | null {
+  try {
+    const parsed = new URL(url.trim());
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+    if (parsed.username || parsed.password) return null;
+    return parsed.origin.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+/** Whether an address is on exactly this site. */
+export function onSite(url: string, site: string): boolean {
+  const here = siteOf(url);
+  const there = siteOf(site);
+  return Boolean(here && there && here === there);
+}
+
+/** How a rule reads back, for the card, the record and the refusal. */
+export function describe(rule: Rule): string {
+  const op = rule.op.replace(/-/g, " ");
+  return `${rule.effect} when ${rule.field} ${op} "${rule.value}"${rule.tool ? ` (${rule.tool} only)` : ""}`;
+}
+
+/**
+ * What happens to this request.
+ *
+ * Deny first and in order, then allow, then ask. Asking is the answer
+ * whenever nothing applies, which is the whole difference between this
+ * and a gateway: the thing an empty policy replaces here is a person
+ * deciding, not an open door.
+ */
+/**
+ * Tools that ask the person something rather than doing something.
+ *
+ * Our own three arrive already labelled as questions. An engine's native
+ * one does not: Claude Code asks permission to *use* AskUserQuestion, so
+ * it reaches us shaped exactly like a request to run a command, and
+ * everything downstream treats it as one. That is how somebody ends up
+ * writing "always allow AskUserQuestion", after which every question is
+ * answered by the rule and the agent can never ask anything again.
+ *
+ * A rule cannot answer a question. Allowing one only means the asking may
+ * proceed, which is what was going to happen anyway, and denying one
+ * refuses a conversation rather than an action. So these are named here
+ * and kept out of the rule system at every level.
+ */
+const QUESTION_TOOLS = new Set(
+  [
+    "ask_user",
+    "askuserquestion",
+    "request_secret",
+    "request_connection",
+    "requestuserinput",
+  ].map((name) => name.toLowerCase()),
+);
+
+export function isQuestionTool(tool: string | undefined): boolean {
+  const name = (tool ?? "").trim().toLowerCase();
+  if (!name) return false;
+  if (QUESTION_TOOLS.has(name)) return true;
+  // An engine may prefix its own: mcp__owlbot__ask_user, and Codex sends
+  // the method path. Match the last segment rather than listing every
+  // spelling a driver might invent.
+  const tail = name.split(/[/_]/).filter(Boolean).slice(-2).join("_");
+  return QUESTION_TOOLS.has(tail) || QUESTION_TOOLS.has(name.split("/").pop() ?? "");
+}
+
+export function decide(rules: Rule[], ask: Ask): Decision {
+  // Before any rule is read. A rule that already matches a question tool
+  // was written before this existed, and the person who wrote it lost the
+  // ability to be asked anything; ignoring it here gives that back on
+  // upgrade rather than requiring a trip to Settings.
+  if (isQuestionTool(ask.tool)) {
+    return { verdict: "ask", because: "a question is for you to answer, not a rule" };
+  }
+  const live = rules.filter((rule) => rule.enabled);
+  const denies = live.filter((rule) => rule.effect === "deny");
+  const allows = live.filter((rule) => rule.effect === "allow");
+
+  for (const rule of denies) {
+    const hit = applies(rule, ask);
+    // A deny nobody can evaluate has not been shown not to apply.
+    if (hit === true || hit === "unknown") {
+      return {
+        verdict: "deny",
+        rule,
+        because: hit === "unknown" ? `${describe(rule)}, which this version cannot check` : describe(rule),
+      };
+    }
+  }
+  for (const rule of allows) {
+    // A narrow rule, or one held to a single tool, is the kind written
+    // from what a person approved, and what they approved was never on
+    // the floor (server/safety-floor.ts). It stays that way: "runs git"
+    // does not grow into a force push. A rule somebody wrote by hand
+    // without either means what it says, as it always has.
+    if ((NARROW_OPS[rule.op] || rule.tool) && dangerous(ask)) continue;
+    if (applies(rule, ask) === true) {
+      return { verdict: "allow", rule, because: describe(rule) };
+    }
+  }
+  return { verdict: "ask", because: "no rule covers this" };
+}
+
+/** The answer for a request that names several files: refused if any
+ * of them is refused, allowed only if every one of them is allowed,
+ * otherwise asked. */
+export function decideEach(rules: Rule[], asks: Ask[]): Decision {
+  const decisions = asks.map((ask) => decide(rules, ask));
+  return (
+    decisions.find((d) => d.verdict === "deny") ??
+    decisions.find((d) => d.verdict === "ask") ??
+    decisions[0] ?? { verdict: "ask", because: "no rule covers this" }
+  );
+}
+
+/** What the agent is told when a rule refuses. It names the rule, because
+ * an agent told only "not allowed" tries a different way round. */
+export function refusal(decision: Extract<Decision, { verdict: "deny" }>): string {
+  return `OwlBot: a rule in this workspace refuses this (${decision.because}). Do not try another way round it; carry on with what you can do without it, and say what you could not do.`;
+}
+
+// ── what a client may send ─────────────────────────────────────────────
+
+export interface NewRule {
+  effect?: unknown;
+  field?: unknown;
+  op?: unknown;
+  value?: unknown;
+  botId?: unknown;
+  tool?: unknown;
+  enabled?: unknown;
+}
+
+/**
+ * A rule as it arrives, checked into shape, or the reason it is not one.
+ *
+ * Refusing at the door is what keeps the runtime honest: `applies` has an
+ * unknown branch for a file somebody hand-edited, and nothing that gets
+ * saved through here can reach it.
+ */
+export function cleanRule(input: NewRule): { rule: Omit<Rule, "id" | "createdAt"> } | { error: string } {
+  const effect = input.effect === "deny" ? "deny" : input.effect === "allow" ? "allow" : null;
+  if (!effect) return { error: "a rule has to allow or deny" };
+  if (!FIELDS.includes(input.field as Field)) return { error: "a rule has to be about something we can look at" };
+  if (!OPS.includes(input.op as Op)) return { error: "a rule has to compare in a way we can check" };
+  const narrow = NARROW_OPS[input.op as Op];
+  if (narrow && narrow !== input.field) return { error: `that comparison only reads the ${narrow}` };
+  const value = String(input.value ?? "").trim().slice(0, MAX_VALUE);
+  if (!value) return { error: "a rule needs something to compare against" };
+  // what each narrow comparison reads has to read, or it is a rule
+  // that can never apply and looks like one that does
+  if (input.op === "runs" && !plainWords(value)) return { error: "a command to run is plain words, nothing chained" };
+  if (input.op === "in-folder" && !cleanPath(value)) return { error: "a folder is a full path" };
+  if (input.op === "on-site" && !siteOf(value)) return { error: "a site is an address such as https://example.com" };
+  const botId =
+    typeof input.botId === "string" && /^[\w-]{1,64}$/.test(input.botId) ? input.botId : undefined;
+  const tool = typeof input.tool === "string" && input.tool.trim() ? input.tool.trim().slice(0, 120) : undefined;
+  return {
+    rule: {
+      effect,
+      field: input.field as Field,
+      op: input.op as Op,
+      value,
+      ...(botId ? { botId } : {}),
+      ...(tool ? { tool } : {}),
+      enabled: input.enabled !== false,
+    },
+  };
+}
+
+// ── somebody else is driving ───────────────────────────────────────────
+//
+// A person taking over an agent's computer has to mean something, or it
+// is a label on a screen. While the wheel is held, the agent's actions
+// that would have asked for permission are refused instead.
+//
+// Refused rather than queued, which is the decision worth stating. A queue
+// would replay, ten minutes later, a plan the agent made before a person
+// changed things underneath it, and the whole reason to take over is that
+// the plan needed changing.
+//
+// Held in memory rather than on disk on purpose: if this process restarted
+// then nobody is at the wheel, whatever a file might say. The record keeps
+// the history; this keeps only the present.
+//
+// The stakes of that went up when a hold stopped being only about
+// permission questions and started stopping turns outright, and it is
+// still the right way round. A hold says a person is at this keyboard
+// now. A file saying so after a restart would be a claim nobody made,
+// and an agent frozen by it would stay frozen with no one there to hand
+// the wheel back.
+
+export interface Hold {
+  botId: string;
+  since: number;
+  /** Said back to the agent and shown on the screen. */
+  why: string;
+  /** How much was turned away while this hold has been on: routines that
+   * did not fire, webhooks that did not wake it, messages refused. A
+   * hold with teeth should be able to say what it cost, and a count is
+   * the honest version of that. Per refusal entries in the record would
+   * flood a signed append only file the moment a webhook retried. */
+  turnedAway: number;
+}
+
+export class Wheel {
+  private held = new Map<string, Hold>();
+
+  take(botId: string, why: string, now: number): Hold {
+    const hold: Hold = {
+      botId,
+      since: now,
+      why: why.trim().slice(0, 200) || "you are using it",
+      turnedAway: 0,
+    };
+    this.held.set(botId, hold);
+    return hold;
+  }
+
+  /** Something tried to make this agent work and was refused. */
+  noteTurnedAway(botId: string): void {
+    const hold = this.held.get(botId);
+    if (hold) hold.turnedAway += 1;
+  }
+
+  release(botId: string): Hold | null {
+    const hold = this.held.get(botId) ?? null;
+    this.held.delete(botId);
+    return hold;
+  }
+
+  heldBy(botId: string): Hold | null {
+    return this.held.get(botId) ?? null;
+  }
+
+  all(): Hold[] {
+    return [...this.held.values()].sort((a, b) => a.since - b.since);
+  }
+}
+
+/** What the agent is told while somebody is driving. It says to wait
+ * rather than to work around, because working around is what an agent
+ * does with "no". */
+export function pausedMessage(hold: Hold): string {
+  return `OwlBot: somebody has taken over this computer (${hold.why}). Do not do this another way and do not retry: stop here, say what you were about to do, and wait to be asked again.`;
+}
+
+/**
+ * What the person is told when they try to set the agent going anyway.
+ *
+ * Deliberately not pausedMessage. That one is aimed at a model and its
+ * job is to stop it working around the refusal. This one is aimed at
+ * whoever just pressed something, and its job is to name the fix, which
+ * is the wheel they are holding.
+ */
+export function heldRefusal(hold: Hold, botName: string): string {
+  return `You have ${botName}'s computer (${hold.why}). Hand the wheel back to let it work.`;
+}
+
+// ── the file ───────────────────────────────────────────────────────────
+
+const RULES_FILE = join(DATA_DIR, "rules.json");
+
+export class PolicyStore {
+  rules: Rule[] = [];
+
+  constructor(file: string = RULES_FILE) {
+    this.file = file;
+    this.rules = readSaved<Rule[]>(this.file, [], Array.isArray).filter((r) => r?.id && typeof r.value === "string");
+  }
+
+  private readonly file: string;
+
+  private save() {
+    try {
+      mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+      writeFileSync(this.file, JSON.stringify(this.rules, null, 2), { mode: 0o600 });
+    } catch {
+      /* a rule that did not save is a question that reaches a person */
+    }
+  }
+
+  list(): Rule[] {
+    // Deny first, because that is the order they are evaluated in and a
+    // list that reads in a different order than it runs is a trap.
+    return [...this.rules].sort(
+      (a, b) => (a.effect === b.effect ? a.createdAt - b.createdAt : a.effect === "deny" ? -1 : 1),
+    );
+  }
+
+  add(rule: Omit<Rule, "id" | "createdAt">, now: number): Rule | null {
+    if (this.rules.length >= MAX_RULES) return null;
+    const made: Rule = { ...rule, id: newId(), createdAt: now };
+    this.rules.push(made);
+    this.save();
+    return made;
+  }
+
+  setEnabled(id: string, enabled: boolean): Rule | null {
+    const rule = this.rules.find((r) => r.id === id);
+    if (!rule) return null;
+    rule.enabled = enabled;
+    this.save();
+    return rule;
+  }
+
+  remove(id: string): boolean {
+    const before = this.rules.length;
+    this.rules = this.rules.filter((r) => r.id !== id);
+    if (this.rules.length === before) return false;
+    this.save();
+    return true;
+  }
+
+  /** A rule about an agent that is gone would never fire again, and would
+   * read as protection that is not there. */
+  removeForBot(botId: string) {
+    const before = this.rules.length;
+    this.rules = this.rules.filter((r) => r.botId !== botId);
+    if (this.rules.length !== before) this.save();
+  }
+}

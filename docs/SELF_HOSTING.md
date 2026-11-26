@@ -1,0 +1,576 @@
+# Running OwlBot on a server of your own
+
+`owlbot-server` is the same workspace the desktop app runs, without the
+desktop: for a small rented server, a Mac mini in a cupboard or a Linux
+box at home. Your devices reach it one of two ways, or both:
+
+- **Through OwlBot Cloud.** It listens on loopback only and connects out
+  to OwlBot Cloud, which carries the iPhone app, the desktop app on your
+  laptop, a browser at owlbot.dev/web, and the people you share rooms
+  with. No port is opened. Pairing is a link, from anywhere.
+- **Your own way.** Behind your reverse proxy or tunnel at an https
+  address of yours, or on your VPN or home network, with nothing of
+  OwlBot Cloud's in the path. `OWLBOT_CLOUD=off` makes sure nothing goes
+  there or to owlbot.dev at all. See [Reached your own way](#reached-your-own-way).
+
+Either way, people can also open it in a browser at an address of your
+own, signed in with your identity provider (see [Signing in from a
+browser](#signing-in-from-a-browser-with-your-own-identity-provider)).
+
+With Docker, [DOCKER.md](DOCKER.md) takes you from nothing to a paired
+server the second way with `docker compose up`.
+
+This page is about a server you run and look after yourself. It covers
+what kind of machine OwlBot thinks it is on, the settings that change
+that, how it is reached, and a systemd setup that keeps running after a
+reboot or a crash.
+
+## Three kinds of machine
+
+OwlBot asks four separate questions about the machine a workspace runs on
+(`server/deployment.ts`), and Settings, About says the answers:
+
+| Question | Desktop app | Self-hosted server | Managed hosting |
+| --- | --- | --- | --- |
+| Where it runs | inside the app on this computer | `owlbot-server` on a machine of yours | a machine OwlBot runs for you |
+| Who looks after it | you | you | the provider |
+| How OwlBot there is updated | with the app | by you, from the app or on the server | with the machine's image |
+| Owner's devices open its terminal | never | when you turn it on | always |
+
+Settings shows a **Self-hosted** mark on a server you run and a
+**Managed hosting** mark on a hosted machine. The desktop app reaching
+either one is a window onto it: About says the app's version and the
+server's apart, and which computer the server runs on.
+
+## Settings, as environment variables
+
+Set these where OwlBot runs (the unit file below, a container's
+environment, or the shell that starts it). None of them can be changed
+from a paired device: a device that could open a shell for itself would
+not need to be trusted with one.
+
+| Variable | What it does |
+| --- | --- |
+| `OWLBOT_OWNER_TERMINAL=1` | Your own paired devices (desktop app, iPhone, browser) may open terminals on this server. Off unless set. Never a member's device, a device nobody paired, or an agent. Has no effect in the desktop app, whose computer's shell is never reachable from a device. |
+| `OWLBOT_SERVER_UPDATES=off` | Settings, About and `owlbot-server update` check for new versions but never install one. |
+| `OWLBOT_DATA_DIR` | Where the workspace lives. Defaults to `~/.owlbot` of the account OwlBot runs as. |
+| `OWLBOT_PORT` | The port. Defaults to 8799. |
+| `OWLBOT_COMPUTER_NAME` | The name your devices show for this server. Defaults to its host name. |
+| `OWLBOT_PUBLIC_URL` | Where your devices reach this server your own way: an https address behind your reverse proxy or tunnel, or an http one on your VPN or network, port and all. Commas for more than one. `owlbot-server pair` hands a device this address. No path: OwlBot is served from the root of it. |
+| `OWLBOT_LISTEN=0.0.0.0` | Listen on every interface rather than loopback (`::` for IPv6 as well). For a container, where the published port decides who reaches it; the image sets it. On a bare machine, a reverse proxy or `tailscale serve` reaches loopback without it. |
+| `OWLBOT_CLOUD=off` | Nothing goes to OwlBot Cloud or owlbot.dev: see [what that turns off](#what-needs-owlbot-cloud). A licence already here is kept and not used. |
+| `OWLBOT_MODEL_URL` | An OpenAI-compatible model server's `/v1` root (vLLM, llama.cpp, LM Studio, LiteLLM, a self-hosted Qwen), listed as an engine. With `OWLBOT_MODEL_KEY` (if it takes one), `OWLBOT_MODEL_NAME` (what the app calls it), `OWLBOT_MODEL_TOOLS=1` (its model calls tools), `OWLBOT_MODEL_VISION=1` (it sees pictures) and `OWLBOT_MODEL_EFFORT=1` (it takes a reasoning effort, sent as `reasoning_effort`). Read each start, never written to `config.json`. |
+| `OWLBOT_BROWSER` | The Chrome the [OwlBot browser](#the-owlbot-browser-on-your-server) runs on, by its full path, when it is not where Chrome, Chromium, Brave or Edge usually install. `off` turns the OwlBot browser off on this server. |
+| `OWLBOT_HOSTED=1` | **Only for managed hosting.** Says a provider runs this machine for you. Do not set it on a server of your own (see below). |
+
+## What stays with managed hosting, and why
+
+Some behaviour depends on infrastructure a provider runs, not on the
+machine being reached remotely. A server of your own does not get it,
+and does not lose anything it needs because of it:
+
+| Area | Self-hosted server | Managed hosting | Why |
+| --- | --- | --- | --- |
+| Terminal from your devices | with `OWLBOT_OWNER_TERMINAL=1` | always | A shell is the most a device can be given, so on your own server you decide. |
+| Updates | from the app, or `owlbot-server update` | with the machine's image | The provider replaces the whole machine. |
+| Location and place watchers | offered | not offered | Where you are goes only to a computer of your own, never to a machine run for you. |
+| Agent computers | Cloud box, Local VM (Docker or Podman on the server; with Docker Compose, the desktop service in [DOCKER.md](DOCKER.md)), Off | This machine, Off | A hosted machine is the agents' computer already, with its own browser and virtual desktop. |
+| Virtual desktop in the Computer panel | not offered | when the image serves one | It needs the hosting image's desktop and viewer. |
+| OwlBot browser beside the chat | on the server, with Chrome installed ([below](#the-owlbot-browser-on-your-server)) | not offered | A server of your own keeps the browser itself and shows it in every device's panel. A hosted machine is the agents' computer already, with a browser on its own desktop. An agent's own browser (Settings, Its own browser) is separate, and works on any server with Chrome, Chromium, Brave or Edge installed, headless where there is no display, on an engine that takes it (the agent's settings say when its engine does not). |
+| Pairing link from owlbot.dev | `owlbot-server pair` on the server, or Settings, Phone and devices from a device or browser of yours | asked of OwlBot Cloud | Nobody can run `owlbot-server pair` on a hosted machine. |
+| Waking for routines | not needed | OwlBot Cloud wakes the machine | Only a hosted machine is put to sleep. |
+| Moving the workspace | backups, on the server | to and from your Mac, from the app | A move is the way into and out of managed hosting. |
+| Meeting notes | offered | not offered | They listen through a computer of your own. |
+
+Authorization is enforced on the server either way: a control the app
+hides is also refused by the route, with the reason.
+
+## Reached your own way
+
+Set `OWLBOT_PUBLIC_URL` to the address your devices use, put your reverse
+proxy, tunnel or VPN in front, and restart. Ready snippets for Caddy,
+NGINX, Cloudflare Tunnel and Tailscale are in [DOCKER.md](DOCKER.md#4-put-your-door-in-front-of-it);
+without Docker, point them at `127.0.0.1:8799` on the same machine.
+
+`owlbot-server pair` then prints a link for each address, carrying the
+address and a one time code that works once, for five minutes. The
+desktop app takes it in Settings, Phone and devices, Your servers, and
+from then on talks to the server at that address with a token of its
+own, exactly as a phone on the same wifi talks to a Mac. The iPhone app
+takes one for an `http://` address on your own network or your
+Tailscale IPv6 address; it does not pair at an `https://` address of
+yours yet. `owlbot-server token --server URL --code 123456` gets a token
+for the scripting commands on another machine.
+
+What keeps strangers out does not move:
+
+- Only a request that arrives on this machine's own loopback, with a
+  loopback `Host` and no foreign `Origin`, and carrying the key the
+  server made when it started, is the person at the server. The key is
+  in `local.key` in the data folder, readable only by the account OwlBot
+  runs as; `owlbot-server` and the MCP bridge send it themselves, and a
+  script of yours on the server sends it as the `x-owlbot-local` header,
+  read fresh after each restart. An agent's own credential needs no key:
+  it only works from this machine and only for what an agent may do. So a
+  tunnel or proxy that delivers a stranger to loopback, whatever it
+  sends, delivers no owner. A browser on the server itself is a device
+  like any other: pair it, or sign in at the web door. Everything else
+  needs a paired device's token, and without one gets `/api/health`
+  and the pairing claim, nothing more.
+- A request that says a proxy forwarded it (`Forwarded`,
+  `X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP` and the like) is
+  never the person at the server, even when the proxy connects from
+  loopback. That matters because NGINX, unless told otherwise, rewrites
+  `Host` to `127.0.0.1`: every proxy above sends one of those headers,
+  so its requests need a token like any other. Keep the proxy passing
+  the original `Host` on all the same (Caddy and cloudflared do by
+  default; NGINX needs `proxy_set_header Host $host`).
+- A pairing code exists only once you ask for one at the server or on a
+  device of yours, five wrong tries close it, and a device removed in
+  Settings is cut off at once.
+- Nothing about this can be set from a device: the address, listening
+  beyond loopback and OwlBot Cloud off are all where OwlBot runs.
+
+### What needs OwlBot Cloud
+
+With `OWLBOT_CLOUD=off` nothing below is offered, and nothing is sent to
+OwlBot Cloud or owlbot.dev. Everything else works as it does with it, and
+the agents, which run on this server, never needed it:
+
+| Needs OwlBot Cloud or owlbot.dev | Instead, your own way |
+| --- | --- |
+| Reaching the server from anywhere, and a pairing link from anywhere | Your address, through your proxy, tunnel or VPN |
+| A browser at owlbot.dev/web | A browser at your own address through the web door (below), or the desktop app at your address |
+| The iPhone app from anywhere, and what reaches a locked phone: notifications and Live Activities | The iPhone app while it is open, at an http address on your VPN or network |
+| Email to agents, WhatsApp | Telegram, Slack, Discord and Signal, which each connect out on their own |
+| People in your workspace (an OwlBot Team plan, which owlbot.dev checks), and the Plan page | Reaching your agents yourself, from each of your devices |
+| OwlBot AI | Your own models and keys |
+| The skill catalog and team gallery on owlbot.dev | The Catalogue, read from this repository on GitHub, or a mirror of the two lists named with `OWLBOT_SKILLS_URL` and `OWLBOT_TEAMS_URL` |
+
+Update checks go to GitHub, not owlbot.dev; `OWLBOT_SERVER_UPDATES=off`
+keeps them from installing anything.
+
+### When OwlBot Cloud cannot be reached
+
+With OwlBot Cloud on, it is a road between your devices and the server,
+nothing more. If the relay cannot be reached, the line keeps trying in
+the background, `owlbot-server status` says it is not connected, and
+agents, routines, watchers and everything reached your own way carry on.
+A test holds this: a server whose relay is unreachable runs an agent's
+task to the end, with OwlBot Cloud on and with it off.
+
+### Your own models
+
+`OWLBOT_MODEL_URL` lists an OpenAI-compatible server as an engine with no
+Settings screen to visit, which is what a container wants:
+
+```sh
+OWLBOT_MODEL_URL=http://127.0.0.1:8000/v1
+OWLBOT_MODEL_NAME=Qwen
+OWLBOT_MODEL_TOOLS=1
+```
+
+Its key, `OWLBOT_MODEL_KEY`, stays in the environment and goes only to
+that server; leave it empty for one that takes none. More servers, and
+keys to rotate, are in Settings, Engines, Your endpoints. Ollama is found
+on its own (`OLLAMA_HOST` when it is not on this machine). Claude Code
+reads `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_MODEL`
+from the environment OwlBot runs in, for a gateway that speaks
+Anthropic's API in front of your own model.
+
+## Signing in from a browser, with your own identity provider
+
+OwlBot Cloud is one way in. The other is the one self-hosted apps
+usually offer: a page at an address of your own (behind the reverse
+proxy you already run) that everybody signs in to with the account they
+already have in Authentik, Keycloak, Authelia, Google or any other
+OpenID Connect provider. OwlBot calls it the web door. It is off until
+you set `OWLBOT_WEB_URL`, and it needs a provider: there is no password
+of OwlBot's own to sign in with.
+
+It is a listener of its own, apart from the loopback port, and nothing
+that comes through it is treated as the computer itself: an agent's
+credential and the terminal are never reachable there, and nobody
+signed out pairs through it, whatever your proxy sends. A signed in browser holds one session
+cookie (HttpOnly, SameSite=Strict, Secure on https), and that cookie is
+all it has.
+
+| Variable | What it does |
+| --- | --- |
+| `OWLBOT_WEB_URL` | The address browsers open, like `https://owlbot.example.com`. https, nothing after the host. Turns the web door on. |
+| `OWLBOT_WEB_LISTEN` | Where the web door listens. Defaults to `127.0.0.1:8790`. In a container, `0.0.0.0:8790`, with only your proxy able to reach that port. |
+| `OWLBOT_OIDC_ISSUER` | The provider's issuer URL. Its discovery document (`/.well-known/openid-configuration`) is read from there. |
+| `OWLBOT_OIDC_CLIENT_ID` | The client ID you made at the provider. |
+| `OWLBOT_OIDC_CLIENT_SECRET` | Its client secret. Keep it in the environment, never in a file the workspace backs up. |
+| `OWLBOT_OIDC_REDIRECT_URL` | Defaults to `OWLBOT_WEB_URL` plus `/auth/callback`, which is the only value it may have. Register that address at the provider. |
+| `OWLBOT_OIDC_OWNER` | Who you are: the value of the person claim (below) for your own account. That identity signs in as the owner. Unset, the owner signs in only from paired devices. |
+| `OWLBOT_OIDC_PERSON_CLAIM` | The claim that says who somebody is. Defaults to `sub`, which never changes; `email` works when the provider verifies addresses. One identity is one person in OwlBot. |
+| `OWLBOT_OIDC_ALLOWED_GROUPS` | Comma separated. Only people in one of these groups may sign in (you excepted). |
+| `OWLBOT_OIDC_ALLOWED_EMAILS` | Comma separated addresses, or domains written `@example.com`. Either list lets somebody in. With neither, whoever the provider lets through may sign in, which is the provider's own rule for the application. |
+| `OWLBOT_OIDC_GROUPS_CLAIM` | Where the groups are. Defaults to `groups`. |
+| `OWLBOT_OIDC_AUTO_CREATE=1` | Somebody allowed who signs in for the first time becomes a member, without an invite. Needs one of the allow lists. |
+| `OWLBOT_OIDC_ADMIN_GROUP` | Members in this group are admins, and members who are not in it are members, as of each sign in. Unset, roles are set on the Members page. |
+| `OWLBOT_OIDC_SCOPES` | Defaults to `openid profile email`, plus `groups` once a group setting is used. |
+| `OWLBOT_OIDC_NAME` | What the button says: "Sign in with Authentik". Defaults to "single sign-on". |
+
+How people get in:
+
+- **You** sign in as the owner when your identity is `OWLBOT_OIDC_OWNER`,
+  and get what one of your paired devices gets, apart from the
+  terminal. Settings, General says who you are signed in as, with Sign
+  out; Settings, Members is where you manage people; Settings, Phone and
+  devices pairs your phone or the desktop app (below).
+- **Somebody you invite** opens the invite's link (it points at
+  `OWLBOT_WEB_URL/join`), sees who invited them, signs in with the
+  provider, and waits while you compare the same four words on the
+  Members page, as with any invite. The join password, when you set
+  one, is asked for first. No app and no command line.
+- **Anybody in the allowed groups**, when `OWLBOT_OIDC_AUTO_CREATE=1`,
+  is a member from their first sign in, an admin when they are in
+  `OWLBOT_OIDC_ADMIN_GROUP`.
+- **Removing somebody** on the Members page signs their browser out at
+  once; signing in again does not bring them back. Members are part of
+  OwlBot Team, as they are everywhere else.
+
+### Authentik, step by step
+
+1. In the admin interface, **Applications, Providers, Create**, choose
+   **OAuth2/OpenID Provider**.
+   - Name: `OwlBot`. Authorization flow: the default explicit or implicit
+     consent flow.
+   - Client type: **Confidential**. Note the client ID and secret.
+   - Redirect URIs: `https://owlbot.example.com/auth/callback` (strict).
+   - Signing Key: pick a certificate, such as the
+     `authentik Self-signed Certificate`. OwlBot only accepts tokens
+     signed with a published key, never with the client secret.
+   - Advanced protocol settings, Scopes: keep `openid`, `email` and
+     `profile`. Authentik's profile scope carries the groups.
+2. **Applications, Create**: name `OwlBot`, slug `owlbot`, provider
+   `OwlBot`. Launch URL `https://owlbot.example.com`.
+3. Make a group for the family, say `family`, and one for admins,
+   say `owlbot-admins`, and put people in them. You can also bind the
+   application to the `family` group, so Authentik itself turns
+   everybody else away.
+4. Set the environment where OwlBot runs and restart it:
+
+   ```sh
+   OWLBOT_WEB_URL=https://owlbot.example.com
+   OWLBOT_WEB_LISTEN=0.0.0.0:8790
+   OWLBOT_OIDC_NAME=Authentik
+   OWLBOT_OIDC_ISSUER=https://auth.example.com/application/o/owlbot/
+   OWLBOT_OIDC_CLIENT_ID=...
+   OWLBOT_OIDC_CLIENT_SECRET=...
+   OWLBOT_OIDC_OWNER=...           # your user's sub, see below
+   OWLBOT_OIDC_ALLOWED_GROUPS=family
+   OWLBOT_OIDC_ADMIN_GROUP=owlbot-admins
+   OWLBOT_OIDC_AUTO_CREATE=1
+   ```
+
+   The issuer is the provider's **OpenID Configuration Issuer**, shown on
+   its page in Authentik. For `OWLBOT_OIDC_OWNER`, Authentik's `sub` is a
+   hash by default; the simplest is to set the provider's **Subject
+   mode** to "Based on the User's username" or "Based on the User's
+   Email" and use that, or keep the hash and copy it from the server's
+   log after your first sign in.
+5. Point your reverse proxy at port 8790, over https:
+
+   ```caddyfile
+   owlbot.example.com {
+       reverse_proxy owlbot:8790
+   }
+   ```
+
+   Server-sent events carry the replies as they are written, so a proxy
+   that buffers responses (nginx does, by default) needs
+   `proxy_buffering off;` for this location.
+6. Open `https://owlbot.example.com` and sign in. The server's log says
+   why when a sign in is refused (a group, an address, a token that did
+   not check out); the page itself says only what the person can do
+   about it.
+
+### Keycloak
+
+Make a client in your realm: Client authentication on, Standard flow on,
+Valid redirect URIs `https://owlbot.example.com/auth/callback`. Groups are
+not in tokens by default: add a **Group Membership** mapper to the
+client's dedicated scope, with token claim name `groups` and **Full group
+path** off (OwlBot also accepts `/family` for `family`). Then:
+
+```sh
+OWLBOT_OIDC_ISSUER=https://keycloak.example.com/realms/home
+OWLBOT_OIDC_NAME=Keycloak
+```
+
+### Google
+
+In Google Cloud, **APIs and Services, Credentials, Create credentials,
+OAuth client ID**, type Web application, with the redirect URI above.
+Google has no groups and knows every Google account, so name who may
+come in by address:
+
+```sh
+OWLBOT_OIDC_ISSUER=https://accounts.google.com
+OWLBOT_OIDC_NAME=Google
+OWLBOT_OIDC_PERSON_CLAIM=email
+OWLBOT_OIDC_OWNER=you@gmail.com
+OWLBOT_OIDC_ALLOWED_EMAILS=partner@gmail.com,@yourfamily.example
+```
+
+Authelia, Zitadel, Kanidm, Pocket ID and the rest work the same way:
+their issuer, a confidential client with the redirect URI, and, for
+groups, the `groups` scope.
+
+### People and their agents, from the browser
+
+Settings, Members works in the browser as it does in the app: invite
+someone (a link to copy, as a member or an admin), see invitations
+waiting and cancel them, let in somebody who asked, change a role, set
+limits, remove someone. Admins have the same page in their own app,
+apart from the join password and the switches that are yours.
+
+**Members' own agents** lists the agents members made for themselves,
+by name and maker, for you and your admins. Settings on a row opens
+that agent's settings without its conversations; delete one and it goes
+with its conversations: nobody reads them first, and the record says
+who deleted it and whose it was.
+
+**Agent settings, by role.** You change every agent's settings. Your
+admins do too, for every agent but your own solo ones: the agent's menu
+in their app (or Settings on its row under Team agents) opens its name,
+title, instructions, engine and model, reasoning effort, how it asks,
+its own browser and its computer. A member opens the same for the
+agents they made, from the agent's menu, and two things stay with you
+and your admins, each shown off with why: letting it act without asking
+(past Accept edits) and giving it a computer. A member moves an agent
+only to the engines their limits allow. Where an agent works (another
+machine over SSH, or a container) is set on the server itself, since it
+uses that machine's own keys; a browser says so where it would be.
+
+### Pairing from the browser
+
+Settings, Phone and devices, Pair a phone shows the code and QR for the
+iPhone and, under them, the link `owlbot-server pair` prints: paste it
+into the desktop app's Settings, Phone and devices, Your servers, and it
+pairs at the server's own address, with OwlBot Cloud on or off. Only you
+make a pairing code, from the web door or a device of yours; a device
+you pair is one of yours, so an admin's or a member's browser never
+makes one. They come in through an invite, on each device.
+
+### More than one workspace
+
+One server is one workspace: one data folder, one port, one set of
+agents and people. A browser opens the workspace at its address, so
+Settings, Workspace, General in a browser says which one this is and
+how to have another. For a second (one for work beside the family's,
+say), run a second server with a data folder and port of its own: with
+Docker, a second compose project with its own volume and
+`OWLBOT_PORT`, and its own address in front; without, a second systemd
+unit with its own `OWLBOT_DATA_DIR` and `OWLBOT_PORT`. Pair each to the
+desktop app and they sit side by side in its workspace switcher, each
+reached at its own address.
+
+## The OwlBot browser on your server
+
+The browser beside the chat, the one you and your agents share, runs on
+the server when no desktop app runs the workspace: a headless Chrome in
+a profile of the workspace's own, in `browser-session` in its data
+folder. Nothing on the server needs a display or a desktop. Open the
+globe in the chat's header, in the desktop app paired with the server,
+at the web door or on your phone, and type an address: the page shows in
+the panel, laid out at the panel's size, and your clicks, scrolling and
+typing (paste too) reach it. Sign in to a site there and your agents can
+carry on from the page you are on; watch them navigate, click and type
+in the same panel, click the page or press **Take over** to take it
+back, and **Give back** when you are done. A headless Chrome draws no
+dialogs, so a page's alert, confirm, prompt or "leave this page?" shows
+as a bar over the page for you to answer, or goes to the agent driving
+it. Tabs, the pages in them and
+every sign-in stay on the server, so they are all still there from your
+phone, or tomorrow, and agents keep browsing when your Mac is closed.
+Each workspace, each server, has a browser of its own.
+
+It needs Chrome, Chromium, Brave or Edge on the server. On Debian or
+Ubuntu, `sudo apt install chromium` (or Google's own `.deb`) is enough;
+OwlBot finds it where those install, or wherever `OWLBOT_BROWSER` says.
+Without one, the panel says so and agents are told plainly, and nothing
+else changes. Chrome starts the first time the browser is wanted and
+closes again after ten minutes with no tabs open; it uses a few hundred
+megabytes of memory while it runs.
+
+Only you, the owner, see it or use it: it is signed in as you. A
+member's device, an agent's credential, a guest and a website never
+reach its pictures or its controls. Agents use it under the same rules
+as in the desktop app (Settings, Browser): Ask first or Auto, the sites
+they may and never may use, and a card before they type a password or a
+card number or choose a file to upload. Pictures are sent only while a
+panel is open and in view, as the page changes, ten a second at most;
+through OwlBot Cloud fewer, at one pixel to a page pixel, and each one
+sealed for your device like everything else. What you type travels the
+same way, never in an address and never in a log. Settings, Browser
+signs the workspace out of every site by closing the browser and
+emptying its profile. Downloads go to `browser-downloads` in the data
+folder; **Save** in the panel's downloads brings one to the device you
+are using.
+
+In the Docker image, Chrome is not included: add it in an image of your
+own built on this one (`FROM ghcr.io/Azizahmed/owlbot2-server`, then
+`USER root`, `RUN apt-get update && apt-get install -y --no-install-recommends chromium`,
+`USER owlbot`). OwlBot keeps Chrome's sandbox on, so a container whose
+security profile does not let Chrome make one says "Chrome on this
+server would not start" when you open a page, with the reason.
+
+## Voices, calls and meeting notes
+
+Agents speak with any voice key saved in Settings, Voices, or a
+Chatterbox server; the Mac's own voices are there only when the server
+itself is a Mac. Calls and meeting notes record what you say in the app
+or the browser you are using and send it, a stretch at a time, to the
+server, which hands it to whoever hears for the workspace (Settings,
+Voices, Hearing): a Whisper server of your own, ElevenLabs or OpenAI with
+your key. In the desktop app on a Mac, the Mac's own recognizer can hear
+instead. No audio is saved. A browser lets only a secure page use the
+microphone, which owlbot.dev/web, the desktop app and a web door at an
+https address all are.
+
+A Whisper server is reached from the server, so its address is the one
+the server sees: `http://localhost:8000` when it runs beside OwlBot on the
+same machine, the service's name (`http://whisper:8000`) in the same
+Compose project, or `http://host.docker.internal:8000` for one on the
+container's host. Any server that answers OpenAI's
+`/v1/audio/transcriptions` works, such as faster-whisper, whisper.cpp,
+LocalAI or Speaches. It has to be on the server's own machine or
+network.
+
+## A systemd service
+
+Keep the release files owned by root, run OwlBot as an account of its
+own with no sudo, and let systemd start it at boot and again after a
+crash.
+
+```sh
+# once, as root
+useradd --system --create-home --home-dir /var/lib/owlbot --shell /usr/sbin/nologin owlbot
+mkdir -p /opt/owlbot-server
+curl -LO https://github.com/Azizahmed/owlbot2/releases/download/vX.Y.Z/owlbot-server-X.Y.Z.tar.gz
+curl -LO https://github.com/Azizahmed/owlbot2/releases/download/vX.Y.Z/owlbot-server-X.Y.Z.tar.gz.sha256
+sha256sum -c owlbot-server-X.Y.Z.tar.gz.sha256
+tar -xzf owlbot-server-X.Y.Z.tar.gz --strip-components=1 -C /opt/owlbot-server
+# the one folder the owlbot account may write, for updates from the app
+install -d -o owlbot -g owlbot -m 0755 /opt/owlbot-server/versions
+```
+
+`/etc/systemd/system/owlbot.service`:
+
+```ini
+[Unit]
+Description=OwlBot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=owlbot
+Group=owlbot
+Environment=OWLBOT_DATA_DIR=/var/lib/owlbot/.owlbot
+# your own paired devices may open terminals here
+Environment=OWLBOT_OWNER_TERMINAL=1
+# reached your own way, behind a proxy on this machine, with nothing
+# sent to OwlBot Cloud (see Reached your own way)
+#Environment=OWLBOT_PUBLIC_URL=https://owlbot.example.com
+#Environment=OWLBOT_CLOUD=off
+ExecStart=/usr/bin/node /opt/owlbot-server/bin/owlbot-server.mjs
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+systemctl daemon-reload
+systemctl enable --now owlbot
+# with OwlBot Cloud; skip this one when it is reached your own way
+sudo -u owlbot OWLBOT_DATA_DIR=/var/lib/owlbot/.owlbot node /opt/owlbot-server/bin/owlbot-server.mjs activate owlbot_live_...
+sudo -u owlbot OWLBOT_DATA_DIR=/var/lib/owlbot/.owlbot node /opt/owlbot-server/bin/owlbot-server.mjs pair
+```
+
+Open the printed link on the device to pair. In the desktop app, paste
+it in Settings, Phone and devices, Your servers (or Add a server in the
+workspace switcher): each server you pair is a workspace of its own in
+the switcher, beside the others, and you can turn off Run workspaces on
+this computer to keep the app a window onto your servers alone. Engines (Claude Code,
+Codex and the rest) are installed and signed in as the `owlbot` account,
+which the terminal from your own devices is the easiest way to do.
+systemd starts OwlBot with a short PATH of its own, and OwlBot adds the
+usual install folders that exist under the account's home (npm and pnpm
+prefixes, nvm, volta, cargo, Bun, Go, the mise, asdf and pyenv shims,
+Homebrew on Linux). A CLI or MCP server anywhere else needs its full
+path, or an `Environment=PATH=...` line in the unit.
+
+## Updates from the app
+
+On the server above, Settings, About on any of your own devices (or
+`owlbot-server update` on the server) checks GitHub for a newer release,
+shows its notes, and installs it when you press Install. No root, no
+sudo and no shell on the server are needed for it:
+
+1. The release's server tarball is downloaded into `versions/`, kept
+   only if it matches the checksum the release publishes (and GitHub's
+   own record of the file), and unpacked beside the version that runs.
+2. Running replies finish first (the same drain as `owlbot-server
+   drain`); you can call the update off until then.
+3. `versions/current` is pointed at the new version, a note of what it
+   came from is left beside it, and OwlBot stops with exit code 75.
+4. systemd starts it again (`Restart=always`). The launcher in
+   `/opt/owlbot-server` hands over to the new version, which has two
+   minutes to come up and stay up as itself.
+5. The app reconnects and says the version now running. If the new
+   version falls over while starting, or does not come up in time, the
+   next start switches back and systemd runs the version before; the app
+   says what happened, and `journalctl -u owlbot` has the reason.
+
+Your workspace, keys, settings and paired devices are in the data
+folder, which an update never touches, and the environment in the unit
+file (`OWLBOT_OWNER_TERMINAL` included) is the same after it.
+
+About says what is missing when the server can't update itself here:
+
+- **The release in `/opt/owlbot-server` is older than 3.2.0.** Update it
+  by hand once (the steps About shows); from then on it updates from the
+  app. The launcher there is the one that goes back if a new version
+  does not start, so it has to know how.
+- **The `owlbot` account can't write `versions/`.** Run the `install -d`
+  line above. With `ProtectSystem=strict`, add
+  `ReadWritePaths=/opt/owlbot-server/versions` and your data folder.
+- **The unit doesn't restart it.** Set `Restart=always`.
+
+`OWLBOT_SERVER_UPDATES=off` keeps the checks and turns installing off.
+OwlBot only ever runs code from `versions/` when that folder belongs to
+the account OwlBot runs as or to root, and not every account may write
+it (run as root, it has to be root's alone).
+
+## Coming from `OWLBOT_HOSTED=1`
+
+Before 3.2, `OWLBOT_HOSTED=1` was the only way to open a server's
+terminal to its owner's devices, so some servers of people's own set it.
+It also told OwlBot a provider manages the machine, which hid update
+checks, refused location, and swapped the Cloud box and Local VM for a
+"This machine" choice.
+
+On a server of your own, replace it:
+
+```diff
+-Environment=OWLBOT_HOSTED=1
++Environment=OWLBOT_OWNER_TERMINAL=1
+```
+
+and restart. Your workspace, keys, settings and paired devices stay as
+they are; the terminal from your own devices keeps working; Settings
+says Self-hosted; and updates and location come back. For updates from
+the app under systemd, see the section above. An agent whose
+computer was "This machine" has no screen until you pick another, and
+its shell, files and browser work as before.
+
+`OWLBOT_HOSTED=1` keeps its meaning for managed hosting machines, where
+nothing changes.

@@ -1,0 +1,394 @@
+// Watching an agent's desktop without leaving the conversation.
+//
+// The viewer takes the screen; the chat rides wherever you put it. Dock
+// it to either side or the bottom and drag its inner edge to taste, or
+// float it and move it like a window, with a corner handle to resize.
+// The close button never leaves the top corner, and Escape always works.
+// Where the viewer's live socket cannot reach (a window carried by OwlBot
+// Cloud), the desktop is watched as the frames it is sent instead.
+// The arrangement is remembered, because a layout you fixed once should
+// stay fixed.
+import { useSettingsObservation } from "@/lib/useSettingsObservation";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ExternalLink } from "@/components/icons";
+import { GripHorizontal } from "@/components/icons";
+import { Loader2 } from "@/components/icons";
+import { PanelBottom } from "@/components/icons";
+import { PanelLeft } from "@/components/icons";
+import { PanelRight } from "@/components/icons";
+import { PictureInPicture2 } from "@/components/icons";
+import { X } from "@/components/icons";
+import { api, useStore, type Bot } from "@/state/store";
+import { AgentAvatar } from "./Avatar";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/cn";
+import { platformOf } from "@/lib/shortcuts";
+import { t } from "@/lib/i18n";
+
+// room for the traffic lights, which sit over this header on a Mac
+const isElectron = navigator.userAgent.includes("Electron");
+
+type Dock = "left" | "right" | "bottom" | "float";
+
+interface ChatLayout {
+  dock: Dock;
+  /** Side-dock width, bottom-dock height, and the float's box. */
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+}
+
+const LAYOUT_KEY = "owlbot-desktop-chat";
+const LIMITS = {
+  width: [260, 560],
+  height: [180, 480],
+  floatW: [280, 640],
+  floatH: [300, 700],
+} as const;
+
+const clampTo = (value: number, [min, max]: readonly [number, number]) =>
+  Math.max(min, Math.min(max, value));
+
+function loadLayout(): ChatLayout {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? "");
+    if (saved && ["left", "right", "bottom", "float"].includes(saved.dock)) {
+      return {
+        dock: saved.dock,
+        width: clampTo(Number(saved.width) || 340, LIMITS.width),
+        height: clampTo(Number(saved.height) || 260, LIMITS.height),
+        // a float parked on last week's monitor must land inside this one
+        x: Math.max(8, Math.min(window.innerWidth - 140, Number(saved.x) || 80)),
+        y: Math.max(52, Math.min(window.innerHeight - 80, Number(saved.y) || 80)),
+      };
+    }
+  } catch {}
+  return { dock: "right", width: 340, height: 260, x: 80, y: 80 };
+}
+
+function SideChat({ bot }: { bot: Bot }) {
+  const { state } = useStore();
+  const live = state.bots.find((b) => b.id === bot.id) ?? bot;
+  const [draft, setDraft] = useState("");
+  const endRef = useRef<HTMLDivElement>(null);
+
+  const messages = live.messages.filter((m) => m.kind === "text" && m.text);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ block: "end" });
+  }, [messages.length, live.busy]);
+
+  const send = () => {
+    const text = draft.trim();
+    if (!text) return;
+    setDraft("");
+    void api(`/api/bots/${bot.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    }).catch(() => {});
+  };
+
+  return (
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
+        <div className="flex flex-col gap-2">
+          {messages.slice(-40).map((m) => (
+            <div
+              key={m.id}
+              className={cn(
+                "max-w-[85%] rounded-2xl px-3 py-1.5 text-body leading-relaxed",
+                m.role === "user"
+                  ? "self-end bg-primary text-primary-foreground"
+                  : "self-start bg-muted text-foreground",
+              )}
+            >
+              {m.text}
+            </div>
+          ))}
+          {live.busy && (
+            <div className="self-start px-1 text-small text-muted-foreground">{t("desktopOverlay.working")}</div>
+          )}
+          <div ref={endRef} />
+        </div>
+      </div>
+      <div className="shrink-0 border-t p-2.5">
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && send()}
+          placeholder={t("desktopOverlay.messageAgent", { name: bot.name })}
+          className="w-full rounded-xl border border-input bg-transparent px-3 py-2 text-body text-foreground outline-none transition-colors placeholder:text-muted-foreground focus:border-ring/60"
+        />
+      </div>
+    </div>
+  );
+}
+
+export function DesktopOverlay({
+  bot,
+  url,
+  frame,
+  onClose,
+}: {
+  bot: Bot;
+  /** The live viewer, framed; without one, `frame` is shown instead. */
+  url?: string;
+  frame?: string | null;
+  onClose: () => void;
+}) {
+  const [layout, setLayout] = useState<ChatLayout>(loadLayout);
+  useSettingsObservation({
+    "desktop.dock": { status: "observed", value: layout.dock },
+    "desktop.width": { status: "observed", value: layout.width },
+    "desktop.height": { status: "observed", value: layout.height },
+    "desktop.x": { status: "observed", value: layout.x },
+    "desktop.y": { status: "observed", value: layout.y },
+  });
+  // pointer capture over an iframe dies the moment the cursor crosses
+  // it; a shield div during any drag keeps the events coming
+  const [dragging, setDragging] = useState(false);
+
+  useEffect(() => {
+    // settle-debounced: a drag emits dozens of layouts a second, and
+    // none of the intermediate ones is worth a synchronous disk write
+    const timer = setTimeout(() => localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout)), 250);
+    return () => clearTimeout(timer);
+  }, [layout]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    // a shrinking window pulls the float back inside it
+    const onResize = () =>
+      setLayout((cur) =>
+        cur.dock === "float"
+          ? {
+              ...cur,
+              x: Math.max(8, Math.min(window.innerWidth - 140, cur.x)),
+              y: Math.max(52, Math.min(window.innerHeight - 80, cur.y)),
+            }
+          : cur,
+      );
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("resize", onResize);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", onResize);
+    };
+  }, [onClose]);
+
+  const trackPointer = useCallback(
+    (onMove: (e: PointerEvent) => void) => {
+      setDragging(true);
+      const onUp = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onUp);
+        setDragging(false);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onUp);
+    },
+    [],
+  );
+
+  /** Dragging the divider between viewer and chat resizes the dock. */
+  const beginEdgeResize = (e: React.PointerEvent) => {
+    e.preventDefault();
+    const start = { x: e.clientX, y: e.clientY, w: layout.width, h: layout.height };
+    trackPointer((ev) => {
+      setLayout((cur) => {
+        if (cur.dock === "right")
+          return { ...cur, width: clampTo(start.w + (start.x - ev.clientX), LIMITS.width) };
+        if (cur.dock === "left")
+          return { ...cur, width: clampTo(start.w + (ev.clientX - start.x), LIMITS.width) };
+        return { ...cur, height: clampTo(start.h + (start.y - ev.clientY), LIMITS.height) };
+      });
+    });
+  };
+
+  /** Dragging the grip moves the float; from a dock it tears it off. */
+  const beginMove = (e: React.PointerEvent) => {
+    e.preventDefault();
+    const offset = { x: e.clientX - layout.x, y: e.clientY - layout.y };
+    if (layout.dock !== "float") {
+      setLayout((cur) => ({
+        ...cur,
+        dock: "float",
+        x: e.clientX - 140,
+        y: e.clientY - 16,
+      }));
+      offset.x = 140;
+      offset.y = 16;
+    }
+    trackPointer((ev) => {
+      setLayout((cur) => ({
+        ...cur,
+        x: Math.max(8, Math.min(window.innerWidth - 120, ev.clientX - offset.x)),
+        y: Math.max(52, Math.min(window.innerHeight - 60, ev.clientY - offset.y)),
+      }));
+    });
+  };
+
+  const beginCornerResize = (e: React.PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const start = { x: e.clientX, y: e.clientY, w: layout.width, h: layout.height };
+    trackPointer((ev) => {
+      setLayout((cur) => ({
+        ...cur,
+        width: clampTo(start.w + (ev.clientX - start.x), LIMITS.floatW),
+        height: clampTo(start.h + (ev.clientY - start.y), LIMITS.floatH),
+      }));
+    });
+  };
+
+  const dockButtons = (
+    <div className="flex items-center gap-0.5">
+      {(
+        [
+          ["left", PanelLeft, t("desktopOverlay.dock.left")],
+          ["bottom", PanelBottom, t("desktopOverlay.dock.bottom")],
+          ["right", PanelRight, t("desktopOverlay.dock.right")],
+          ["float", PictureInPicture2, t("desktopOverlay.dock.float")],
+        ] as const
+      ).map(([dock, Icon, label]) => (
+        <button
+          key={dock}
+          onClick={() => setLayout((cur) => ({ ...cur, dock }))}
+          title={label}
+          className={cn(
+            "rounded-md p-1 transition-colors",
+            layout.dock === dock
+              ? "bg-accent text-foreground"
+              : "text-muted-foreground/60 hover:text-foreground",
+          )}
+        >
+          <Icon size={13} />
+        </button>
+      ))}
+    </div>
+  );
+
+  const chatCard = (
+    <div
+      className={cn(
+        "flex min-h-0 min-w-0 flex-col bg-background",
+        layout.dock === "float" &&
+          "fixed z-[70] overflow-hidden rounded-2xl border shadow-2xl shadow-(color:--shadow-color)",
+      )}
+      style={
+        layout.dock === "float"
+          ? { left: layout.x, top: layout.y, width: layout.width, height: layout.height }
+          : layout.dock === "bottom"
+            ? { height: layout.height }
+            : { width: layout.width }
+      }
+    >
+      {/* the chat's own header: grip to move, docks to place */}
+      <div
+        onPointerDown={beginMove}
+        className="flex shrink-0 cursor-grab select-none items-center justify-between border-b px-2 py-1 active:cursor-grabbing"
+      >
+        <div className="flex items-center gap-1.5 pl-1">
+          <GripHorizontal size={13} className="text-muted-foreground/50" />
+          <span className="text-small font-medium text-muted-foreground">{t("desktopOverlay.chat")}</span>
+        </div>
+        <div onPointerDown={(e) => e.stopPropagation()}>{dockButtons}</div>
+      </div>
+      <SideChat bot={bot} />
+      {layout.dock === "float" && (
+        <div
+          onPointerDown={beginCornerResize}
+          className="absolute bottom-0 right-0 size-4 cursor-nwse-resize"
+          title={t("desktopOverlay.resize")}
+        >
+          <div className="absolute bottom-1 right-1 size-2 rounded-sm border-b-2 border-r-2 border-muted-foreground/40" />
+        </div>
+      )}
+    </div>
+  );
+
+  const divider = (
+    <div
+      onPointerDown={beginEdgeResize}
+      className={cn(
+        "shrink-0 bg-border transition-colors hover:bg-ring/50",
+        layout.dock === "bottom" ? "h-1 w-full cursor-row-resize" : "w-1 cursor-col-resize",
+      )}
+    />
+  );
+
+  const viewer = url ? (
+    <iframe
+      src={url}
+      title={t("desktopOverlay.agentDesktop", { name: bot.name })}
+      className={cn("min-h-0 w-full flex-1 border-0 bg-black", dragging && "pointer-events-none")}
+      allow="clipboard-read; clipboard-write"
+    />
+  ) : (
+    <div className="flex min-h-0 w-full flex-1 flex-col bg-black">
+      <div className="flex min-h-0 flex-1 items-center justify-center">
+        {frame ? (
+          <img
+            src={frame}
+            alt={t("desktopOverlay.agentDesktop", { name: bot.name })}
+            className="max-h-full max-w-full select-none object-contain"
+            draggable={false}
+          />
+        ) : (
+          <Loader2 size={18} className="animate-spin text-white/60" />
+        )}
+      </div>
+      <div className="shrink-0 px-3 py-1.5 text-center text-caption text-white/70">{t("desktopOverlay.framesOnly")}</div>
+    </div>
+  );
+
+  return (
+    // The window's drag strips under this overlay still take clicks in
+    // the desktop app, whatever covers them: everything here opts out,
+    // and this header is the drag strip instead, its buttons clickable.
+    <div className="fixed inset-0 z-[60] flex animate-fade-in flex-col bg-background [-webkit-app-region:no-drag]">
+      <div className="titlebar-drag flex h-[48px] shrink-0 items-center justify-between border-b px-3">
+        <div className={cn("flex items-center gap-2", isElectron && platformOf() === "mac" && "pl-[66px]")}>
+          <AgentAvatar bot={bot} size={26} />
+          <span className="text-ui font-semibold text-foreground">
+            {t("desktopOverlay.agentDesktop", { name: bot.name })}
+          </span>
+        </div>
+        <div className="flex items-center gap-1">
+          {url && (
+            <a href={url} target="_blank" rel="noreferrer" title={t("desktopOverlay.openInBrowser")}>
+              <Button variant="ghost" size="icon-sm" aria-label={t("desktopOverlay.openInBrowser")}>
+                <ExternalLink size={15} />
+              </Button>
+            </a>
+          )}
+          <Button variant="secondary" size="icon-sm" aria-label={t("desktopOverlay.closeDesktopView")} onClick={onClose}>
+            <X size={16} />
+          </Button>
+        </div>
+      </div>
+
+      {layout.dock === "float" ? (
+        <>
+          <div className="flex min-h-0 flex-1 flex-col">{viewer}</div>
+          {chatCard}
+        </>
+      ) : layout.dock === "bottom" ? (
+        <div className="flex min-h-0 flex-1 flex-col">
+          {viewer}
+          {divider}
+          {chatCard}
+        </div>
+      ) : (
+        <div className={cn("flex min-h-0 flex-1", layout.dock === "left" && "flex-row-reverse")}>
+          {viewer}
+          {divider}
+          {chatCard}
+        </div>
+      )}
+    </div>
+  );
+}

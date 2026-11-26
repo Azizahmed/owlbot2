@@ -1,0 +1,49 @@
+// Hand-written twin of fake-cdp-browser.mjs, for the tests that hold it.
+import type { CdpLine } from "../../server/server-browser.ts";
+
+export interface FakePageDef {
+  title: string;
+  text?: string;
+  elements: Array<{ backendNodeId: number; role: string; name: string; nodeName?: string; attributes?: Record<string, string> }>;
+}
+
+export interface FakeTarget {
+  targetId: string;
+  url: string;
+  title: string;
+  openerId?: string;
+  sessions: Set<string>;
+  fetch: unknown[] | null;
+  viewport: { width: number; height: number; scale: number } | null;
+  userAgent: string | null;
+  cast: Record<string, unknown> | null;
+  frames: number;
+  input: Array<Record<string, unknown> & { method: string }>;
+  waiting: boolean;
+  /** Every dialog answered on it, in order. */
+  answers: Array<{ type: string; accept: boolean; promptText?: string }>;
+  dialog: { type: string } | null;
+}
+
+export interface FakeBrowser {
+  calls: Array<{ method: string; params: Record<string, unknown>; sessionId?: string }>;
+  targets: Map<string, FakeTarget>;
+  /** Extensions loaded over the line: id to folder. */
+  loaded: Map<string, string>;
+  extensionOpens(url: string): FakeTarget;
+  worker(url: string, type?: string): { targetId: string; url: string; type: string; waiting: boolean; detachedWaiting: boolean | null };
+  extensionMoves(targetId: string, url: string): void;
+  readonly downloadPath: string;
+  line: CdpLine;
+  open(url: string): FakeTarget;
+  popup(openerId: string, url: string): FakeTarget;
+  follow(targetId: string, url: string): Promise<{ frameId: string; errorText?: string } | null>;
+  repaint(targetId: string): void;
+  arm(targetId: string, dialog: { type: "alert" | "confirm" | "prompt"; message?: string; defaultPrompt?: string }): void;
+  askBeforeLeaving(targetId: string): void;
+  download(guid: string, name: string, body?: string): void;
+  close(): void;
+  readonly closed: boolean;
+}
+
+export function fakeBrowser(options?: { pages?: Record<string, FakePageDef>; userAgent?: string; extensions?: boolean }): FakeBrowser;

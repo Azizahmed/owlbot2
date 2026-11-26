@@ -1,0 +1,279 @@
+// Routine scheduling.
+//
+// A routine spends the user's tokens with nobody watching, so the
+// interesting assertions here are all about NOT running: not twice for one
+// slot, not for a slot that has already been served, not hours late, and
+// not at all when it is switched off.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  describe,
+  GRACE_MS,
+  isDue,
+  lastScheduledBefore,
+  nextScheduledAfter,
+  MAX_ROUTINE_PROMPT,
+  normalize,
+  parseTime,
+  promptTooLong,
+  type Routine,
+} from "../server/routines.ts";
+
+const routine = (over: Partial<Routine> = {}): Routine => ({
+  id: "r1",
+  targetId: "bot1",
+  targetKind: "agent",
+  prompt: "Brief me",
+  time: "09:00",
+  days: [],
+  enabled: true,
+  createdAt: 0,
+  ...over,
+});
+
+/** A local-time Date, so the tests read in the same clock the scheduler uses. */
+const at = (iso: string) => new Date(iso);
+
+test("a time is only a time when it is one", () => {
+  assert.equal(parseTime("09:00"), 540);
+  assert.equal(parseTime("9:05"), 545);
+  assert.equal(parseTime("23:59"), 1439);
+  for (const bad of ["24:00", "09:60", "0900", "9", "", "nine", null, 900]) {
+    assert.equal(parseTime(bad), null, `${JSON.stringify(bad)} is not a time`);
+  }
+});
+
+test("a daily routine's last slot is today once the time has passed", () => {
+  const now = at("2026-03-17T10:00:00");
+  const slot = lastScheduledBefore(routine(), now);
+  assert.ok(slot);
+  assert.equal(slot.getHours(), 9);
+  assert.equal(slot.getDate(), 17);
+});
+
+test("before its time, a daily routine's last slot is yesterday", () => {
+  // Not today's: today's has not happened yet, and treating it as past
+  // would fire the routine every morning before it was due.
+  const now = at("2026-03-17T08:00:00");
+  const slot = lastScheduledBefore(routine(), now);
+  assert.ok(slot);
+  assert.equal(slot.getDate(), 16);
+});
+
+test("day filters are respected in both directions", () => {
+  // 2026-03-17 is a Tuesday.
+  const mondaysOnly = routine({ days: [1] });
+  const tuesday = at("2026-03-17T10:00:00");
+
+  const last = lastScheduledBefore(mondaysOnly, tuesday);
+  assert.ok(last);
+  assert.equal(last.getDay(), 1, "the previous slot is Monday");
+  assert.equal(last.getDate(), 16);
+
+  const next = nextScheduledAfter(mondaysOnly, tuesday);
+  assert.ok(next);
+  assert.equal(next.getDay(), 1, "the next slot is the following Monday");
+  assert.equal(next.getDate(), 23);
+});
+
+test("a due routine fires once, then not again for the same slot", () => {
+  // This is the assertion that matters: the scheduler ticks every thirty
+  // seconds, so without lastRunAt a due routine would fire on every tick.
+  const now = at("2026-03-17T09:00:30");
+  const r = routine();
+  assert.equal(isDue(r, now), true);
+
+  r.lastRunAt = at("2026-03-17T09:00:05").getTime();
+  assert.equal(isDue(r, now), false, "already served this slot");
+
+  // Tomorrow is a different slot and runs again.
+  assert.equal(isDue(r, at("2026-03-18T09:00:10")), true);
+});
+
+test("a run missed by more than the grace window is skipped, not fired late", () => {
+  // The lid was shut all day. A 09:00 brief arriving at 23:40 is not a
+  // brief, it is a surprise, so it waits for tomorrow.
+  const r = routine();
+  const late = at("2026-03-17T23:40:00");
+  assert.equal(isDue(r, late), false);
+
+  // Inside the window it still fires, because a laptop opened at 10:30
+  // should still get its 09:00 brief.
+  const slightlyLate = at("2026-03-17T10:30:00");
+  assert.equal(isDue(r, slightlyLate), true);
+  assert.ok(GRACE_MS > 60 * 60_000, "the window is generous enough to survive a meeting");
+});
+
+test("a disabled routine never fires", () => {
+  assert.equal(isDue(routine({ enabled: false }), at("2026-03-17T09:00:10")), false);
+});
+
+test("a routine on a day it does not run stays quiet", () => {
+  // Weekdays only, asked on a Sunday morning. The previous slot is Friday,
+  // which is long past the grace window.
+  const weekdays = routine({ days: [1, 2, 3, 4, 5] });
+  assert.equal(isDue(weekdays, at("2026-03-22T09:00:10")), false);
+});
+
+test("only a room's routine keeps a topic, and only one that reads as an id", () => {
+  const room = normalize({ targetId: "r1", targetKind: "room", prompt: "Standup", time: "09:00", topicId: "topic-1" });
+  assert.equal(room?.topicId, "topic-1");
+  const agent = normalize({ targetId: "b1", targetKind: "agent", prompt: "hi", time: "09:00", topicId: "topic-1" });
+  assert.equal(agent?.topicId, undefined, "an agent's routine has no topic");
+  const odd = normalize({ targetId: "r1", targetKind: "room", prompt: "hi", time: "09:00", topicId: "../x" });
+  assert.equal(odd?.topicId, undefined);
+});
+
+test("normalize refuses what it cannot store and clamps the rest", () => {
+  assert.equal(normalize(null), null);
+  assert.equal(normalize({ prompt: "hi", time: "09:00" }), null, "no target");
+  assert.equal(normalize({ targetId: "b", time: "09:00" }), null, "no prompt");
+  assert.equal(normalize({ targetId: "b", prompt: "hi", time: "99:99" }), null, "no valid time");
+
+  const clean = normalize({
+    targetId: "  bot1  ",
+    targetKind: "nonsense",
+    prompt: "  Brief me  ",
+    time: "9:05",
+    days: [1, 1, 9, -2, 3, "x"],
+    enabled: false,
+  });
+  assert.ok(clean);
+  assert.equal(clean.targetId, "bot1");
+  assert.equal(clean.targetKind, "agent", "an unknown kind falls back to the safe one");
+  assert.equal(clean.prompt, "Brief me");
+  assert.equal(clean.time, "09:05", "normalised to two digits so clients can compare strings");
+  assert.deepEqual(clean.days, [1, 3], "duplicates and out-of-range days dropped");
+  assert.equal(clean.enabled, false);
+});
+
+test("an over-long prompt is refused, not cut (GitHub 163)", () => {
+  // The cap exists because this text reaches a system prompt on every run.
+  // Cutting it silently meant a routine ran half its instructions.
+  assert.equal(MAX_ROUTINE_PROMPT, 4_000);
+  const fits = normalize({ targetId: "b", prompt: "x".repeat(4_000), time: "09:00" });
+  assert.equal(fits?.prompt.length, 4_000);
+  assert.equal(normalize({ targetId: "b", prompt: "x".repeat(4_001), time: "09:00" }), null);
+  // measured after trimming, as it is stored
+  assert.equal(promptTooLong(`  ${"x".repeat(4_000)}\n`), null);
+  assert.equal(promptTooLong("x".repeat(4_019)), "routine prompt is too long: maximum 4000, received 4019");
+});
+
+test("the schedule reads like something a person would say", () => {
+  assert.equal(describe(routine({ days: [] })), "Every day at 09:00");
+  assert.equal(describe(routine({ days: [1, 2, 3, 4, 5] })), "Weekdays at 09:00");
+  assert.equal(describe(routine({ days: [0, 6] })), "Weekends at 09:00");
+  assert.equal(describe(routine({ days: [3] })), "Every Wednesday at 09:00");
+  assert.equal(describe(routine({ days: [1, 4] })), "Mon, Thu at 09:00");
+});
+
+test("a routine made or retimed after its slot waits for the next one (GitHub 142)", () => {
+  // Made at 19:01 for 18:00: the 18:00 an hour ago was not missed, it was
+  // never this routine's. The grace is for slots the Mac slept through.
+  const made = at("2026-03-17T19:01:00").getTime();
+  const r = routine({ time: "18:00", createdAt: made, scheduledAt: made });
+  assert.equal(isDue(r, at("2026-03-17T19:01:30")), false);
+  assert.equal(isDue(r, at("2026-03-17T20:30:00")), false);
+  assert.equal(isDue(r, at("2026-03-18T18:00:10")), true, "tomorrow's slot runs as usual");
+
+  // a slot after the schedule was set, missed while asleep, still runs late within the grace
+  const set = at("2026-03-17T17:00:00").getTime();
+  assert.equal(isDue(routine({ time: "18:00", scheduledAt: set }), at("2026-03-17T19:30:00")), true);
+
+  // and a routine from before this field existed behaves as it always did
+  assert.equal(isDue(routine({ time: "18:00" }), at("2026-03-17T19:01:30")), true);
+});
+
+test("changing a routine's time, days or date, or switching it back on, restarts its slots", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+  // RoutineStore writes under the real data folder, so it runs in a child with its own HOME
+  const home = mkdtempSync(join(tmpdir(), "owlbot-routine-store-"));
+  try {
+    const script = `
+      import { RoutineStore } from ${JSON.stringify(new URL("../server/routines.ts", import.meta.url).href)};
+      const store = new RoutineStore();
+      const r = store.create({ targetId: "b", targetKind: "agent", prompt: "x", time: "21:00", days: [], enabled: true });
+      const made = r.scheduledAt;
+      await new Promise((ok) => setTimeout(ok, 20));
+      store.patch(r.id, { prompt: "y" });
+      const sameAfterPrompt = store.get(r.id).scheduledAt === made;
+      store.patch(r.id, { time: "18:00" });
+      const movedOnRetime = store.get(r.id).scheduledAt > made;
+      const retimed = store.get(r.id).scheduledAt;
+      await new Promise((ok) => setTimeout(ok, 20));
+      store.patch(r.id, { enabled: false });
+      const sameOnPause = store.get(r.id).scheduledAt === retimed;
+      store.patch(r.id, { enabled: true });
+      const movedOnResume = store.get(r.id).scheduledAt > retimed;
+      console.log(JSON.stringify({ made: typeof made === "number", sameAfterPrompt, movedOnRetime, sameOnPause, movedOnResume }));
+    `;
+    const run = spawnSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: "utf8" });
+    const result = JSON.parse(run.stdout.trim().split("\n").pop() ?? "{}");
+    assert.deepEqual(result, { made: true, sameAfterPrompt: true, movedOnRetime: true, sameOnPause: true, movedOnResume: true }, run.stderr);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("once routines that have run make room at the limit, and nothing else does", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+  // RoutineStore writes under the real data folder, so it runs in a child with its own HOME
+  const home = mkdtempSync(join(tmpdir(), "owlbot-routine-limit-"));
+  try {
+    const script = `
+      import { RoutineStore, MAX_ROUTINES } from ${JSON.stringify(new URL("../server/routines.ts", import.meta.url).href)};
+      const store = new RoutineStore();
+      const once = { targetId: "b", targetKind: "agent", prompt: "x", time: "09:00", days: [], repeat: "once", date: "2030-01-01", enabled: true };
+      const weekly = { targetId: "b", targetKind: "agent", prompt: "x", time: "09:00", days: [], enabled: true };
+      const made = [];
+      for (let i = 0; i < MAX_ROUTINES; i++) {
+        const r = store.create(once);
+        made.push(r.id);
+        store.markRan(r.id, 1_000 + i);
+      }
+      // every one of the fifty has run and is switched off (GitHub 276)
+      const next = store.create(weekly);
+      const afterOne = { made: Boolean(next), count: store.routines.length, oldestGone: !store.get(made[0]), secondKept: Boolean(store.get(made[1])) };
+      // the same from a store read back from disk
+      const reread = new RoutineStore();
+      const again = reread.create(weekly);
+      const afterReload = { made: Boolean(again), count: reread.routines.length, secondGone: !reread.get(made[1]) };
+
+      // what can still run is never dropped: fill the rest with weekly ones
+      while (reread.routines.some((r) => r.repeat === "once")) reread.create(weekly);
+      const full = { count: reread.routines.length, refused: reread.create(weekly) === null, stillFull: reread.routines.length };
+      // a once routine that has not run, one switched off by hand, and one whose run is still open all stay
+      const fresh = new RoutineStore();
+      fresh.routines.length = 0;
+      for (let i = 0; i < MAX_ROUTINES - 3; i++) fresh.create(weekly);
+      const waiting = fresh.create(once);
+      const off = fresh.create({ ...once, enabled: false });
+      const running = fresh.create(once);
+      fresh.markRan(running.id, 5);
+      fresh.beginRun(running.id);
+      const kept = { refused: fresh.create(weekly) === null, all: [waiting, off, running].every((r) => fresh.get(r.id)) };
+      console.log(JSON.stringify({ afterOne, afterReload, full, kept }));
+    `;
+    const run = spawnSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: "utf8" });
+    const result = JSON.parse(run.stdout.trim().split("\n").pop() ?? "{}");
+    assert.deepEqual(
+      result,
+      {
+        afterOne: { made: true, count: 50, oldestGone: true, secondKept: true },
+        afterReload: { made: true, count: 50, secondGone: true },
+        full: { count: 50, refused: true, stillFull: 50 },
+        kept: { refused: true, all: true },
+      },
+      run.stderr,
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});

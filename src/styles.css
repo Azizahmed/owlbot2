@@ -1,0 +1,1162 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ── OwlBot design tokens ──────────────────────────────────────────────
+   Two full palettes flipped by the `.dark` class on <html> (set before
+   first paint by the inline script in index.html, managed by
+   src/lib/theme.tsx). Semantic names follow shadcn/ui so generated
+   components drop in unchanged. */
+
+:root {
+  color-scheme: light;
+
+  --background: #ffffff;
+  --foreground: #18181b;
+
+  --sidebar: #f7f7f8;
+  /* the band browser-style tabs sit on, set off from the page the open
+     tab joins (TaskStrip.tsx) */
+  --tab-strip: #efeff2;
+  --card: #ffffff;
+  --card-foreground: #18181b;
+  --popover: #ffffff;
+  --popover-foreground: #18181b;
+
+  --primary: #18181b;
+  --primary-foreground: #fafafa;
+  --secondary: #f1f1f3;
+  --secondary-foreground: #18181b;
+  --muted: #f4f4f5;
+  /* Just dark enough to clear 4.5:1 on the accent grey it most often
+     sits on, not only on white. */
+  --muted-foreground: #68686f;
+  --accent: #efeff1;
+  --accent-foreground: #18181b;
+
+  --brand: #5b6cff;
+  /* the mark's orange, kept for the one thing that asks to be noticed
+     from the rail: an update waiting for a relaunch */
+  --update: #ff751f;
+  --update-foreground: #ffffff;
+  --brand-foreground: #ffffff;
+  --brand-soft: #eef0ff;
+  /* The same blue, dark enough to be read. Brand colour as a fill is a
+     surface and 4.17 to 1 is fine for one; the moment it becomes words,
+     or carries them, the bar is 4.5 and it misses. So --brand stays on
+     everything that is pure colour, a dot or a bar or a switch track,
+     and the ink takes every fill with something drawn on it and every
+     run of brand coloured text. Dark mode needs no second shade: there
+     the brand already sits at 6.4 to 1 on near black, which is why the
+     two are the same value below. */
+  --brand-ink: #4a59e6;
+
+  /* The brand gradient: the mark's colours in one run, the deep blue at
+     both ends so it can repeat with no seam. Stops only, so a line can
+     run it across (90deg) or down (to bottom). A line of it sits at
+     --brand-line, brighter at --brand-line-strong when it is a handle in
+     use; dark mode lifts both, since the same colours read dimmer on
+     near black. */
+  --brand-gradient: #004aad 0%, #5ce1e6 9%, #cb6ce6 21%, #ff5757 30%, #ff751f 43%, #ffbd59 51%, #7ed957 62%,
+    #5ce1e6 70%, #cb6ce6 83%, #ff5757 91%, #004aad 100%;
+  --brand-line: 0.4;
+  --brand-line-strong: 0.62;
+  /* the gold end of the OwlBot AI mark's sweep, deepened on white so it
+     does not fade into the page (ProviderIcons.tsx) */
+  --owlbot-ai-gold: #ffa834;
+  /* a column's edge at rest: there to be found, not seen */
+  --side-line-rest: 0.22;
+
+  /* Status colours carry meaning, so they have to be readable at 11px
+     and on their own tint, which is where a badge puts them. The lighter
+     versions of these came out at about 3:1 on white and under 3:1 on a
+     15% wash of themselves. Dark mode never had the problem: there the
+     same hues sit on near black. */
+  --destructive: #c0272d;
+  --destructive-foreground: #ffffff;
+  --success: #1f7048;
+  --warning: #8f5a09;
+  /* A conversation that is working. Fixed, unlike --brand, which follows
+     the workspace accent: a green or amber accent would then read as
+     finished (--success) or waiting on you (--warning). The mark's deep
+     blue, the default accent, so a default workspace looks as it did.
+     Dark mode lifts it: the logo blue on near black is about 2 to 1. */
+  --working: #004aad;
+  /* Another person at something in a shared room (the side dock's dot,
+     GitHub 522): violet, which no other state uses, deep enough to read
+     at a dot's size on white. */
+  --teammate: #6d3fd6;
+
+  --border: rgba(18, 18, 21, 0.09);
+  --input: rgba(18, 18, 21, 0.12);
+  /* The focus ring has to be seen, which the fill blue could not be:
+     at the seventy percent the rule below uses it came out at 2.6 to 1
+     against the page, under the 3 to 1 a focus indicator needs. Same
+     value as the ink, for the same reason. */
+  --ring: #4a59e6;
+
+  --shadow-color: rgba(24, 24, 27, 0.08);
+
+  /* A loading shape: a shade off the page and every surface it sits on
+     (white, the card, the sidebar grey), never so dark it reads as
+     content. The shine is the band that crosses it (ui/skeleton.tsx). */
+  --skeleton: #ececef;
+  --skeleton-shine: rgba(255, 255, 255, 0.75);
+
+  /* Chart series, in a fixed order: the brand first, then four hues
+     checked as a set for colour blind separation and for telling apart
+     at a glance. Three of them sit under 3:1 on white, so a chart that
+     uses them labels its values directly (src/components/genui/charts.tsx). */
+  --series-1: #5b6cff;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+}
+
+.dark {
+  color-scheme: dark;
+
+  --background: #0e0e10;
+  --foreground: #ededf0;
+
+  --sidebar: #131316;
+  --tab-strip: #1a1a1f;
+  --card: #17171a;
+  --card-foreground: #ededf0;
+  --popover: #1a1a1e;
+  --popover-foreground: #ededf0;
+
+  --primary: #ededf0;
+  --primary-foreground: #131316;
+  --secondary: #232328;
+  --secondary-foreground: #ededf0;
+  --muted: #1e1e23;
+  --muted-foreground: #8f8f99;
+  --accent: #202025;
+  --accent-foreground: #ededf0;
+
+  --brand: #7c8aff;
+  --brand-ink: #7c8aff;
+  --brand-foreground: #14151f;
+  --brand-soft: rgba(124, 138, 255, 0.14);
+  --brand-line: 0.55;
+  --brand-line-strong: 0.78;
+  --owlbot-ai-gold: #ffbd59;
+  --side-line-rest: 0.3;
+
+  --destructive: #ff6369;
+  --destructive-foreground: #1a0d0e;
+  --success: #3dd68c;
+  --warning: #f5a524;
+  /* the same deep blue, lifted in lightness only until it reads on every
+     dark surface it sits on, the selected row's grey included */
+  --working: #2e86ff;
+  --teammate: #a78bfa;
+
+  --border: rgba(255, 255, 255, 0.09);
+  --input: rgba(255, 255, 255, 0.13);
+  --ring: #7c8aff;
+
+  --shadow-color: rgba(0, 0, 0, 0.45);
+
+  --skeleton: #1f1f24;
+  --skeleton-shine: rgba(255, 255, 255, 0.045);
+
+  /* The same five, stepped for the dark ground and checked again there.
+     The brand comes down a shade: at full brightness it outshines the
+     others and reads as the one that matters. */
+  --series-1: #7282fb;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-sidebar: var(--sidebar);
+  --color-tab-strip: var(--tab-strip);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-brand: var(--brand);
+  --color-update: var(--update);
+  --color-update-foreground: var(--update-foreground);
+  --color-brand-ink: var(--brand-ink);
+  --color-brand-foreground: var(--brand-foreground);
+  --color-brand-soft: var(--brand-soft);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-working: var(--working);
+  --color-teammate: var(--teammate);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* Each stack ends on the color emoji fonts, named. Inter has no emoji,
+     so an emoji in a name (or anywhere else) is drawn by whatever font
+     the system falls back to, and on some systems that fallback lands on
+     a font with an empty glyph for it: the name keeps the emoji's width
+     and shows nothing (GitHub 545). A symbol Inter does have, like the
+     bitcoin sign, never falls back, which is why it showed when the
+     emoji beside it did not. Named here, the emoji comes from the color
+     font on every platform. After the generic families, so a character
+     the text fonts cover is never drawn as an emoji. */
+  --font-sans: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont,
+    "SF Pro Text", "Segoe UI", system-ui, sans-serif, "Apple Color Emoji",
+    "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace,
+    "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+
+  /* The type scale: nine sizes, each with the leading it reads best at.
+     Small text gets room between lines so dense lists still breathe;
+     titles close up, since big type set loose looks like it is falling
+     apart. A `leading-*` beside one of these still wins. */
+  --text-micro: 10px;
+  --text-micro--line-height: 14px;
+  --text-caption: 11px;
+  --text-caption--line-height: 16px;
+  --text-small: 12px;
+  --text-small--line-height: 18px;
+  --text-body: 13px;
+  --text-body--line-height: 20px;
+  --text-ui: 14px;
+  --text-ui--line-height: 22px;
+  --text-lead: 15px;
+  --text-lead--line-height: 24px;
+  --text-title: 17px;
+  --text-title--line-height: 24px;
+  --text-heading: 22px;
+  --text-heading--line-height: 28px;
+  --text-heading--letter-spacing: -0.019em;
+  --text-display: 28px;
+  --text-display--line-height: 34px;
+  --text-display--letter-spacing: -0.022em;
+
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+  --radius-2xl: 18px;
+
+  /* Strong curves, the built-in CSS easings are too weak for UI. */
+  --ease-out-quart: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out-quart: cubic-bezier(0.77, 0, 0.175, 1);
+
+  --animate-panel-in: panel-in 0.22s var(--ease-out-quart);
+  --animate-pop-in: pop-in 0.18s var(--ease-out-quart);
+  --animate-fade-in: fade-in 0.15s ease-out;
+  --animate-rise-in: rise-in 0.2s var(--ease-out-quart);
+  --animate-flip-in: flip-in 0.28s var(--ease-out-quart);
+  --animate-send-in: send-in 0.22s var(--ease-out-quart);
+  --animate-receive-in: receive-in 0.24s var(--ease-out-quart);
+  --animate-pop: pop 0.26s var(--ease-out-quart);
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    letter-spacing: -0.011em;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overflow: hidden;
+  }
+
+  /* Anything that can be pressed shows the pointing hand, so a row, a
+     chip or a tab reads as clickable before it is tried. Disabled ones
+     keep the arrow. A handle with a cursor of its own (a resize edge, a
+     drag grip) sets it as a utility, which wins over this. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="tab"]:not([aria-disabled="true"]),
+  [role="switch"]:not([aria-disabled="true"]),
+  [role="checkbox"]:not([aria-disabled="true"]),
+  [role="radio"]:not([aria-disabled="true"]),
+  [role="menuitem"]:not([aria-disabled="true"]):not([data-disabled]),
+  [role="menuitemradio"]:not([data-disabled]),
+  [role="menuitemcheckbox"]:not([data-disabled]),
+  [role="option"]:not([aria-disabled="true"]):not([data-disabled]),
+  a[href],
+  summary,
+  select,
+  label[for] {
+    cursor: pointer;
+  }
+  button:disabled,
+  [aria-disabled="true"],
+  [data-disabled] {
+    cursor: default;
+  }
+
+  /* One focus ring for the whole app, and only for keyboard users. The
+     app is dense and every surface has its own radius, so this rides on
+     a shadow rather than an outline: it follows the border radius of
+     whatever it lands on instead of drawing a rectangle around it. */
+  :focus {
+    outline: none;
+  }
+  :focus-visible {
+    outline: none;
+    box-shadow:
+      0 0 0 2px var(--background),
+      0 0 0 4px var(--ring);
+    border-radius: inherit;
+  }
+  /* Text fields never take the global ring. A bare field shows focus
+     through its own component border, and a field inside a styled
+     wrapper (the composer pill, the search bar) lets the wrapper's
+     focus-within treatment speak alone. One ring, always the outermost. */
+  input:focus-visible,
+  textarea:focus-visible {
+    box-shadow: none;
+  }
+}
+
+/* The slider's real input sits invisible over the drawn one; its thumb is
+   sized to match, so where you press is exactly where the dot goes
+   (ui/slider.tsx). */
+.slider-input {
+  appearance: none;
+  background: transparent;
+}
+.slider-input::-webkit-slider-thumb {
+  appearance: none;
+  width: 20px;
+  height: 20px;
+}
+.slider-input::-moz-range-thumb {
+  width: 20px;
+  height: 20px;
+  border: 0;
+}
+
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--foreground) 16%, transparent);
+  border-radius: 4px;
+  background-clip: padding-box;
+  border: 1px solid transparent;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--foreground) 26%, transparent);
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--brand) 24%, transparent);
+}
+
+@keyframes panel-in {
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+@keyframes pop-in {
+  from { transform: scale(0.97) translateY(4px); opacity: 0; }
+  to { transform: scale(1) translateY(0); opacity: 1; }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes rise-in {
+  from { transform: translateY(6px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+/* the describe → name field turn; the card rotates in on X so the two
+   states read as one object changing, not two fields swapping */
+@keyframes flip-in {
+  from { transform: rotateX(-38deg) translateY(-6px); opacity: 0; }
+  to { transform: rotateX(0) translateY(0); opacity: 1; }
+}
+/* arriving messages settle from the side they came from, so the motion
+   says who spoke before you've read a word */
+@keyframes send-in {
+  from { transform: translate3d(10px, 8px, 0) scale(0.98); opacity: 0; }
+  to { transform: translate3d(0, 0, 0) scale(1); opacity: 1; }
+}
+@keyframes receive-in {
+  from { transform: translate3d(-8px, 8px, 0) scale(0.98); opacity: 0; }
+  to { transform: translate3d(0, 0, 0) scale(1); opacity: 1; }
+}
+/* a shape landing after a shuffle */
+@keyframes pop {
+  0% { transform: scale(0.86); }
+  60% { transform: scale(1.04); }
+  100% { transform: scale(1); }
+}
+
+/* A loading shape (ui/skeleton.tsx). The band is a pseudo-element moved
+   by transform, so a page full of them costs the compositor and nothing
+   else. It is slow and soft on purpose: a skeleton should sit there, not
+   shout that it is busy. */
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background-color: var(--skeleton);
+}
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, var(--skeleton-shine), transparent);
+  animation: skeleton-shine 1.8s cubic-bezier(0.65, 0, 0.35, 1) infinite;
+}
+@keyframes skeleton-shine {
+  to { transform: translateX(100%); }
+}
+/* Held back a beat before it shows, so a load that answers at once never
+   flashes grey at all. */
+.skeleton-group {
+  animation: fade-in 0.2s ease-out 0.12s both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton::after {
+    animation: none;
+    opacity: 0;
+  }
+}
+
+/* the halo an agent wears while its voice plays, in its own color */
+.call-speaking-ring {
+  animation: call-ring 1.6s ease-in-out infinite;
+}
+@keyframes call-ring {
+  0%, 100% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--ring-tint, var(--brand)) 28%, transparent); }
+  50% { box-shadow: 0 0 0 18px color-mix(in srgb, var(--ring-tint, var(--brand)) 8%, transparent); }
+}
+
+/* ── first-run intro ─────────────────────────────────────────────────
+   One cinematic sequence, run once. Every animation here is transform
+   and opacity only, so the whole film stays on the compositor; the
+   reduced-motion block below flattens all of it to near-instant, and the
+   component itself swaps to plain crossfades in that case. */
+
+/* a block of the mark arriving: flies in from fully outside the frame
+   (--from-x/--from-y set per block in viewport units) and settles with a
+   soft overshoot */
+@keyframes intro-block-in {
+  from {
+    transform: translate(var(--from-x, 0px), var(--from-y, -100vh));
+    opacity: 1;
+  }
+  70% {
+    transform: translate(calc(var(--from-x, 0px) * -0.012), calc(var(--from-y, 0px) * -0.012));
+  }
+  to { transform: translate(0, 0); opacity: 1; }
+}
+.intro-block-in {
+  animation: intro-block-in 650ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  /* off-screen until its animation starts, not parked in the frame */
+  opacity: 0;
+}
+
+.intro-fade-in {
+  animation: intro-fade 400ms ease-out both;
+}
+@keyframes intro-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* content entering a stage: a short rise, staggered per element via
+   animation-delay in the markup */
+.intro-rise {
+  animation: intro-rise 500ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes intro-rise {
+  from { transform: translateY(14px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+/* the loader mascot hovers like it is treading air */
+.intro-hover {
+  animation: intro-hover 2.6s ease-in-out infinite;
+}
+@keyframes intro-hover {
+  0%, 100% { transform: translateY(0) rotate(-1.5deg); }
+  50% { transform: translateY(-9px) rotate(1.5deg); }
+}
+
+/* trailing dots on "Setting up your workspace" */
+.intro-ellipsis::after {
+  content: "";
+  animation: intro-ellipsis 1.4s steps(4) infinite;
+}
+@keyframes intro-ellipsis {
+  0% { content: ""; }
+  25% { content: "."; }
+  50% { content: ".."; }
+  75% { content: "..."; }
+}
+
+/* indeterminate progress: honest about not knowing how long */
+.intro-progress {
+  animation: intro-progress 1.5s ease-in-out infinite;
+}
+@keyframes intro-progress {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(420%); }
+}
+
+.intro-caret {
+  animation: intro-caret 1s steps(1) infinite;
+}
+@keyframes intro-caret {
+  50% { opacity: 0; }
+}
+
+/* the settled mark rattling before it blows: a long build with the
+   amplitude ramping up, so it reads as pressure rising, not a glitch */
+.intro-shake {
+  animation: intro-shake 1620ms linear both;
+}
+@keyframes intro-shake {
+  0% { transform: translate(0, 0) rotate(0); }
+  5% { transform: translate(-1px, 1px) rotate(-0.2deg); }
+  10% { transform: translate(1px, -1px) rotate(0.2deg); }
+  15% { transform: translate(-1px, -1px) rotate(-0.3deg); }
+  20% { transform: translate(1px, 1px) rotate(0.3deg); }
+  25% { transform: translate(-2px, 1px) rotate(-0.4deg); }
+  30% { transform: translate(2px, -1px) rotate(0.4deg); }
+  35% { transform: translate(-2px, -2px) rotate(-0.5deg); }
+  40% { transform: translate(2px, 2px) rotate(0.5deg); }
+  45% { transform: translate(-2px, 2px) rotate(-0.6deg); }
+  50% { transform: translate(3px, -2px) rotate(0.6deg); }
+  55% { transform: translate(-3px, -2px) rotate(-0.7deg); }
+  60% { transform: translate(3px, 2px) rotate(0.8deg); }
+  65% { transform: translate(-3px, 2px) rotate(-0.9deg); }
+  70% { transform: translate(4px, -2px) rotate(0.9deg); }
+  75% { transform: translate(-4px, -3px) rotate(-1deg); }
+  80% { transform: translate(4px, 3px) rotate(1.1deg); }
+  85% { transform: translate(-5px, 3px) rotate(-1.2deg); }
+  90% { transform: translate(5px, -3px) rotate(1.3deg); }
+  95% { transform: translate(-5px, 2px) rotate(-1.2deg); }
+  100% { transform: translate(0, 0) rotate(0); }
+}
+
+/* the agent cursor's click: one expanding ring, then gone */
+.intro-click {
+  animation: intro-click 500ms ease-out both;
+}
+@keyframes intro-click {
+  from { transform: scale(0.3); opacity: 0.9; }
+  to { transform: scale(1.4); opacity: 0; }
+}
+
+/* the glow that sweeps the ring while the five agents take their places:
+   a conic highlight rotating once slowly, then left as a faint halo */
+.intro-sweep {
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    color-mix(in srgb, var(--brand) 55%, transparent) 40deg,
+    transparent 90deg
+  );
+  filter: blur(18px);
+  animation: intro-sweep 2.4s cubic-bezier(0.4, 0, 0.2, 1) both;
+  transition: opacity 400ms ease-out;
+}
+@keyframes intro-sweep {
+  from { transform: rotate(0deg); opacity: 0; }
+  15% { opacity: 1; }
+  85% { opacity: 0.9; }
+  to { transform: rotate(360deg); opacity: 0.18; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* The window's own drag handle.
+ *
+ * With a hidden titlebar the frame gives us no draggable strip: whatever
+ * the app paints across the top IS the titlebar, and a header that does
+ * not say so leaves the window stuck to the desk. Anything a person can
+ * actually click inside that header opts back out, or the button would
+ * start a drag instead of firing. */
+.titlebar-drag {
+  -webkit-app-region: drag;
+}
+.titlebar-drag :is(button, a, input, textarea, select, [role="button"], [role="tab"], [contenteditable]) {
+  -webkit-app-region: no-drag;
+}
+
+/* The terminal.
+ *
+ * xterm lays out its own grid and paints its own scrollbar, and both want
+ * the right-hand gutter. Padding on the element around it is therefore
+ * counted twice on that side and crops the last column, so the breathing
+ * room goes inside the terminal and only on the left.
+ *
+ * The grid is pinned to the top as well. Fitting leaves a partial row of
+ * slack and xterm would otherwise distribute it, which moves every line
+ * by a few pixels each time the drawer is dragged. */
+.term-host .xterm {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  height: 100%;
+  padding: 4px 0 4px 12px;
+}
+.term-host .xterm-screen {
+  flex: 0 0 auto;
+}
+.term-host .xterm-scrollable-element {
+  align-self: stretch;
+  width: 100%;
+}
+/* xterm paints these itself, and its own idea of the background is one
+   frame behind a theme change. */
+.term-host .xterm,
+.term-host .xterm-viewport,
+.term-host .xterm-screen {
+  background-color: var(--card) !important;
+}
+.term-host .xterm-scrollable-element > .scrollbar.vertical > .slider {
+  border-radius: 999px;
+  left: auto !important;
+  right: 3px !important;
+  width: 6px !important;
+}
+
+/* The caret on a reply that is still arriving. It rides the end of the
+   last line rather than sitting on a line of its own under the text,
+   which read as a blank line the reply had not written. */
+.streaming-text > :last-child::after {
+  content: "";
+  display: inline-block;
+  width: 2px;
+  height: 14px;
+  margin-left: 2px;
+  vertical-align: -2px;
+  background: var(--muted-foreground);
+  animation: caret-blink 1s ease-in-out infinite;
+}
+@keyframes caret-blink {
+  50% {
+    opacity: 0.2;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .streaming-text > :last-child::after {
+    animation: none;
+  }
+}
+/* An interface answer has no line of text to ride the end of; it shows
+   itself arriving part by part instead. */
+.streaming-text > [data-genui]:last-child::after {
+  content: none;
+}
+
+/* A browser's open tab: it joins the page below, and where it meets the
+ * band it curves out on each side, a quarter circle cut from a square of
+ * the page's colour (TaskStrip.tsx). */
+.tab-joined::before,
+.tab-joined::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  width: 10px;
+  height: 10px;
+  pointer-events: none;
+}
+.tab-joined::before {
+  left: -10px;
+  background: radial-gradient(circle at 0 0, transparent 9.5px, var(--background) 10px);
+}
+.tab-joined::after {
+  right: -10px;
+  background: radial-gradient(circle at 100% 0, transparent 9.5px, var(--background) 10px);
+}
+
+/* The conversation tab in front (TaskStrip.tsx), outlined in the colours
+ * of the sidebar's edge, quietly: a hairline that comes along the band's
+ * foot from the sidebar, follows the curve where the tab meets the band
+ * (.tab-joined::before), rises up the tab's side, rounds its top corner
+ * and fades out along its top. --reach is how far the tab sits from the
+ * strip's start, so the foot reaches the sidebar from wherever it is.
+ * Like the sidebar's own line, which is faded where it meets the band, it
+ * starts barely there, gathers up the curve and the side, is at its
+ * strongest in the top corner, and fades out along the top.
+ *
+ * The side and top are one ring cut from a box by masks: the fade to the
+ * right, over the ring left between the padding (left and top only) and
+ * the box. It stops a curve's height above the foot, where the arc (a
+ * band of a circle around the curve's own centre) takes over. */
+.tab-outline {
+  --hair: 1px;
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.tab-outline::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 10px calc(-1 * var(--hair));
+  border-radius: 10px 10px 0 0;
+  padding: var(--hair) 0 0 var(--hair);
+  background: linear-gradient(to top, rgb(203 108 230 / 0.18), rgb(92 225 230 / 0.42) 85%);
+  -webkit-mask:
+    linear-gradient(to right, #000 6%, transparent 45%),
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: source-in, xor;
+  mask:
+    linear-gradient(to right, #000 6%, transparent 45%),
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: intersect, exclude;
+}
+.tab-outline::after {
+  content: "";
+  position: absolute;
+  left: -10px;
+  bottom: 0;
+  width: 10px;
+  height: 10px;
+  background: radial-gradient(
+    circle at 0 0,
+    transparent calc(10px - var(--hair) - 0.35px),
+    rgb(203 108 230 / 0.15) calc(10px - var(--hair)),
+    rgb(203 108 230 / 0.15) 10px,
+    transparent 10.35px
+  );
+}
+.tab-outline > span {
+  position: absolute;
+  bottom: 0;
+  left: calc(-1 * var(--reach, 0px));
+  width: max(0px, calc(var(--reach, 0px) - 10px));
+  height: var(--hair);
+  /* nothing where it leaves the sidebar, gathering toward the curve */
+  background: linear-gradient(to right, rgb(203 108 230 / 0), rgb(203 108 230 / 0.12));
+}
+
+/* The edge of a page's column (SideColumn.tsx): the brand gradient as a
+ * hairline running down it, gone at the top and the bottom and strongest
+ * through the middle, with a glow beside it on the page's side so faint it
+ * reads as light more than colour. At rest it is barely there, there to be
+ * found rather than seen; it is the drag handle's whole look, so the line
+ * and its glow come up under the pointer and while it is dragged.
+ *
+ * The box is wider than the line so the blur has room inside the mask,
+ * which would otherwise cut it off at the line's own edges. The colours
+ * drift the way they do along the header line, a tile's length every 70
+ * seconds, but by moving the strip rather than its background, so the
+ * drift costs the compositor and not a repaint every frame. */
+.side-divider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(50% - 12px);
+  width: 36px;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: var(--side-line-rest);
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 35%, #000 65%, transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 35%, #000 65%, transparent);
+  transition: opacity 150ms ease-out;
+}
+.side-divider::before,
+.side-divider::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 11.25px;
+  width: 1.5px;
+  /* two tiles, each twice the visible line, as along the header */
+  height: 400%;
+  background: linear-gradient(to bottom, var(--brand-gradient));
+  background-size: 100% 50%;
+}
+.side-divider::after {
+  /* the line and the 7px beside it, toward the page, blurred */
+  width: 8.5px;
+  filter: blur(6px);
+  /* barely there at rest; the glow comes up with the line in hand */
+  opacity: 0.18;
+  transition: opacity 150ms ease-out;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .side-divider::before,
+  .side-divider::after {
+    animation: side-divider-drift 70s linear infinite;
+  }
+}
+@keyframes side-divider-drift {
+  from { transform: translateY(-50%); }
+  to { transform: translateY(0); }
+}
+.side-edge:hover .side-divider,
+.side-edge[data-dragging] .side-divider {
+  opacity: var(--brand-line-strong);
+}
+.side-edge:hover .side-divider::after,
+.side-edge[data-dragging] .side-divider::after,
+.side-edge:focus-visible .side-divider::after {
+  opacity: 0.45;
+}
+/* the keyboard's own mark: the line at full strength, since the global
+   ring would draw a box the height of the window */
+.side-edge:focus-visible {
+  box-shadow: none;
+}
+.side-edge:focus-visible .side-divider {
+  opacity: 1;
+}
+/* While an edge is in hand the pointer can run ahead of it, over text and
+   buttons; it keeps the resize cursor and selects nothing on the way. */
+:root[data-column-resize],
+:root[data-column-resize] * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+/* ── the trace waterfall (trace/TraceWaterfall.tsx) ──────────────────────
+ *
+ * Every bar, tick, link and the playhead is placed by the same two
+ * numbers, set on the timeline every frame while a turn runs: --ms,
+ * pixels per millisecond, and --now, how far the shared clock has gone.
+ * Each piece carries its own --start and --end (milliseconds from the
+ * first agent's start), and one still running has no --end, so it reaches
+ * --now on its own. Nothing is rendered again to move. An agent's colour
+ * comes in as --c, on its rows. */
+.trace-timeline {
+  --ms: 0;
+  --now: 0;
+  contain: layout paint;
+}
+.trace-bar {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  height: var(--bar-h, 14px);
+  margin-top: calc(var(--bar-h, 14px) / -2);
+  border-radius: 4px;
+  /* a piece of a parent's bar sits a pixel in from each neighbour */
+  transform: translate3d(calc(var(--start) * var(--ms) * 1px + var(--inset, 0px)), 0, 0);
+  width: max(var(--bar-min, 3px), calc((var(--end, var(--now)) - var(--start)) * var(--ms) * 1px - var(--inset, 0px) * 2));
+  container-type: inline-size;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  color: #fff;
+}
+.trace-bar[data-kind="model"],
+.trace-bar[data-kind="retry"] {
+  background-color: var(--c);
+}
+/* tool time: the same colour a shade deeper, so a parent's bar reads as
+   thinking and doing in turn */
+.trace-bar[data-kind="tool"] {
+  background-color: color-mix(in oklab, var(--c) 70%, #000);
+}
+.dark .trace-bar[data-kind="tool"] {
+  background-color: color-mix(in oklab, var(--c) 52%, var(--background));
+}
+.trace-bar[data-kind="agent"] {
+  background-color: color-mix(in oklab, var(--c) 80%, #fff);
+  color: #101013;
+  justify-content: flex-start;
+  padding-left: 3px;
+}
+.trace-bar[data-kind="wait"] {
+  background-color: color-mix(in srgb, var(--foreground) 4%, transparent);
+  background-image: repeating-linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--foreground) 26%, transparent) 0 1px,
+    transparent 1px 5px
+  );
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foreground) 16%, transparent);
+}
+.trace-bar[data-kind="failed"] {
+  background-color: var(--destructive);
+  color: var(--destructive-foreground);
+}
+.trace-bar[data-kind="stopped"] {
+  background-color: color-mix(in oklab, var(--c) 34%, transparent);
+}
+/* a mark inside a bar only where the bar has room for it */
+@container (width < 15px) {
+  .trace-bar > * {
+    display: none;
+  }
+}
+/* the running one: a light at its leading edge, riding now, and a soft
+   sweep along it, which the hatch of a wait shows best */
+.trace-bar[data-live]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, transparent calc(100% - 26px), rgba(255, 255, 255, 0.38)),
+    linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.24), transparent) no-repeat;
+  background-size:
+    100% 100%,
+    56px 100%;
+  animation: trace-sweep 2.2s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+@keyframes trace-sweep {
+  from { background-position: 0 0, -56px 0; }
+  to { background-position: 0 0, calc(100% + 56px) 0; }
+}
+/* a moment, an error or a compaction, on the bar at its time */
+.trace-mark {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 7px;
+  height: 7px;
+  margin: -3.5px 0 0 -3.5px;
+  border-radius: 2px;
+  transform: translate3d(calc(var(--start) * var(--ms) * 1px), 0, 0) rotate(45deg);
+  background: color-mix(in srgb, var(--foreground) 45%, transparent);
+  box-shadow: 0 0 0 1.5px var(--trace-ground, var(--background));
+}
+.trace-mark[data-kind="error"] {
+  background: var(--destructive);
+}
+/* what follows a bar: how long, what it cost, and perhaps the pill */
+.trace-note {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  transform: translate3d(calc(var(--end, var(--now)) * var(--ms) * 1px + 6px), 0, 0);
+}
+/* a hand-off: down from the parent's bar into the sub-agent's own row */
+.trace-link {
+  position: absolute;
+  left: 0;
+  width: 7px;
+  border-left: 1.5px solid color-mix(in srgb, var(--c) 75%, transparent);
+  border-bottom: 1.5px solid color-mix(in srgb, var(--c) 75%, transparent);
+  border-bottom-left-radius: 6px;
+  transform: translate3d(calc(var(--start) * var(--ms) * 1px - 7px), 0, 0);
+  pointer-events: none;
+}
+.trace-link::before {
+  content: "";
+  position: absolute;
+  top: -3px;
+  left: -3.75px;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--c);
+  box-shadow: 0 0 0 1.5px var(--trace-ground, var(--background));
+}
+.trace-grid {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 1px;
+  background: var(--border);
+  transform: translate3d(calc(var(--at) * var(--ms) * 1px), 0, 0);
+  transition: opacity 240ms ease-out;
+}
+/* What an agent said before asking, on its question's card, fades out
+ * under its third line while there is more to open (OptionCard.tsx),
+ * rather than stopping mid sentence as if that were all of it. */
+.ask-said-fade {
+  -webkit-mask-image: linear-gradient(to bottom, #000 55%, transparent);
+  mask-image: linear-gradient(to bottom, #000 55%, transparent);
+}
+/* A sidebar heading pinned while its rows scroll under it (Sidebar.tsx).
+ * It wears the sidebar's own surface, tinted as its section is while a
+ * row is dragged onto it (--pin-tint), and while it is pinned the same
+ * surface carries on below it under a mask, so rows go soft as they pass
+ * under it instead of being cut at an edge. No transition: it is where
+ * the list is, not something that happens. */
+.sidebar-pin {
+  background: linear-gradient(var(--pin-tint, transparent), var(--pin-tint, transparent)), var(--sidebar);
+}
+.sidebar-pin::after {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  top: 100%;
+  height: 14px;
+  pointer-events: none;
+  background: inherit;
+  -webkit-mask-image: linear-gradient(to bottom, #000, transparent);
+  mask-image: linear-gradient(to bottom, #000, transparent);
+  visibility: hidden;
+}
+.sidebar-pin[data-stuck] {
+  /* square while pinned, so no row shows past its corners */
+  border-radius: 0;
+}
+.sidebar-pin[data-stuck]::after {
+  visibility: visible;
+}
+/* A label that runs past the ruler's edge fades out rather than being
+ * cut through a word ("1m 15"). */
+.trace-ruler {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
+}
+.trace-tick {
+  position: absolute;
+  left: 0;
+  white-space: nowrap;
+  transform: translate3d(calc(var(--at) * var(--ms) * 1px + 5px), 0, 0);
+  transition: opacity 240ms ease-out;
+}
+.trace-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 1px;
+  margin-left: -0.5px;
+  background: color-mix(in srgb, var(--foreground) 62%, transparent);
+  transform: translate3d(calc(var(--now) * var(--ms) * 1px), 0, 0);
+  pointer-events: none;
+}
+/* rows slide when a fold above them opens or shuts, and a new one fades up */
+.trace-row {
+  position: absolute;
+  left: 0;
+  right: 0;
+  transition: transform 260ms var(--ease-out-quart);
+}
+.trace-row[data-new] {
+  animation: fade-in 320ms var(--ease-out-quart) both;
+}
+/* the running step's name: a soft light passing through it */
+.trace-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    currentColor 0%,
+    currentColor 35%,
+    var(--trace-shine, var(--foreground)) 50%,
+    currentColor 65%,
+    currentColor 100%
+  );
+  background-size: 250% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: trace-shimmer 2.4s linear infinite;
+}
+@keyframes trace-shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: -150% 0; }
+}
+.trace-spin {
+  animation: trace-spin 0.9s linear infinite;
+}
+@keyframes trace-spin {
+  to { transform: rotate(360deg); }
+}
+/* rolling digits (trace/RollingNumber.tsx): the wheel fades at its top
+   and bottom, so a digit on its way in or out is a ghost, not a cut */
+.rolling-digit {
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 24%, #000 76%, transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 24%, #000 76%, transparent);
+}
+.rolling-digit > span {
+  transition: transform 520ms var(--ease-out-quart);
+}
+@media (prefers-reduced-motion: reduce) {
+  .trace-bar[data-live]::after,
+  .trace-shimmer,
+  .trace-spin,
+  .trace-row[data-new] {
+    animation: none;
+  }
+  .trace-shimmer {
+    background-image: none;
+    -webkit-text-fill-color: currentColor;
+  }
+  .trace-row,
+  .rolling-digit > span {
+    transition: none;
+  }
+}
+
+/* ── the notch (notch/NotchIsland.tsx) ─────────────────────────────────
+ * The window is a clear frame over the menu bar, larger than the island,
+ * so the page in it has to be clear too. */
+:root[data-surface="notch"],
+:root[data-surface="notch"] body,
+:root[data-surface="notch"] #root {
+  background: transparent;
+}
+/* where the island meets the top of the screen it flares out, as the
+   hardware does: a quarter circle cut from a square of black each side */
+.notch-shoulder {
+  position: absolute;
+  top: 0;
+  width: var(--shoulder, 8px);
+  height: var(--shoulder, 8px);
+  pointer-events: none;
+}
+.notch-shoulder[data-side="left"] {
+  right: 100%;
+  background: radial-gradient(circle at 0 100%, transparent calc(var(--shoulder, 8px) - 0.5px), #000 var(--shoulder, 8px));
+}
+.notch-shoulder[data-side="right"] {
+  left: 100%;
+  background: radial-gradient(circle at 100% 100%, transparent calc(var(--shoulder, 8px) - 0.5px), #000 var(--shoulder, 8px));
+}
+/* a working agent's face breathes, in its own colour */
+.notch-pulse {
+  animation: notch-pulse 2.4s ease-in-out infinite;
+}
+@keyframes notch-pulse {
+  0%, 100% { box-shadow: 0 0 0 1.5px #000, 0 0 0 1.5px color-mix(in srgb, var(--c) 0%, transparent); }
+  50% { box-shadow: 0 0 0 1.5px #000, 0 0 0 4px color-mix(in srgb, var(--c) 45%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .notch-pulse {
+    animation: none;
+  }
+}
